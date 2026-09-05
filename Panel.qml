@@ -19,7 +19,9 @@ Item {
   property bool focusPrimed: false
   property string targetScreenName: ""
   property int keyboardIndex: -1
-  property bool inspectorOpen: true
+  // Selection alone must not resize the file list. The inspector opens only
+  // through its toolbar button or an explicit context action.
+  property bool inspectorOpen: false
   property bool inspectorDetailsVisible: false
   property string editorMode: ""
   property string editorValue: ""
@@ -1110,6 +1112,7 @@ Item {
     Connections {
       target: root.service
       function onNavigationAboutToChange(path, token) {
+        root.inspectorOpen = false
         stableView.rememberLocation(path, token)
       }
       function onListingAboutToChange() {
@@ -3683,6 +3686,7 @@ Item {
           }
 
           Column {
+            objectName: "quickfileEmptyState"
             anchors.centerIn: fileList
             width: parent.width - Style.space(44)
             spacing: Style.space(8)

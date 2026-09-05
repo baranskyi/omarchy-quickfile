@@ -22,7 +22,12 @@ Item {
   property bool initialized: false
   property bool panelVisible: false
   property bool busy: listingProcess.running
-  readonly property bool foregroundBusy: busy && !listInFlightBackground
+  // Process.running becomes false just before its exit handler applies stdout.
+  // Keep an explicit foreground latch so the UI cannot render a false empty
+  // state in that one-frame gap.
+  property bool foregroundListingPending: false
+  readonly property bool foregroundBusy: foregroundListingPending
+    || (busy && !listInFlightBackground)
   property bool knowledgeBusy: knowledgeProcess.running
   property bool sessionsBusy: sessionsProcess.running
   property bool settingsBusy: settingsLoadProcess.running || settingsSaveProcess.running
@@ -506,6 +511,7 @@ Item {
   function reload(background) {
     var silent = background === true
     if (silent && !panelVisible) return false
+    if (!silent) foregroundListingPending = true
     if (listingProcess.running) {
       reloadPending = true
       reloadPendingForeground = reloadPendingForeground || !silent
@@ -1794,6 +1800,7 @@ Item {
         watchError: root.watchError, busy: root.busy,
         foregroundBusy: root.foregroundBusy, entries: root.entries.length,
         listingRequests: root.listingRequests, listingChanges: root.listingChanges,
+        foregroundListingPending: root.foregroundListingPending,
         activeSessionsEnabled: root.activeSessionsEnabled,
         activeSessions: root.activeSessions.length,
         inspectorTab: root.inspectorTab,
@@ -1880,6 +1887,9 @@ Item {
     onExited: function(exitCode) {
       if (!root.applyListing(root.listStdout) && !root.errorMessage)
         root.errorMessage = root.listStderr.trim() || ("QuickFile exited " + exitCode)
+      var keepForegroundPending = root.reloadPending && root.reloadPendingForeground
+      if (!root.listInFlightBackground && !keepForegroundPending)
+        root.foregroundListingPending = false
       if (root.reloadPending) {
         var foreground = root.reloadPendingForeground
         root.reloadPending = false

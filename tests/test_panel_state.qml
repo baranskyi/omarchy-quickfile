@@ -54,7 +54,6 @@ ShellRoot {
     id: panel
     service: fixture
     manifest: ({ id: "m0sthatedman.quickfile" })
-    inspectorOpen: false
   }
 
   function check(condition, message) {
@@ -178,6 +177,15 @@ ShellRoot {
 
   function newFeatureChecks() {
     panel.dismissEditor()
+    check(!panel.inspectorOpen,
+      "inspector opened before an explicit toolbar or context action")
+    select(entry("selection-does-not-open-inspector", ""))
+    check(!panel.inspectorOpen,
+      "ordinary file selection opened the inspector and resized the file list")
+    panel.inspectorOpen = true
+    fixture.navigationAboutToChange(fixture.rootPath, fixture.rootToken)
+    check(!panel.inspectorOpen,
+      "directory navigation left the inspector armed for the next click")
     var panelWindow = objectFinder.findChild(panel, "quickfilePanelWindow")
     var bladeSlide = objectFinder.findChild(panel, "quickfileBladeSlide")
     check(panelWindow !== null && panelWindow.width === panel.bladeWidth,
@@ -366,6 +374,7 @@ ShellRoot {
     fixture.navigationAboutToChange(fixture.rootPath, fixture.rootToken)
     fixture.rootPath = "/quickfile-test/child"
     fixture.rootToken = "child-root"
+    fixture.foregroundListingPending = true
     fixture.listingAboutToChange()
     fixture.entries = []
     fixture.entriesModel.clear()
@@ -373,6 +382,10 @@ ShellRoot {
     fixture.selectedTokens = []
     fixture.selectedEntry = null
     fixture.modelChanged()
+    var emptyState = objectFinder.findChild(panel, "quickfileEmptyState")
+    check(emptyState !== null && !emptyState.visible,
+      "empty-folder artwork appeared while foreground navigation was pending")
+    fixture.foregroundListingPending = false
     var childRows = [entry("inside-child", "")]
     fixture.listingAboutToChange()
     fixture.entries = childRows

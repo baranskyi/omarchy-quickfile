@@ -70,12 +70,14 @@ class BackendTests(unittest.TestCase):
     def test_settings_persist_private_normalized_module_layout(self) -> None:
         saved = quickfile.settings_command(argparse.Namespace(
             active_sessions="true",
+            inspector_tab="git",
             module_layout_json=json.dumps([
                 {"id": "knowledge", "pinned": True, "collapsed": True},
                 {"id": "sessions", "pinned": False, "collapsed": False},
             ]),
         ))
         self.assertTrue(saved["settings"]["activeSessionsEnabled"])
+        self.assertEqual(saved["settings"]["inspectorTab"], "git")
         self.assertEqual(
             [row["id"] for row in saved["settings"]["modules"]],
             ["knowledge", "sessions", "devices", "favorites"],
@@ -84,9 +86,18 @@ class BackendTests(unittest.TestCase):
         settings_path = Path(os.environ["QUICKFILE_SETTINGS_FILE"])
         self.assertEqual(settings_path.stat().st_mode & 0o777, 0o600)
         loaded = quickfile.settings_command(argparse.Namespace(
-            active_sessions=None, module_layout_json=None,
+            active_sessions=None, inspector_tab=None, module_layout_json=None,
         ))
         self.assertEqual(loaded["settings"], saved["settings"])
+
+    def test_settings_reject_unknown_inspector_tab(self) -> None:
+        with self.assertRaises(quickfile.QuickfileError) as raised:
+            quickfile.settings_command(argparse.Namespace(
+                active_sessions=None,
+                inspector_tab="terminal",
+                module_layout_json=None,
+            ))
+        self.assertEqual(raised.exception.code, "settings-invalid")
 
     def test_settings_reject_unknown_or_duplicate_modules(self) -> None:
         invalid_layouts = [

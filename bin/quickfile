@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-VERSION = "0.10.2"
+VERSION = "0.11.0"
 DEFAULT_LIMIT = 2000
 COMMAND_TIMEOUT = 3
 DEFAULT_CONTENT_FILE_LIMIT = 1024 * 1024
@@ -69,6 +69,8 @@ KNOWLEDGE_AGENT_ORDER = (
 KNOWLEDGE_AGENT_KEYS = set(KNOWLEDGE_AGENT_ORDER)
 MODULE_ORDER = ("sessions", "devices", "favorites", "knowledge")
 MODULE_KEYS = set(MODULE_ORDER)
+INSPECTOR_TAB_ORDER = ("properties", "notes", "git")
+INSPECTOR_TAB_KEYS = set(INSPECTOR_TAB_ORDER)
 ACTIVE_SESSION_PROCESS_LIMIT = 4096
 ACTIVE_SESSION_LIMIT = 64
 ACTIVE_SESSION_AGENTS = {
@@ -509,8 +511,9 @@ def normalize_module_layout(value: Any) -> list[dict[str, Any]]:
 
 def default_settings_store() -> dict[str, Any]:
     return {
-        "version": 1,
+        "version": 2,
         "activeSessionsEnabled": False,
+        "inspectorTab": "properties",
         "modules": default_module_layout(),
     }
 
@@ -532,9 +535,13 @@ def load_settings_store() -> dict[str, Any]:
     active_sessions = parsed.get("activeSessionsEnabled", False)
     if not isinstance(active_sessions, bool):
         raise QuickfileError("Active-session preference must be true or false", "settings-invalid")
+    inspector_tab = parsed.get("inspectorTab", "properties")
+    if not isinstance(inspector_tab, str) or inspector_tab not in INSPECTOR_TAB_KEYS:
+        raise QuickfileError("Inspector tab preference is invalid", "settings-invalid")
     return {
-        "version": 1,
+        "version": 2,
         "activeSessionsEnabled": active_sessions,
+        "inspectorTab": inspector_tab,
         "modules": normalize_module_layout(parsed.get("modules", default_module_layout())),
     }
 
@@ -573,6 +580,12 @@ def settings_command(args: argparse.Namespace) -> dict[str, Any]:
         enabled = active_sessions == "true"
         changed = changed or store["activeSessionsEnabled"] != enabled
         store["activeSessionsEnabled"] = enabled
+    inspector_tab = getattr(args, "inspector_tab", None)
+    if inspector_tab is not None:
+        if inspector_tab not in INSPECTOR_TAB_KEYS:
+            raise QuickfileError("Inspector tab preference is invalid", "settings-invalid")
+        changed = changed or store["inspectorTab"] != inspector_tab
+        store["inspectorTab"] = inspector_tab
     module_layout_json = getattr(args, "module_layout_json", None)
     if module_layout_json is not None:
         try:
@@ -3934,6 +3947,7 @@ def parser() -> argparse.ArgumentParser:
         "settings", help="Read or update private QuickFile preferences"
     )
     settings.add_argument("--active-sessions", choices=("true", "false"))
+    settings.add_argument("--inspector-tab", choices=INSPECTOR_TAB_ORDER)
     settings.add_argument("--module-layout-json")
 
     knowledge_links = subcommands.add_parser(

@@ -239,6 +239,7 @@ ShellRoot {
     var propertiesBeforeSessions = synthetic.selectedProperties
     check(synthetic.applySettings(JSON.stringify({ ok: true, settings: {
       activeSessionsEnabled: true,
+      inspectorTab: "git",
       modules: [
         { id: "knowledge", pinned: true, collapsed: true },
         { id: "sessions", pinned: true, collapsed: false },
@@ -247,8 +248,12 @@ ShellRoot {
       ]
     } })), "Settings response was rejected")
     check(synthetic.settingsLoaded && synthetic.activeSessionsEnabled
+      && synthetic.inspectorTab === "git"
       && synthetic.moduleLayout[0].id === "knowledge" && synthetic.knowledgeCollapsed,
-      "Persisted module order or collapse state was not applied")
+      "Persisted inspector tab, module order, or collapse state was not applied")
+    check(synthetic.setInspectorTab("notes") && synthetic.inspectorTab === "notes"
+      && !synthetic.setInspectorTab("terminal"),
+      "Inspector tab setter did not enforce its built-in allowlist")
     synthetic.sessionsInFlightRootToken = synthetic.rootToken
     synthetic.sessionsInFlightRootPath = synthetic.rootPath
     check(synthetic.applySessions(JSON.stringify({ ok: true,

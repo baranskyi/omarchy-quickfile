@@ -81,12 +81,18 @@ concept. It does not depend on or copy unreleased FileBlade source code.
   collapse, expand or pin Sessions, Devices, Favorites and Project Knowledge.
   The order and state persist without rebuilding the live file list, changing
   selection, moving the viewport or discarding an unsaved note.
-- Right-click properties expose the full path with a one-click copy button.
+- The always-live `FILES` surface stays dedicated to navigation and file
+  operations, while a persisted inspector switches between `Properties`,
+  `Notes`, and read-only `Git` modules without rebuilding the file list.
+- `Properties` exposes the full path with a one-click copy button plus POSIX
+  metadata, owner/group, timestamps, MIME, inode, allocation,
+  mount/filesystem details, ACLs, xattrs, and symlink data.
+- `Notes` keeps color labels, unsaved note drafts, and the Project Knowledge
+  registry alive while another inspector module is visible.
+- `Git` gives the selected item its own repository, branch, and status view.
 - Delayed hover tooltips explain every icon-only toolbar/navigation action.
-- Properties inspector with POSIX metadata, owner/group, timestamps, MIME,
-  inode, allocation, mount/filesystem details, ACLs, xattrs, symlink and Git data.
-- Compact properties mode hides Agents and filesystem details and gives their
-  space back to the file tree; the details icon restores them when needed.
+- Compact inspector mode gives more space back to the file tree; the details
+  icon expands the current inspector module when needed.
 - Binary path tokens, so the backend can address filenames that are not valid
   UTF-8 without interpolating them into a shell command.
 
@@ -186,7 +192,7 @@ Quick Nav recent locations are stored as private binary path tokens in
 `~/.local/state/omarchy/quickfile/recent-locations.json`) with mode `0600`.
 Both `rg` and zoxide are optional; QuickFile remains functional without them.
 
-Module layout and the active-session opt-in are stored privately in
+Module layout, selected inspector tab, and the active-session opt-in are stored privately in
 `$XDG_CONFIG_HOME/omarchy/quickfile/settings.json` (normally
 `~/.config/omarchy/quickfile/settings.json`) with mode `0600`. Only a strict
 built-in module allowlist is accepted; this setting is not an extension or an
@@ -323,7 +329,8 @@ models reconcile changed rows by path token instead of replacing the model.
 ## Next milestones
 
 - Independent resizable left and right blades.
-- Dedicated Files, Properties, Git, Notes, Memory and Skills module surfaces.
+- Memory and Skills remain intentionally folded into Project Knowledge until
+  they have distinct, useful workflows instead of duplicate file lists.
 - Declarative extension modules plus an explicitly trusted QML extension tier
   remain deferred while everyday file-management workflows are completed.
 

@@ -404,9 +404,17 @@ ShellRoot {
         && panel.keyboardIndex === fileView.rowIndexForKey(rememberedSelection),
       "returning to a directory did not restore the folder used to enter it")
 
+    fixture.settingsLoaded = true
+    fixture.inspectorTab = "notes"
     panel.inspectorOpen = true
     var noteEditor = objectFinder.findChild(panel, "quickfileNoteEditor")
+    var propertiesTab = objectFinder.findChild(panel, "quickfilePropertiesTab")
+    var notesTab = objectFinder.findChild(panel, "quickfileNotesTab")
+    var gitTab = objectFinder.findChild(panel, "quickfileGitTab")
     check(noteEditor !== null, "could not find the rendered note editor")
+    check(propertiesTab !== null && notesTab !== null && gitTab !== null
+        && notesTab.visible && !propertiesTab.visible && !gitTab.visible,
+      "persisted Notes tab was not rendered as the active inspector module")
     noteEditor.forceActiveFocus()
     noteEditor.insert(0, "draft with a selected phrase")
     noteEditor.select(6, 10)
@@ -420,7 +428,25 @@ ShellRoot {
         && noteEditor.selectionStart === 6 && noteEditor.selectionEnd === 10,
       "background update reset note focus, text selection, or cursor")
 
-    fixture.settingsLoaded = true
+    var fileDelegateBeforeTabs = fileView.itemAtIndex(panel.keyboardIndex)
+    var viewportBeforeTabs = fileView.contentY
+    check(fixture.setInspectorTab("git") && gitTab.visible
+        && !notesTab.visible && !propertiesTab.visible,
+      "Git inspector module did not become active")
+    check(fixture.setInspectorTab("properties") && propertiesTab.visible
+        && !notesTab.visible && !gitTab.visible,
+      "Properties inspector module did not become active")
+    check(fixture.setInspectorTab("notes") && notesTab.visible
+        && !propertiesTab.visible && !gitTab.visible,
+      "Notes inspector module did not become active again")
+    fileView.forceLayout()
+    check(noteEditor.text === textBefore && panel.noteDraft === textBefore
+        && fileView.itemAtIndex(panel.keyboardIndex) === fileDelegateBeforeTabs
+        && Math.abs(fileView.contentY - viewportBeforeTabs) < 1,
+      "inspector tab changes rebuilt file delegates, moved the viewport, or discarded the draft")
+    noteEditor.forceActiveFocus()
+    noteEditor.select(6, 10)
+
     fixture.moduleLayout = fixture.defaultModuleLayout()
     fixture.applyModuleCollapseFlags()
     var sessionsModule = objectFinder.findChild(panel, "quickfileSessionsModule")

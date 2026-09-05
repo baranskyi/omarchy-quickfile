@@ -101,6 +101,7 @@ Item {
   property string settingsError: ""
   property bool settingsSaveQueued: false
   property bool activeSessionsEnabled: false
+  property string inspectorTab: "properties"
   property var activeSessions: []
   property bool sessionsCollapsed: false
   property bool sessionsReloadPending: false
@@ -325,6 +326,15 @@ Item {
     next.splice(target, 0, moving)
     moduleLayout = normalizedModuleLayout(next)
     applyModuleCollapseFlags()
+    persistSettings()
+    return true
+  }
+
+  function setInspectorTab(tab) {
+    var value = String(tab || "")
+    if (!settingsLoaded || ["properties", "notes", "git"].indexOf(value) < 0
+        || inspectorTab === value) return false
+    inspectorTab = value
     persistSettings()
     return true
   }
@@ -631,6 +641,9 @@ Item {
     }
     moduleLayout = normalizedModuleLayout(parsed.settings.modules)
     activeSessionsEnabled = parsed.settings.activeSessionsEnabled === true
+    inspectorTab = ["properties", "notes", "git"].indexOf(
+      String(parsed.settings.inspectorTab || "")) >= 0
+      ? String(parsed.settings.inspectorTab) : "properties"
     applyModuleCollapseFlags()
     settingsLoaded = true
     settingsError = ""
@@ -650,6 +663,7 @@ Item {
     settingsError = ""
     settingsSaveProcess.command = ["/usr/bin/env", "python3", cliPath, "settings",
       "--active-sessions", activeSessionsEnabled ? "true" : "false",
+      "--inspector-tab", inspectorTab,
       "--module-layout-json", JSON.stringify(moduleLayout)]
     settingsSaveProcess.running = true
     return true
@@ -1782,6 +1796,7 @@ Item {
         listingRequests: root.listingRequests, listingChanges: root.listingChanges,
         activeSessionsEnabled: root.activeSessionsEnabled,
         activeSessions: root.activeSessions.length,
+        inspectorTab: root.inspectorTab,
         moduleLayout: root.moduleLayout
       })
     }
@@ -1801,6 +1816,7 @@ Item {
       if (!root.applySettings(root.settingsStdout)) {
         root.moduleLayout = root.defaultModuleLayout()
         root.activeSessionsEnabled = false
+        root.inspectorTab = "properties"
         root.applyModuleCollapseFlags()
         root.settingsLoaded = true
         if (!root.settingsError)

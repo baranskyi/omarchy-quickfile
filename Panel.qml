@@ -724,8 +724,6 @@ Item {
       rows.push({ label: "Children", value: String(p.children) })
     if (p.symlinkTarget)
       rows.push({ label: "Target", value: String(p.symlinkTarget) })
-    if (p.git && (p.git.root || p.git.branch || p.git.status))
-      rows.push({ label: "Git", value: [p.git.branch || "", p.git.status || "", p.git.root || ""].filter(Boolean).join(" · ") })
     if (p.mount && p.mount.mountpoint)
       rows.push({ label: "Filesystem", value: (p.mount.filesystem || "") + " · " + p.mount.mountpoint })
     if (p.filesystemUsage && p.filesystemUsage.freeText)
@@ -735,6 +733,24 @@ Item {
     if (p.acl)
       rows.push({ label: "ACL", value: String(p.acl).replace(/\n/g, " · ") })
     return rows
+  }
+
+  function gitRows() {
+    if (!service) return []
+    var selected = service.selectedProperties && service.selectedProperties.git
+      ? service.selectedProperties.git : ({})
+    var listing = service.git || ({})
+    var repository = String(selected.root || listing.root || "")
+    if (repository === "") return []
+    var branch = String(selected.branch || listing.branch || "")
+    var status = String(selected.status || "")
+    return [
+      { label: "Repository", value: repository },
+      { label: "Branch", value: branch || "Detached HEAD" },
+      { label: "Selected item", value: service.selectedEntry
+          ? String(service.selectedEntry.name || "") : "" },
+      { label: "Status", value: status || "Clean" }
+    ]
   }
 
   function moveSelection(delta, modifiers) {
@@ -2664,8 +2680,8 @@ Item {
                 anchors.topMargin: Style.space(5)
                 glyph: "󰒓"
                 tooltip: root.inspectorDetailsVisible
-                  ? "Hide Agents and file details"
-                  : "Show Agents and file details"
+                  ? "Compact inspector"
+                  : "Expand inspector"
                 active: root.inspectorDetailsVisible
                 buttonSize: Style.space(25)
                 onClicked: root.inspectorDetailsVisible = !root.inspectorDetailsVisible
@@ -2677,7 +2693,7 @@ Item {
                 anchors.top: parent.top
                 anchors.topMargin: Style.space(5)
                 glyph: "󰅖"
-                tooltip: "Close properties"
+                tooltip: "Close inspector"
                 buttonSize: Style.space(25)
                 onClicked: root.inspectorOpen = false
               }
@@ -2753,13 +2769,90 @@ Item {
             }
 
             Rectangle {
-              id: pathBar
+              id: inspectorTabs
+              objectName: "quickfileInspectorTabs"
               anchors.top: inspectorHeader.bottom
+              anchors.left: parent.left
+              anchors.right: parent.right
+              height: Style.space(34)
+              color: "transparent"
+
+              Row {
+                anchors.fill: parent
+                anchors.leftMargin: Style.space(10)
+                anchors.rightMargin: Style.space(10)
+                anchors.topMargin: Style.space(2)
+                anchors.bottomMargin: Style.space(3)
+                spacing: Style.space(5)
+
+                Repeater {
+                  model: [
+                    { id: "properties", label: "Properties", glyph: "󰒓" },
+                    { id: "notes", label: "Notes", glyph: "󰎞" },
+                    { id: "git", label: "Git", glyph: "󰊢" }
+                  ]
+                  delegate: Rectangle {
+                    id: inspectorTabButton
+                    required property var modelData
+                    readonly property bool selected: root.service
+                      && root.service.inspectorTab === String(modelData.id)
+                    width: (inspectorTabs.width - Style.space(30)) / 3
+                    height: parent.height
+                    radius: Style.cornerRadius > 0 ? Style.space(4) : 0
+                    color: selected ? Qt.alpha(root.accent, 0.16)
+                      : inspectorTabMouse.containsMouse ? Style.hoverFill : "transparent"
+                    border.width: selected ? 1 : 0
+                    border.color: selected ? Qt.alpha(root.accent, 0.65) : "transparent"
+
+                    Row {
+                      anchors.centerIn: parent
+                      spacing: Style.space(5)
+                      Text {
+                        text: String(inspectorTabButton.modelData.glyph)
+                        color: inspectorTabButton.selected ? root.accent : root.muted
+                        font.family: Style.font.family
+                        font.pixelSize: root.secondaryFontSize
+                        renderType: Text.NativeRendering
+                      }
+                      Text {
+                        text: String(inspectorTabButton.modelData.label)
+                        color: inspectorTabButton.selected ? root.foreground : root.muted
+                        font.family: Style.font.family
+                        font.pixelSize: Style.font.caption
+                        font.bold: inspectorTabButton.selected
+                        renderType: Text.NativeRendering
+                      }
+                    }
+
+                    MouseArea {
+                      id: inspectorTabMouse
+                      anchors.fill: parent
+                      hoverEnabled: true
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: if (root.service)
+                        root.service.setInspectorTab(String(inspectorTabButton.modelData.id))
+                    }
+                  }
+                }
+              }
+
+              Components.Divider {
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.bottom: parent.bottom
+              }
+            }
+
+            Rectangle {
+              id: pathBar
+              objectName: "quickfilePropertiesTab"
+              anchors.top: inspectorTabs.bottom
               anchors.left: parent.left
               anchors.right: parent.right
               anchors.leftMargin: Style.space(10)
               anchors.rightMargin: Style.space(8)
               height: Style.space(42)
+              visible: root.service && root.service.inspectorTab === "properties"
               color: "transparent"
 
               Text {
@@ -2816,12 +2909,14 @@ Item {
 
             Rectangle {
               id: colorBar
-              anchors.top: pathBar.bottom
+              objectName: "quickfileNotesTab"
+              anchors.top: inspectorTabs.bottom
               anchors.left: parent.left
               anchors.right: parent.right
               anchors.leftMargin: Style.space(10)
               anchors.rightMargin: Style.space(8)
               height: Style.space(38)
+              visible: root.service && root.service.inspectorTab === "notes"
               color: "transparent"
 
               Text {
@@ -2896,6 +2991,7 @@ Item {
               anchors.leftMargin: Style.space(10)
               anchors.rightMargin: Style.space(8)
               height: Style.space(76)
+              visible: root.service && root.service.inspectorTab === "notes"
               color: "transparent"
 
               Text {
@@ -2971,6 +3067,7 @@ Item {
               anchors.leftMargin: Style.space(10)
               anchors.rightMargin: Style.space(8)
               height: root.inspectorDetailsVisible ? Style.space(78) : Style.space(40)
+              visible: root.service && root.service.inspectorTab === "notes"
               color: "transparent"
 
               Text {
@@ -3103,8 +3200,8 @@ Item {
 
             ListView {
               id: inspectorDetailsList
-              visible: root.inspectorDetailsVisible
-              anchors.top: knowledgeRegistryBar.bottom
+              visible: root.service && root.service.inspectorTab === "properties"
+              anchors.top: pathBar.bottom
               anchors.left: parent.left
               anchors.right: parent.right
               anchors.bottom: parent.bottom
@@ -3138,6 +3235,67 @@ Item {
                 }
               }
               ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+            }
+
+            Rectangle {
+              id: gitInspector
+              objectName: "quickfileGitTab"
+              visible: root.service && root.service.inspectorTab === "git"
+              anchors.top: inspectorTabs.bottom
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.bottom: parent.bottom
+              color: "transparent"
+
+              Text {
+                anchors.centerIn: parent
+                width: parent.width - Style.space(40)
+                visible: root.gitRows().length === 0
+                text: "Not inside a Git worktree"
+                color: root.muted
+                horizontalAlignment: Text.AlignHCenter
+                wrapMode: Text.Wrap
+                font.family: Style.font.family
+                font.pixelSize: Style.font.bodySmall
+                renderType: Text.NativeRendering
+              }
+
+              ListView {
+                anchors.fill: parent
+                anchors.leftMargin: Style.space(12)
+                anchors.rightMargin: Style.space(8)
+                anchors.topMargin: Style.space(10)
+                anchors.bottomMargin: Style.space(7)
+                visible: root.gitRows().length > 0
+                spacing: Style.space(8)
+                clip: true
+                model: root.gitRows()
+                delegate: Row {
+                  required property var modelData
+                  width: ListView.view.width
+                  spacing: Style.space(8)
+                  Text {
+                    width: Style.space(86)
+                    text: parent.modelData.label
+                    color: root.muted
+                    elide: Text.ElideRight
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.caption
+                    renderType: Text.NativeRendering
+                  }
+                  Text {
+                    width: parent.width - Style.space(94)
+                    text: parent.modelData.value
+                    color: parent.modelData.label === "Status"
+                      && parent.modelData.value !== "Clean" ? root.accent : root.foreground
+                    elide: Text.ElideMiddle
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.caption
+                    renderType: Text.NativeRendering
+                  }
+                }
+                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+              }
             }
           }
 

@@ -1,9 +1,8 @@
 # QuickFile marketplace submission draft
 
-Status: **not submitted**. Add one repository-root screenshot named
-`preview.png`, `preview.jpg`, `preview.jpeg`, `preview.webp`, or `preview.avif`
-before the final validation. The marketplace accepts up to 50 MB and 40
-megapixels and generates its own optimized card and detail images.
+Status: **ready for owner confirmation; not submitted**. The repository-root
+`preview.png` is prepared for final validation. The marketplace accepts up to
+50 MB and 40 megapixels and generates its own optimized card and detail images.
 Before submission, the owner must directly approve the title and exact body and
 confirm that every checklist statement, including preview-asset ownership, is
 true.

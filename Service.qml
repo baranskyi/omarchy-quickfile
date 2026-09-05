@@ -25,10 +25,27 @@ Item {
   readonly property bool foregroundBusy: busy && !listInFlightBackground
   property bool knowledgeBusy: knowledgeProcess.running
   property bool volumesBusy: volumesProcess.running || volumeActionProcess.running
-  property bool actionBusy: actionProcess.running || knowledgeLinksProcess.running
+  property bool operationBusy: operationProcess.running
+  property bool actionBusy: actionProcess.running || operationBusy || knowledgeLinksProcess.running
     || volumeActionProcess.running
   property string errorMessage: ""
   property string actionMessage: ""
+  property string operationPhase: ""
+  property real operationProgress: -1
+  property int operationItemsDone: 0
+  property int operationItemsTotal: 0
+  property real operationBytesDone: 0
+  property real operationBytesTotal: 0
+  property bool operationCancelling: false
+  property var operationResult: null
+  property var trashEntries: []
+  property bool trashBusy: trashProcess.running
+  property string trashError: ""
+  property bool trashReloadPending: false
+  property bool undoAvailable: false
+  property string undoId: ""
+  property string undoLabel: ""
+  property bool historyReloadPending: false
 
   property string rootPath: homePath
   property string rootToken: ""
@@ -112,6 +129,11 @@ Item {
   property string propertyStderr: ""
   property string actionStdout: ""
   property string actionStderr: ""
+  property string operationStderr: ""
+  property string trashStdout: ""
+  property string trashStderr: ""
+  property string historyStdout: ""
+  property string historyStderr: ""
   property string volumesStdout: ""
   property string volumesStderr: ""
   property string volumeActionStdout: ""
@@ -154,11 +176,13 @@ Item {
       initialized = true
       reload()
       reloadVolumes()
+      reloadHistory()
     } else {
       // Reconcile changes that happened while the panel (and watcher) was shut.
       reload(true)
       reloadKnowledge()
       reloadVolumes()
+      reloadHistory()
     }
   }
 
@@ -240,7 +264,8 @@ Item {
 
   function scheduleBackgroundRefresh() {
     // Do not restart this timer: continuous writes still get bounded latency.
-    if (panelVisible && initialized && !eventRefresh.running) eventRefresh.start()
+    if (panelVisible && initialized && !operationBusy && !eventRefresh.running)
+      eventRefresh.start()
   }
 
   function handleWatchEvent(raw) {
@@ -832,7 +857,7 @@ Item {
   }
 
   function runAction(kind, token, name) {
-    if (actionProcess.running || !token) return false
+    if (actionBusy || !token) return false
     actionKind = String(kind || "")
     actionStdout = ""
     actionStderr = ""
@@ -850,7 +875,7 @@ Item {
 
   function runBatchAction(kind, tokens, destinationToken) {
     var values = Array.isArray(tokens) ? tokens : []
-    if (actionProcess.running || values.length === 0) return false
+    if (actionBusy || values.length === 0) return false
     actionKind = String(kind || "")
     actionStdout = ""
     actionStderr = ""
@@ -867,8 +892,111 @@ Item {
 
   function runTransfer(kind, sourceTokens, destinationToken) {
     if (!destinationToken) return false
-    return runBatchAction(kind, sourceTokens, destinationToken)
+    return runOperation(kind, sourceTokens, destinationToken)
   }
+
+  function runOperation(kind, tokens, destinationToken, name, trashUris) {
+    var values = Array.isArray(tokens) ? tokens : []
+    var uris = Array.isArray(trashUris) ? trashUris : []
+    if (actionBusy) return false
+    if (kind !== "undo" && values.length === 0 && uris.length === 0) return false
+    actionKind = String(kind || "")
+    actionMessage = ""
+    operationPhase = "starting"
+    operationProgress = -1
+    operationItemsDone = 0
+    operationItemsTotal = 0
+    operationBytesDone = 0
+    operationBytesTotal = 0
+    operationCancelling = false
+    operationResult = null
+    operationStderr = ""
+    var command = ["/usr/bin/env", "python3", cliPath, "operation", actionKind]
+    if (values.length === 1) {
+      command.push("--path-token")
+      command.push(String(values[0]))
+    } else if (values.length > 1) {
+      command.push("--path-tokens-json")
+      command.push(JSON.stringify(values))
+    }
+    if (destinationToken) {
+      command.push("--destination-token")
+      command.push(String(destinationToken))
+    }
+    if (name !== undefined && name !== null && String(name) !== "") {
+      command.push("--name")
+      command.push(String(name))
+    }
+    if (uris.length === 1) {
+      command.push("--trash-uri")
+      command.push(String(uris[0]))
+    } else if (uris.length > 1) {
+      command.push("--trash-uris-json")
+      command.push(JSON.stringify(uris))
+    }
+    operationProcess.command = command
+    operationProcess.running = true
+    return true
+  }
+
+  function handleOperationEvent(raw) {
+    var message = null
+    try { message = JSON.parse(raw) } catch (error) { return }
+    if (message.event === "result" || message.ok !== undefined) {
+      operationResult = message
+      return
+    }
+    if (message.event !== "progress") return
+    operationPhase = String(message.phase || "working")
+    operationItemsDone = Number(message.itemsDone || 0)
+    operationItemsTotal = Number(message.itemsTotal || 0)
+    operationBytesDone = Number(message.bytesDone || 0)
+    operationBytesTotal = Number(message.bytesTotal || 0)
+    if (operationBytesTotal > 0)
+      operationProgress = Math.max(0, Math.min(1, operationBytesDone / operationBytesTotal))
+    else if (operationItemsTotal > 0)
+      operationProgress = Math.max(0, Math.min(1, operationItemsDone / operationItemsTotal))
+    else operationProgress = -1
+  }
+
+  function cancelOperation() {
+    if (!operationProcess.running || operationCancelling) return false
+    operationCancelling = true
+    actionMessage = "Cancelling…"
+    operationProcess.signal(15)
+    return true
+  }
+
+  function reloadTrash() {
+    if (trashProcess.running) {
+      trashReloadPending = true
+      return false
+    }
+    trashStdout = ""
+    trashStderr = ""
+    trashError = ""
+    trashProcess.command = ["/usr/bin/env", "python3", cliPath, "trash-list"]
+    trashProcess.running = true
+    return true
+  }
+
+  function reloadHistory() {
+    if (historyProcess.running) {
+      historyReloadPending = true
+      return false
+    }
+    historyStdout = ""
+    historyStderr = ""
+    historyProcess.command = ["/usr/bin/env", "python3", cliPath, "history"]
+    historyProcess.running = true
+    return true
+  }
+
+  function restoreTrash(uri) { return runOperation("restore", [], "", "", [uri]) }
+  function permanentlyDeleteTrash(uri) {
+    return runOperation("trash-delete", [], "", "", [uri])
+  }
+  function undoLast() { return runOperation("undo", [], "", "", []) }
 
   function copySelected() {
     if (!selectedEntry || !selectedToken) return false
@@ -911,8 +1039,10 @@ Item {
 
   function createFile(name) { return runAction("touch", rootToken, name) }
   function createFolder(name) { return runAction("mkdir", rootToken, name) }
-  function renameSelected(name) { return runAction("rename", selectedToken, name) }
-  function trashSelected() { return runBatchAction("trash", effectiveSelectionTokens()) }
+  function renameSelected(name) {
+    return runOperation("rename", [selectedToken], "", name)
+  }
+  function trashSelected() { return runOperation("trash", effectiveSelectionTokens()) }
   function openSelected() { return runAction("open", selectedToken) }
   function revealSelected() { return runAction("reveal", selectedToken) }
   function previewSelected() {
@@ -927,10 +1057,12 @@ Item {
     return runAction("preview", String(entry.token || ""))
   }
   function copySelectedPath() { return runAction("copy-path", selectedToken) }
-  function duplicateSelected() { return runBatchAction("duplicate", effectiveSelectionTokens()) }
+  function duplicateSelected() {
+    return runOperation("duplicate", effectiveSelectionTokens())
+  }
 
   function saveEntryMetadata(entry, color, note, starred) {
-    if (actionProcess.running || !entry || !entry.token) return false
+    if (actionBusy || !entry || !entry.token) return false
     actionKind = "metadata"
     actionMetadataToken = String(entry.token)
     actionStdout = ""
@@ -950,7 +1082,7 @@ Item {
   }
 
   function saveEntryKnowledge(entry, registered, agents) {
-    if (actionProcess.running || !entry || !entry.token || entry.isDir === true)
+    if (actionBusy || !entry || !entry.token || entry.isDir === true)
       return false
     var values = Array.isArray(agents) ? agents : []
     actionKind = "metadata"
@@ -1044,7 +1176,7 @@ Item {
     id: eventRefresh
     interval: 100
     onTriggered: {
-      if (!root.panelVisible) return
+      if (!root.panelVisible || root.operationBusy) return
       root.refreshAll(true)
       if (root.selectedToken !== "") root.inspect(root.selectedToken)
     }
@@ -1260,6 +1392,89 @@ Item {
       }
       root.knowledgeLinkApplying = false
       root.knowledgeLinksFinished(ok, wasApplying, message)
+    }
+  }
+
+  Process {
+    id: trashProcess
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.trashStdout = text
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.trashStderr = text.slice(-2000)
+    }
+    onExited: function(exitCode) {
+      var parsed = null
+      try { parsed = JSON.parse(root.trashStdout) } catch (error) {}
+      if (exitCode === 0 && parsed && parsed.ok === true) {
+        root.trashEntries = Array.isArray(parsed.entries) ? parsed.entries : []
+        root.trashError = ""
+      } else {
+        root.trashError = parsed && parsed.error ? String(parsed.error)
+          : (root.trashStderr.trim() || "Could not read Trash")
+      }
+      if (root.trashReloadPending) {
+        root.trashReloadPending = false
+        Qt.callLater(root.reloadTrash)
+      }
+    }
+  }
+
+  Process {
+    id: historyProcess
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.historyStdout = text
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.historyStderr = text.slice(-2000)
+    }
+    onExited: function(exitCode) {
+      var parsed = null
+      try { parsed = JSON.parse(root.historyStdout) } catch (error) {}
+      if (exitCode === 0 && parsed && parsed.ok === true) {
+        root.undoAvailable = parsed.undoAvailable === true
+        root.undoId = parsed.operation ? String(parsed.operation.id || "") : ""
+        root.undoLabel = parsed.operation ? String(parsed.operation.label || "") : ""
+      }
+      if (root.historyReloadPending) {
+        root.historyReloadPending = false
+        Qt.callLater(root.reloadHistory)
+      }
+    }
+  }
+
+  Process {
+    id: operationProcess
+    stdout: SplitParser {
+      onRead: function(data) { root.handleOperationEvent(data) }
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.operationStderr = text.slice(-2000)
+    }
+    onExited: function(exitCode) {
+      var parsed = root.operationResult
+      var kind = root.actionKind
+      var ok = exitCode === 0 && parsed && parsed.ok === true
+      var message = ok ? String(parsed.message || "Done")
+        : (parsed && parsed.error ? String(parsed.error)
+          : (root.operationStderr.trim() || (root.operationCancelling
+            ? "Operation cancelled" : "Action failed")))
+      root.actionMessage = message
+      root.operationPhase = ""
+      root.operationProgress = -1
+      root.operationCancelling = false
+      root.actionKind = ""
+      if (ok && kind === "move") root.clearClipboard()
+      root.actionFinished(kind, ok, message)
+      Qt.callLater(root.reloadHistory)
+      Qt.callLater(root.reloadTrash)
+      // A cancelled or failed batch can still have completed earlier items.
+      Qt.callLater(root.refreshAll)
     }
   }
 

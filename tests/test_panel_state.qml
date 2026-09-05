@@ -23,6 +23,9 @@ ShellRoot {
     function inspect(token) {}
     function saveSelectedMetadata(color, note, starred) { return !rejectSave }
     function saveSelectedKnowledge(registered, agents) { return !rejectSave }
+    function renameSelected(name) { return true }
+    function reloadTrash() { return true }
+    function permanentlyDeleteTrash(uri) { return true }
   }
 
   Quickfile.Panel {
@@ -119,6 +122,31 @@ ShellRoot {
     fixture.modelChanged()
     check(panel.noteDraft === "changed externally" && !panel.noteDirty,
       "untouched note did not follow an external metadata change")
+  }
+
+  function operationChecks() {
+    select(entry("rename-source", ""))
+    panel.beginEditor("rename")
+    panel.editorValue = "occupied-name"
+    panel.commitEditor()
+    check(panel.editorMode === "rename",
+      "Rename dialog closed before the atomic operation completed")
+    fixture.actionFinished("rename", false, "That name already exists")
+    check(panel.editorMode === "rename" && panel.editorError === "That name already exists",
+      "Rename conflict was not left visible in the dialog")
+    fixture.actionFinished("rename", true, "Renamed")
+    check(panel.editorMode === "", "Successful rename did not close its dialog")
+
+    fixture.trashEntries = [{ uri: "trash:///old.txt", name: "old.txt",
+      originalPath: "/quickfile-test/old.txt" }]
+    panel.openTrashBrowser()
+    check(panel.editorMode === "trash-browser", "Trash browser did not open")
+    panel.confirmTrashDelete(fixture.trashEntries[0])
+    check(panel.editorMode === "trash-delete" && panel.pendingTrashEntry.name === "old.txt",
+      "Permanent delete did not require a separate confirmation state")
+    panel.commitEditor()
+    check(panel.editorMode === "trash-browser" && panel.pendingTrashEntry === null,
+      "Confirmed permanent delete did not return to Trash")
   }
 
   function prepareViewport() {
@@ -221,6 +249,7 @@ ShellRoot {
   Component.onCompleted: {
     try {
       metadataChecks()
+      operationChecks()
       prepareViewport()
       viewportTimer.start()
     } catch (error) {

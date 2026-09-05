@@ -24,6 +24,7 @@ Item {
   property string editorMode: ""
   property string editorValue: ""
   property string editorError: ""
+  property var pendingTrashEntry: null
   property string hoveredToken: ""
   property string metadataToken: service ? String(service.selectedToken || "") : ""
   property string noteDraft: ""
@@ -478,6 +479,34 @@ Item {
     editorMode = mode
   }
 
+  function openTrashBrowser() {
+    if (!service) return
+    pendingTrashEntry = null
+    editorError = ""
+    editorMode = "trash-browser"
+    service.reloadTrash()
+  }
+
+  function confirmTrashDelete(entry) {
+    pendingTrashEntry = entry
+    editorError = ""
+    editorMode = "trash-delete"
+  }
+
+  function operationStatus() {
+    if (!service || !service.operationBusy) return ""
+    if (service.operationCancelling) return "Cancelling…"
+    var labels = ({ scanning: "Scanning", copying: "Copying", moving: "Moving",
+      trashing: "Moving to Trash", restoring: "Restoring", deleting: "Deleting",
+      undoing: "Undoing", starting: "Starting" })
+    var label = labels[service.operationPhase] || "Working"
+    if (service.operationProgress >= 0)
+      label += "  " + Math.round(service.operationProgress * 100) + "%"
+    if (service.operationItemsTotal > 0)
+      label += "  ·  " + service.operationItemsDone + "/" + service.operationItemsTotal
+    return label
+  }
+
   function commitEditor() {
     if (!service) return
     if (editorMode === "knowledge-links") {
@@ -487,8 +516,15 @@ Item {
     }
     if (editorMode === "trash") {
       if (!service.selectedToken) return
-      service.trashSelected()
-      editorMode = ""
+      if (service.trashSelected()) editorMode = ""
+      return
+    }
+    if (editorMode === "trash-delete") {
+      if (!pendingTrashEntry || !pendingTrashEntry.uri) return
+      if (service.permanentlyDeleteTrash(String(pendingTrashEntry.uri))) {
+        pendingTrashEntry = null
+        editorMode = "trash-browser"
+      }
       return
     }
     var name = String(editorValue || "")
@@ -499,7 +535,7 @@ Item {
     var started = editorMode === "new-file" ? service.createFile(name)
       : editorMode === "new-folder" ? service.createFolder(name)
       : editorMode === "rename" ? service.renameSelected(name) : false
-    if (started) editorMode = ""
+    if (started && editorMode !== "rename") editorMode = ""
   }
 
   Connections {
@@ -520,6 +556,14 @@ Item {
     function onActionFinished(kind, ok, message) {
       if (kind === "metadata") root.finishMetadataSave(ok)
       if (!ok) root.editorError = message
+      else if (kind === "rename" && root.editorMode === "rename") {
+        root.editorError = ""
+        root.editorMode = ""
+      } else if ((kind === "restore" || kind === "trash-delete")
+          && root.editorMode === "trash-browser") {
+        root.editorError = ""
+        root.service.reloadTrash()
+      }
     }
     function onKnowledgeLinksFinished(ok, applied, message) {
       if (!ok) root.editorError = message
@@ -714,6 +758,11 @@ Item {
                 && (event.modifiers & Qt.ControlModifier) !== 0) {
               root.service.selectAllVisible()
               event.accepted = true
+            } else if (event.key === Qt.Key_Z
+                && (event.modifiers & Qt.ControlModifier) !== 0) {
+              if (root.service && root.service.undoAvailable)
+                root.service.undoLast()
+              event.accepted = true
             } else if (event.key === Qt.Key_C
                 && (event.modifiers & Qt.ControlModifier) !== 0) {
               root.service.copySelected()
@@ -802,6 +851,11 @@ Item {
                 glyph: "󰉓"
                 tooltip: "New folder"
                 onClicked: root.beginEditor("new-folder")
+              }
+              Components.IconButton {
+                glyph: "󰩺"
+                tooltip: "Trash"
+                onClicked: root.openTrashBrowser()
               }
               Components.IconButton {
                 glyph: "󰑐"
@@ -1583,14 +1637,51 @@ Item {
             color: Qt.alpha(root.foreground, 0.025)
             border.width: 0
 
-            Text {
+            Rectangle {
               anchors.left: parent.left
+              anchors.bottom: parent.bottom
+              height: Style.space(2)
+              width: root.service && root.service.operationProgress >= 0
+                ? parent.width * root.service.operationProgress : 0
+              color: root.accent
+              visible: root.service && root.service.operationBusy
+              Behavior on width { NumberAnimation { duration: 90 } }
+            }
+
+            Row {
+              id: footerActions
+              anchors.left: parent.left
+              anchors.leftMargin: Style.space(5)
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.space(2)
+              Components.IconButton {
+                visible: root.service && root.service.operationBusy
+                glyph: "󰜺"
+                tooltip: "Cancel operation"
+                buttonSize: Style.space(23)
+                available: root.service && !root.service.operationCancelling
+                onClicked: root.service.cancelOperation()
+              }
+              Components.IconButton {
+                visible: root.service && !root.service.operationBusy
+                  && root.service.undoAvailable
+                glyph: "󰕌"
+                tooltip: "Undo " + (root.service ? root.service.undoLabel : "") + "  ·  Ctrl+Z"
+                buttonSize: Style.space(23)
+                available: root.service && root.service.undoAvailable
+                onClicked: root.service.undoLast()
+              }
+            }
+
+            Text {
+              anchors.left: footerActions.right
               anchors.right: parent.right
-              anchors.leftMargin: Style.space(10)
+              anchors.leftMargin: Style.space(5)
               anchors.rightMargin: Style.space(10)
               anchors.verticalCenter: parent.verticalCenter
               horizontalAlignment: Text.AlignRight
               text: !root.service ? ""
+                : root.service.operationBusy ? root.operationStatus()
                 : root.service.actionBusy ? "Working…"
                 : root.service.clipboardToken !== ""
                   ? ((root.service.clipboardMode === "cut" ? "Cut: " : "Copy: ")
@@ -2432,6 +2523,8 @@ Item {
 
             onVisibleChanged: {
               if (visible && root.editorMode !== "trash"
+                  && root.editorMode !== "trash-browser"
+                  && root.editorMode !== "trash-delete"
                   && root.editorMode !== "knowledge-links") {
                 Qt.callLater(function() {
                   editorField.selectAll()
@@ -2461,6 +2554,8 @@ Item {
                   text: root.editorMode === "new-file" ? "Create file"
                     : root.editorMode === "new-folder" ? "Create folder"
                     : root.editorMode === "rename" ? "Rename item"
+                    : root.editorMode === "trash-browser" ? "Trash"
+                    : root.editorMode === "trash-delete" ? "Delete permanently?"
                     : root.editorMode === "knowledge-links"
                       ? "Connect Project Knowledge"
                     : "Move to Trash?"
@@ -2472,18 +2567,113 @@ Item {
                 }
 
                 Text {
-                  visible: root.editorMode === "trash"
+                  visible: root.editorMode === "trash" || root.editorMode === "trash-delete"
                   width: parent.width
                   wrapMode: Text.Wrap
-                  text: !root.service || !root.service.selectedEntry ? ""
+                  text: root.editorMode === "trash-delete"
+                    ? (!root.pendingTrashEntry ? ""
+                      : ("“" + root.pendingTrashEntry.name
+                        + "” will be deleted permanently. This cannot be undone."))
+                    : (!root.service || !root.service.selectedEntry ? ""
                     : root.service.selectedTokens.length > 1
                       ? (root.service.selectedTokens.length
                         + " selected items can be restored from Trash.")
                       : ("“" + root.service.selectedEntry.name
-                        + "” can be restored from Trash.")
+                        + "” can be restored from Trash."))
                   color: root.muted
                   font.family: Style.font.family
                   font.pixelSize: Style.font.bodySmall
+                  renderType: Text.NativeRendering
+                }
+
+                ListView {
+                  id: trashList
+                  visible: root.editorMode === "trash-browser"
+                  width: parent.width
+                  height: visible ? Style.space(330) : 0
+                  spacing: Style.space(5)
+                  clip: true
+                  boundsBehavior: Flickable.StopAtBounds
+                  model: root.service ? root.service.trashEntries : []
+
+                  delegate: Rectangle {
+                    id: trashRow
+                    required property var modelData
+                    width: ListView.view.width
+                    height: Style.space(58)
+                    radius: Style.cornerRadius > 0 ? Style.space(4) : 0
+                    color: Qt.alpha(root.foreground, 0.035)
+                    border.width: 1
+                    border.color: root.borderColor
+
+                    Column {
+                      anchors.left: parent.left
+                      anchors.leftMargin: Style.space(8)
+                      anchors.right: trashActions.left
+                      anchors.rightMargin: Style.space(7)
+                      anchors.verticalCenter: parent.verticalCenter
+                      spacing: Style.space(2)
+                      Text {
+                        width: parent.width
+                        text: String(trashRow.modelData.name || "")
+                        color: root.foreground
+                        elide: Text.ElideMiddle
+                        font.family: Style.font.family
+                        font.pixelSize: Style.font.bodySmall
+                        renderType: Text.NativeRendering
+                      }
+                      Text {
+                        width: parent.width
+                        text: String(trashRow.modelData.originalPath || "")
+                        color: root.muted
+                        elide: Text.ElideMiddle
+                        font.family: Style.font.family
+                        font.pixelSize: Style.font.caption
+                        renderType: Text.NativeRendering
+                      }
+                    }
+
+                    Row {
+                      id: trashActions
+                      anchors.right: parent.right
+                      anchors.rightMargin: Style.space(6)
+                      anchors.verticalCenter: parent.verticalCenter
+                      spacing: Style.space(4)
+                      Components.IconButton {
+                        glyph: "󰁯"
+                        tooltip: "Restore"
+                        buttonSize: Style.space(25)
+                        available: root.service && !root.service.actionBusy
+                        onClicked: root.service.restoreTrash(String(trashRow.modelData.uri))
+                      }
+                      Components.IconButton {
+                        glyph: "󰆴"
+                        tooltip: "Delete permanently"
+                        buttonSize: Style.space(25)
+                        available: root.service && !root.service.actionBusy
+                        onClicked: root.confirmTrashDelete(trashRow.modelData)
+                      }
+                    }
+                  }
+
+                  ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                }
+
+                Text {
+                  visible: root.editorMode === "trash-browser"
+                    && root.service && (root.service.trashBusy
+                      || root.service.trashEntries.length === 0
+                      || root.service.trashError !== "")
+                  width: parent.width
+                  horizontalAlignment: Text.AlignHCenter
+                  wrapMode: Text.Wrap
+                  text: !root.service ? ""
+                    : root.service.trashBusy ? "Loading Trash…"
+                    : root.service.trashError ? root.service.trashError
+                    : "Trash is empty"
+                  color: root.service && root.service.trashError ? Color.urgent : root.muted
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
                   renderType: Text.NativeRendering
                 }
 
@@ -2656,25 +2846,29 @@ Item {
                   spacing: Style.space(7)
                   ActionButton {
                     glyph: "󰅖"
-                    label: "Cancel"
+                    label: root.editorMode === "trash-browser" ? "Close" : "Cancel"
                     onClicked: {
                       root.editorMode = ""
                       keyScope.forceActiveFocus()
                     }
                   }
                   ActionButton {
+                    visible: root.editorMode !== "trash-browser"
                     glyph: root.editorMode === "trash" ? "󰩺"
+                      : root.editorMode === "trash-delete" ? "󰆴"
                       : root.editorMode === "knowledge-links" ? "󰌷" : "󰄬"
                     label: root.editorMode === "trash" ? "Move to Trash"
+                      : root.editorMode === "trash-delete" ? "Delete permanently"
                       : root.editorMode === "knowledge-links"
                         ? (!root.service || !root.service.knowledgeLinkPlan
                           ? "Preparing…"
                           : "Create " + root.service.knowledgeLinkPlan.createCount)
                       : "Confirm"
-                    enabled: root.editorMode !== "knowledge-links"
+                    enabled: root.service && !root.service.actionBusy
+                      && (root.editorMode !== "knowledge-links"
                       || (root.service && root.service.knowledgeLinkPlan
                         && root.service.knowledgeLinkPlan.createCount > 0
-                        && !root.service.actionBusy)
+                        && !root.service.actionBusy))
                     onClicked: root.commitEditor()
                   }
                 }

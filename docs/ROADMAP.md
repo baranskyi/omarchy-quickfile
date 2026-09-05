@@ -8,16 +8,17 @@ identity, navigation/search, metadata, and a small set of recoverable actions.
 
 - [x] Hyprland-aware dock mode that pushes tiled windows aside.
 
-## 0.2 — complete file operations (complete)
+## 0.2 — core file operations (complete)
 
 - [x] Single-item copy, cut, paste, move and duplicate with keep-both naming.
 - [x] Desktop-style multi-selection and batch copy, cut, paste, duplicate and Trash.
-- [ ] Per-operation progress reporting.
-- Collision policy: replace, merge, keep both, skip, and apply-to-all.
-- Operation journal with undo where the underlying operation is reversible.
-- Trash module using GIO metadata, restore to original path, and explicit
+- [x] Per-operation progress reporting and cancellation for recursive transfers.
+- [x] Atomic no-replace rename; copy/move collisions use bounded keep-both naming.
+- [ ] Optional advanced collision policy: merge, skip, replace, and apply-to-all.
+- [x] Persistent operation journal with guarded undo for reversible operations.
+- [x] Trash module using GIO metadata, restore to original path, and explicit
   permanent-delete confirmation.
-- Mount/eject support through UDisks without privileged shell commands.
+- [x] Mount/eject support through UDisks without privileged shell commands.
 
 ## 0.3 — navigation, organization and preview (complete)
 

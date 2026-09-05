@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import argparse
 import base64
+import ctypes
 import datetime as dt
+import errno
 import grp
 import hashlib
 import json
@@ -18,18 +20,21 @@ import mimetypes
 import os
 import pwd
 import re
+import selectors
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Iterable
 
 
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 DEFAULT_LIMIT = 2000
 COMMAND_TIMEOUT = 3
 DEFAULT_CONTENT_FILE_LIMIT = 1024 * 1024
@@ -42,6 +47,11 @@ FAVORITES_LIMIT = 200
 COLOR_KEYS = {"red", "yellow", "orange", "green", "cyan", "blue", "magenta", "brown"}
 KNOWLEDGE_LIMIT = 128
 WATCH_PATH_LIMIT = 4096
+OPERATION_ENTRY_LIMIT = 250000
+OPERATION_DEPTH_LIMIT = 128
+OPERATION_HISTORY_LIMIT = 50
+OPERATION_HISTORY_SIZE_LIMIT = 2 * 1024 * 1024
+COPY_CHUNK_SIZE = 1024 * 1024
 KNOWLEDGE_AGENT_ORDER = (
     "codex", "claude", "gemini", "cursor", "copilot", "windsurf",
 )
@@ -54,8 +64,13 @@ class QuickfileError(Exception):
         self.code = code
 
 
+class OperationCancelled(QuickfileError):
+    def __init__(self) -> None:
+        super().__init__("Operation cancelled", "cancelled")
+
+
 def json_print(value: dict[str, Any]) -> None:
-    print(json.dumps(value, ensure_ascii=True, separators=(",", ":")))
+    print(json.dumps(value, ensure_ascii=True, separators=(",", ":")), flush=True)
 
 
 def display_text(value: str) -> str:
@@ -277,20 +292,51 @@ def iso_time(timestamp: float | int | None) -> str:
 
 def run_bounded(argv: list[str], *, timeout: int = COMMAND_TIMEOUT, limit: int = 131072) -> tuple[int, str, str]:
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             argv,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=timeout,
-            check=False,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except OSError as exc:
         return 127, "", str(exc)
-    return (
-        result.returncode,
-        result.stdout[:limit].decode("utf-8", "replace"),
-        result.stderr[:8192].decode("utf-8", "replace"),
-    )
+    output = bytearray()
+    errors = bytearray()
+    selector = selectors.DefaultSelector()
+    assert process.stdout is not None and process.stderr is not None
+    selector.register(process.stdout, selectors.EVENT_READ, (output, max(0, limit)))
+    selector.register(process.stderr, selectors.EVENT_READ, (errors, 8192))
+    deadline = time.monotonic() + timeout
+    timed_out = False
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                process.kill()
+                remaining = 0.2
+            events = selector.select(min(max(remaining, 0.01), 0.2))
+            for key, _mask in events:
+                chunk = os.read(key.fileobj.fileno(), 8192)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                buffer, bound = key.data
+                if len(buffer) < bound:
+                    buffer.extend(chunk[:bound - len(buffer)])
+            if timed_out and process.poll() is not None and not events:
+                # The next selector iteration drains any final pipe bytes/EOF.
+                continue
+        return_code = process.wait()
+    finally:
+        selector.close()
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        process.stdout.close()
+        process.stderr.close()
+    if timed_out:
+        return 127, output.decode("utf-8", "replace"), f"Command timed out after {timeout}s"
+    return return_code, output.decode("utf-8", "replace"), errors.decode("utf-8", "replace")
 
 
 def human_size(size: int) -> str:
@@ -1794,6 +1840,748 @@ def action_paths_from_args(args: argparse.Namespace) -> list[str]:
     return paths
 
 
+def operation_history_file() -> Path:
+    override = os.environ.get("QUICKFILE_STATE_FILE", "").strip()
+    if override:
+        return Path(override).expanduser()
+    state_home = os.environ.get("XDG_STATE_HOME", "").strip()
+    base = Path(state_home).expanduser() if state_home else Path.home() / ".local" / "state"
+    return base / "omarchy" / "quickfile" / "operations.json"
+
+
+def load_operation_history() -> list[dict[str, Any]]:
+    path = operation_history_file()
+    try:
+        if not path.exists():
+            return []
+        if path.stat().st_size > OPERATION_HISTORY_SIZE_LIMIT:
+            raise QuickfileError("Operation history is too large", "history-too-large")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except QuickfileError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise QuickfileError(f"Could not read operation history: {exc}", "history-read-failed") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("operations"), list):
+        raise QuickfileError("Operation history has an invalid format", "history-invalid")
+    return [item for item in payload["operations"] if isinstance(item, dict)][-OPERATION_HISTORY_LIMIT:]
+
+
+def save_operation_history(operations: list[dict[str, Any]]) -> None:
+    path = operation_history_file()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    payload = json.dumps(
+        {"version": 1, "operations": operations[-OPERATION_HISTORY_LIMIT:]},
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ) + "\n"
+    if len(payload.encode("utf-8")) > OPERATION_HISTORY_SIZE_LIMIT:
+        raise QuickfileError("Operation history is too large", "history-too-large")
+    descriptor, temporary = tempfile.mkstemp(prefix=".operations.", dir=path.parent)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            descriptor = -1
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except OSError as exc:
+        raise QuickfileError(f"Could not save operation history: {exc}", "history-write-failed") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def record_operation(kind: str, label: str, inverse: dict[str, Any]) -> dict[str, Any]:
+    operations = load_operation_history()
+    record = {
+        "id": uuid.uuid4().hex,
+        "kind": kind,
+        "label": label,
+        "createdAt": iso_time(time.time()),
+        "inverse": inverse,
+    }
+    operations.append(record)
+    save_operation_history(operations)
+    return record
+
+
+def history_command(_args: argparse.Namespace) -> dict[str, Any]:
+    operations = load_operation_history()
+    last = operations[-1] if operations else None
+    return {
+        "ok": True,
+        "undoAvailable": last is not None,
+        "operation": {
+            "id": str(last.get("id", "")),
+            "kind": str(last.get("kind", "")),
+            "label": str(last.get("label", "")),
+        } if last else None,
+    }
+
+
+def rename_noreplace(source: str, target: str) -> bool:
+    """Atomically rename *source* without ever replacing *target* on Linux."""
+    source = normalized_path(source)
+    target = normalized_path(target)
+    if source == target:
+        return False
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = libc.renameat2
+    except (OSError, AttributeError):
+        renameat2 = None
+    if renameat2 is not None:
+        renameat2.argtypes = (
+            ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint,
+        )
+        renameat2.restype = ctypes.c_int
+        result = renameat2(-100, os.fsencode(source), -100, os.fsencode(target), 1)
+        if result == 0:
+            return True
+        error = ctypes.get_errno()
+        if error in {errno.EEXIST, errno.ENOTEMPTY}:
+            raise QuickfileError(
+                f'“{display_text(os.path.basename(target))}” already exists',
+                "name-conflict",
+            )
+        raise OSError(error, os.strerror(error), source, target)
+
+    # Safe fallback for non-directories. It preserves the no-clobber guarantee,
+    # although Linux installations used by Omarchy normally provide renameat2.
+    if os.path.isdir(source) and not os.path.islink(source):
+        raise QuickfileError("Safe folder rename is unavailable on this system", "safe-rename-unavailable")
+    try:
+        os.link(source, target, follow_symlinks=False)
+    except FileExistsError as exc:
+        raise QuickfileError(
+            f'“{display_text(os.path.basename(target))}” already exists', "name-conflict"
+        ) from exc
+    try:
+        os.unlink(source)
+    except OSError:
+        os.unlink(target)
+        raise
+    return True
+
+
+def path_identity(path: str) -> dict[str, Any]:
+    details = os.lstat(path)
+    identity = {
+        "device": details.st_dev,
+        "inode": details.st_ino,
+        "mode": stat.S_IFMT(details.st_mode),
+        "size": details.st_size,
+        "mtimeNs": details.st_mtime_ns,
+    }
+    if stat.S_ISDIR(details.st_mode):
+        digest = hashlib.sha256()
+        pending = [(path, "", 0)]
+        count = 0
+        while pending:
+            check_operation_cancelled()
+            current, relative, depth = pending.pop()
+            if depth > OPERATION_DEPTH_LIMIT or count >= OPERATION_ENTRY_LIMIT:
+                raise QuickfileError("Folder changed beyond the safe undo limit", "undo-scan-limit")
+            current_stat = os.lstat(current)
+            digest.update(os.fsencode(relative))
+            digest.update(b"\0")
+            digest.update(
+                f"{stat.S_IFMT(current_stat.st_mode)}:{current_stat.st_dev}:"
+                f"{current_stat.st_ino}:{current_stat.st_size}:{current_stat.st_mtime_ns}".encode("ascii")
+            )
+            if stat.S_ISLNK(current_stat.st_mode):
+                digest.update(b"\0" + os.fsencode(os.readlink(current)))
+            elif stat.S_ISDIR(current_stat.st_mode):
+                with os.scandir(current) as iterator:
+                    children = sorted(iterator, key=lambda entry: os.fsencode(entry.name), reverse=True)
+                for child in children:
+                    child_relative = os.path.join(relative, child.name) if relative else child.name
+                    pending.append((child.path, child_relative, depth + 1))
+            count += 1
+        identity["treeHash"] = digest.hexdigest()
+        identity["treeItems"] = count
+    return identity
+
+
+def identity_matches(path: str, expected: dict[str, Any]) -> bool:
+    try:
+        return path_identity(path) == expected
+    except OSError:
+        return False
+
+
+def discard_history_referencing_trash(uris: set[str]) -> None:
+    if not uris:
+        return
+    operations = load_operation_history()
+    kept = []
+    for record in operations:
+        inverse = record.get("inverse", {})
+        items = inverse.get("items", []) if isinstance(inverse, dict) else []
+        references = {
+            str(item.get("uri", "")) for item in items if isinstance(item, dict)
+        }
+        if references.isdisjoint(uris):
+            kept.append(record)
+    if len(kept) != len(operations):
+        save_operation_history(kept)
+
+
+_operation_cancelled = False
+
+
+def request_operation_cancel(_signum: int, _frame: Any) -> None:
+    global _operation_cancelled
+    _operation_cancelled = True
+
+
+def check_operation_cancelled() -> None:
+    if _operation_cancelled:
+        raise OperationCancelled()
+
+
+class OperationReporter:
+    def __init__(self, callback: Any = json_print) -> None:
+        self.callback = callback
+        self.last_emit = 0.0
+
+    def emit(self, phase: str, *, force: bool = False, **values: Any) -> None:
+        now = time.monotonic()
+        if not force and now - self.last_emit < 0.08:
+            return
+        self.last_emit = now
+        self.callback({"event": "progress", "phase": phase, **values})
+
+
+def scan_copy_source(source: str, reporter: OperationReporter) -> tuple[list[dict[str, Any]], int]:
+    source = normalized_path(source)
+    entries: list[dict[str, Any]] = []
+    total_bytes = 0
+
+    def visit(path: str, relative: str, depth: int) -> None:
+        nonlocal total_bytes
+        check_operation_cancelled()
+        if depth > OPERATION_DEPTH_LIMIT:
+            raise QuickfileError("Folder nesting is too deep to copy safely", "copy-depth-limit")
+        if len(entries) >= OPERATION_ENTRY_LIMIT:
+            raise QuickfileError(
+                f"Folder contains more than {OPERATION_ENTRY_LIMIT:,} items",
+                "copy-entry-limit",
+            )
+        details = os.lstat(path)
+        if stat.S_ISLNK(details.st_mode):
+            kind = "link"
+            size = 0
+        elif stat.S_ISDIR(details.st_mode):
+            kind = "directory"
+            size = 0
+        elif stat.S_ISREG(details.st_mode):
+            kind = "file"
+            size = details.st_size
+            total_bytes += size
+        else:
+            raise QuickfileError(
+                f'“{display_text(os.path.basename(path))}” is a special file and cannot be copied',
+                "unsupported-file-type",
+            )
+        entries.append({"path": path, "relative": relative, "kind": kind, "size": size})
+        reporter.emit("scanning", itemsDone=len(entries), itemsTotal=-1,
+                      bytesDone=total_bytes, bytesTotal=-1)
+        if kind == "directory":
+            with os.scandir(path) as iterator:
+                for child in iterator:
+                    child_relative = os.path.join(relative, child.name) if relative else child.name
+                    visit(child.path, child_relative, depth + 1)
+
+    visit(source, "", 0)
+    reporter.emit("scanning", force=True, itemsDone=len(entries), itemsTotal=len(entries),
+                  bytesDone=total_bytes, bytesTotal=total_bytes)
+    return entries, total_bytes
+
+
+def remove_created_path(path: str) -> None:
+    if os.path.islink(path) or not os.path.isdir(path):
+        os.unlink(path)
+    else:
+        shutil.rmtree(path)
+
+
+def copy_regular_file(source: str, target: str, reporter: OperationReporter,
+                      progress: dict[str, int]) -> None:
+    details = os.stat(source, follow_symlinks=False)
+    descriptor = -1
+    created = False
+    try:
+        descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, details.st_mode & 0o777)
+        created = True
+        first_chunk = True
+        with open(source, "rb") as input_stream, os.fdopen(descriptor, "wb") as output_stream:
+            descriptor = -1
+            while True:
+                check_operation_cancelled()
+                chunk = input_stream.read(COPY_CHUNK_SIZE)
+                if not chunk:
+                    break
+                output_stream.write(chunk)
+                progress["bytesDone"] += len(chunk)
+                reporter.emit("copying", force=first_chunk, **progress)
+                first_chunk = False
+                check_operation_cancelled()
+        shutil.copystat(source, target, follow_symlinks=False)
+    except BaseException:
+        if created:
+            try:
+                os.unlink(target)
+            except OSError:
+                pass
+        raise
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def copy_scanned_source(source: str, target: str, entries: list[dict[str, Any]],
+                        total_bytes: int, reporter: OperationReporter,
+                        totals: dict[str, int]) -> None:
+    progress = {
+        "itemsDone": totals["itemsDone"],
+        "itemsTotal": totals["itemsTotal"],
+        "bytesDone": totals["bytesDone"],
+        "bytesTotal": totals["bytesTotal"],
+    }
+    created = False
+    try:
+        root_kind = str(entries[0]["kind"])
+        if root_kind == "directory":
+            os.mkdir(target, os.stat(source, follow_symlinks=False).st_mode & 0o777)
+        elif root_kind == "link":
+            os.symlink(os.readlink(source), target)
+        else:
+            copy_regular_file(source, target, reporter, progress)
+        created = True
+
+        if root_kind == "directory":
+            directories: list[tuple[str, str]] = [(source, target)]
+            for entry in entries[1:]:
+                check_operation_cancelled()
+                destination = os.path.join(target, str(entry["relative"]))
+                kind = str(entry["kind"])
+                if kind == "directory":
+                    os.mkdir(destination, os.stat(entry["path"], follow_symlinks=False).st_mode & 0o777)
+                    directories.append((str(entry["path"]), destination))
+                elif kind == "link":
+                    os.symlink(os.readlink(entry["path"]), destination)
+                    try:
+                        shutil.copystat(entry["path"], destination, follow_symlinks=False)
+                    except OSError:
+                        pass
+                else:
+                    copy_regular_file(str(entry["path"]), destination, reporter, progress)
+                progress["itemsDone"] += 1
+                reporter.emit("copying", **progress)
+            for original, destination in reversed(directories):
+                shutil.copystat(original, destination, follow_symlinks=False)
+        progress["itemsDone"] += 1
+        totals.update(itemsDone=progress["itemsDone"], bytesDone=progress["bytesDone"])
+        reporter.emit("copying", force=True, **progress)
+    except BaseException:
+        if created:
+            try:
+                remove_created_path(target)
+            except OSError:
+                pass
+        raise
+
+
+def trash_rows() -> list[dict[str, Any]]:
+    code, output, error = run_bounded(["gio", "trash", "--list"], timeout=10)
+    if code != 0:
+        raise QuickfileError(error.strip() or "Could not read Trash", "trash-list-failed")
+    rows: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        if not line or "\t" not in line:
+            continue
+        uri, original = line.split("\t", 1)
+        if not uri.startswith("trash:///"):
+            continue
+        rows.append({
+            "uri": uri,
+            "name": display_text(os.path.basename(original.rstrip(os.sep)) or original),
+            "originalPath": display_text(original),
+            "originalToken": encode_path(original),
+        })
+        if len(rows) >= DEFAULT_LIMIT:
+            break
+    return rows
+
+
+def trash_list_command(_args: argparse.Namespace) -> dict[str, Any]:
+    rows = trash_rows()
+    return {"ok": True, "entries": rows, "count": len(rows),
+            "truncated": len(rows) >= DEFAULT_LIMIT}
+
+
+def require_trash_uri(uri: str) -> dict[str, Any]:
+    if not uri or not uri.startswith("trash:///"):
+        raise QuickfileError("Invalid Trash item", "invalid-trash-uri")
+    for row in trash_rows():
+        if row["uri"] == uri:
+            return row
+    raise QuickfileError("The Trash item no longer exists", "trash-item-missing")
+
+
+def trash_uris_from_args(args: argparse.Namespace) -> list[str]:
+    raw = getattr(args, "trash_uris_json", None)
+    if raw:
+        try:
+            values = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise QuickfileError("Invalid Trash item list", "invalid-trash-uri-list") from exc
+        if not isinstance(values, list) or not values or len(values) > 500:
+            raise QuickfileError("Select between 1 and 500 Trash items", "invalid-trash-uri-list")
+        return [str(value) for value in values]
+    uri = str(getattr(args, "trash_uri", "") or "")
+    return [uri] if uri else []
+
+
+def unique_transfer_target(source: str, destination_dir: str) -> str:
+    source_is_dir = os.path.isdir(source) and not os.path.islink(source)
+    target = os.path.join(destination_dir, os.path.basename(source))
+    if not os.path.lexists(target):
+        return target
+    parent = os.path.dirname(target)
+    name = os.path.basename(target)
+    stem, suffix = (name, "") if source_is_dir else os.path.splitext(name)
+    for number in range(1, 10001):
+        marker = " (copy)" if number == 1 else f" (copy {number})"
+        candidate = os.path.join(parent, f"{stem}{marker}{suffix}")
+        if not os.path.lexists(candidate):
+            return candidate
+    raise QuickfileError("Could not choose a free destination name", "name-space-exhausted")
+
+
+def operation_result(action: str, message: str, **values: Any) -> dict[str, Any]:
+    return {"event": "result", "ok": True, "action": action, "message": message, **values}
+
+
+def rebase_saved_metadata(source: str, target: str) -> None:
+    metadata = load_metadata_store()
+    if rebase_metadata_records(metadata, source, target):
+        save_metadata_store(metadata)
+
+
+def move_path_noreplace(source: str, target: str, reporter: OperationReporter) -> None:
+    try:
+        rename_noreplace(source, target)
+        rebase_saved_metadata(source, target)
+        return
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+    entries, total_bytes = scan_copy_source(source, reporter)
+    totals = {"itemsDone": 0, "itemsTotal": len(entries),
+              "bytesDone": 0, "bytesTotal": total_bytes}
+    copy_scanned_source(source, target, entries, total_bytes, reporter, totals)
+    try:
+        remove_created_path(source)
+    except BaseException:
+        # Keep both complete copies if removing the original fails; deleting the
+        # destination here could discard the only good copy after a source error.
+        raise
+    rebase_saved_metadata(source, target)
+
+
+def record_transfer_undo(action: str, completed: list[dict[str, Any]]) -> None:
+    if not completed:
+        return
+    if action == "move":
+        inverse = {"type": "move-back", "items": [
+            {"source": item["target"], "target": item["source"]} for item in completed
+        ]}
+    else:
+        inverse = {"type": "delete-created", "items": [
+            {"path": item["target"], "identity": item["identity"]} for item in completed
+        ]}
+    record_operation(action, action, inverse)
+
+
+def execute_transfer_plan(plan: dict[str, Any], action: str, totals: dict[str, int],
+                          reporter: OperationReporter) -> dict[str, Any] | None:
+    check_operation_cancelled()
+    if plan.get("unchanged"):
+        return None
+    source = str(plan["source"])
+    target = unique_transfer_target(source, str(plan["destination"]))
+    if plan.get("atomicMove"):
+        for _attempt in range(100):
+            try:
+                rename_noreplace(source, target)
+                break
+            except QuickfileError as exc:
+                if exc.code != "name-conflict":
+                    raise
+                target = unique_transfer_target(source, str(plan["destination"]))
+        else:
+            raise QuickfileError("Destination names keep changing", "name-conflict")
+        totals["itemsDone"] += 1
+        reporter.emit("moving", force=True, **totals)
+    else:
+        for _attempt in range(100):
+            try:
+                copy_scanned_source(source, target, plan["entries"], plan["bytes"], reporter, totals)
+                break
+            except FileExistsError:
+                target = unique_transfer_target(source, str(plan["destination"]))
+        else:
+            raise QuickfileError("Destination names keep changing", "name-conflict")
+        if action == "move":
+            remove_created_path(source)
+    if action == "move":
+        identity: dict[str, Any] = {}
+    else:
+        try:
+            identity = path_identity(target)
+        except BaseException:
+            # The undo fingerprint is part of a safe copy transaction. Do not
+            # leave an untracked result if fingerprinting is cancelled/fails.
+            remove_created_path(target)
+            raise
+    completed = {"source": source, "target": target, "identity": identity}
+    return completed
+
+
+def run_undo(reporter: OperationReporter) -> dict[str, Any]:
+    operations = load_operation_history()
+    if not operations:
+        raise QuickfileError("There is nothing to undo", "nothing-to-undo")
+    record = operations[-1]
+    inverse = record.get("inverse", {})
+    inverse_type = str(inverse.get("type", "")) if isinstance(inverse, dict) else ""
+    items = inverse.get("items", []) if isinstance(inverse, dict) else []
+    if not isinstance(items, list):
+        raise QuickfileError("The undo record is invalid", "history-invalid")
+    reporter.emit("undoing", force=True, itemsDone=0, itemsTotal=len(items),
+                  bytesDone=0, bytesTotal=0)
+    if inverse_type == "delete-created":
+        for item in items:
+            if not isinstance(item, dict) or not identity_matches(str(item.get("path", "")), item.get("identity", {})):
+                raise QuickfileError(
+                    "Undo stopped because a created item was changed or replaced",
+                    "undo-target-changed",
+                )
+        for index, item in enumerate(reversed(items), 1):
+            check_operation_cancelled()
+            remove_created_path(str(item["path"]))
+            reporter.emit("undoing", force=True, itemsDone=index, itemsTotal=len(items),
+                          bytesDone=0, bytesTotal=0)
+    elif inverse_type in {"rename", "move-back"}:
+        for index, item in enumerate(reversed(items), 1):
+            check_operation_cancelled()
+            source = str(item["source"])
+            target = str(item["target"])
+            if inverse_type == "move-back":
+                move_path_noreplace(source, target, reporter)
+            else:
+                rename_noreplace(source, target)
+                rebase_saved_metadata(source, target)
+            reporter.emit("undoing", force=True, itemsDone=index, itemsTotal=len(items),
+                          bytesDone=0, bytesTotal=0)
+    elif inverse_type == "restore-trash":
+        for index, item in enumerate(items, 1):
+            check_operation_cancelled()
+            uri = str(item.get("uri", ""))
+            require_trash_uri(uri)
+            code, _, error = run_bounded(["gio", "trash", "--restore", uri], timeout=30)
+            if code != 0:
+                raise QuickfileError(error.strip() or "Could not restore item", "trash-restore-failed")
+            reporter.emit("undoing", force=True, itemsDone=index, itemsTotal=len(items),
+                          bytesDone=0, bytesTotal=0)
+    elif inverse_type == "trash-paths":
+        for index, item in enumerate(items, 1):
+            check_operation_cancelled()
+            path = str(item.get("path", ""))
+            code, _, error = run_bounded(["gio", "trash", "--", path], timeout=30)
+            if code != 0:
+                raise QuickfileError(error.strip() or "Could not move item to Trash", "trash-failed")
+            reporter.emit("undoing", force=True, itemsDone=index, itemsTotal=len(items),
+                          bytesDone=0, bytesTotal=0)
+    else:
+        raise QuickfileError("This operation cannot be undone", "undo-unsupported")
+    operations.pop()
+    save_operation_history(operations)
+    return operation_result("undo", f'Undid {record.get("label", "operation")}', undoAvailable=bool(operations))
+
+
+def operation_command(args: argparse.Namespace, callback: Any = json_print) -> dict[str, Any]:
+    global _operation_cancelled
+    _operation_cancelled = False
+    reporter = OperationReporter(callback)
+    action = str(args.action)
+
+    if action == "undo":
+        return run_undo(reporter)
+
+    if action in {"restore", "trash-delete"}:
+        uris = trash_uris_from_args(args)
+        if not uris:
+            raise QuickfileError("Select a Trash item", "missing-trash-item")
+        completed: list[dict[str, Any]] = []
+        for index, uri in enumerate(uris, 1):
+            check_operation_cancelled()
+            row = require_trash_uri(uri)
+            if action == "restore":
+                code, _, error = run_bounded(["gio", "trash", "--restore", uri], timeout=30)
+                failure = "Could not restore item"
+            else:
+                code, _, error = run_bounded(["gio", "remove", uri], timeout=30)
+                failure = "Could not permanently delete item"
+            if code != 0:
+                if completed:
+                    discard_history_referencing_trash({str(row["uri"]) for row in completed})
+                    if action == "restore":
+                        record_operation("restore", "restore from Trash", {
+                            "type": "trash-paths",
+                            "items": [{"path": row["originalPath"]} for row in completed],
+                        })
+                raise QuickfileError(error.strip() or failure,
+                                     "trash-restore-failed" if action == "restore" else "trash-delete-failed")
+            completed.append(row)
+            reporter.emit("restoring" if action == "restore" else "deleting", force=True,
+                          itemsDone=index, itemsTotal=len(uris), bytesDone=0, bytesTotal=0)
+        if action == "restore":
+            discard_history_referencing_trash({str(row["uri"]) for row in completed})
+            record_operation("restore", "restore from Trash", {
+                "type": "trash-paths",
+                "items": [{"path": row["originalPath"]} for row in completed],
+            })
+        else:
+            discard_history_referencing_trash({str(row["uri"]) for row in completed})
+        return operation_result(action, "Restored from Trash" if action == "restore"
+                                else "Permanently deleted")
+
+    paths = action_paths_from_args(args)
+    if action == "rename":
+        if len(paths) != 1:
+            raise QuickfileError("Rename supports one item", "single-item-action")
+        source = paths[0]
+        target = os.path.join(os.path.dirname(source), require_name(args.name or ""))
+        changed = rename_noreplace(source, target)
+        if changed:
+            record_operation("rename", "rename", {
+                "type": "rename", "items": [{"source": target, "target": source}],
+            })
+            rebase_saved_metadata(source, target)
+        return operation_result(action, "Renamed" if changed else "Name unchanged",
+                                path=display_text(target), token=encode_path(target), changed=changed)
+
+    if action == "trash":
+        before = {row["uri"] for row in trash_rows()}
+        trashed: list[dict[str, Any]] = []
+        for index, path in enumerate(paths, 1):
+            check_operation_cancelled()
+            code, _, error = run_bounded(["gio", "trash", "--", path], timeout=30)
+            if code != 0:
+                if trashed:
+                    record_operation("trash", "move to Trash", {
+                        "type": "restore-trash",
+                        "items": [{"uri": row["uri"], "path": row["originalPath"]}
+                                  for row in trashed],
+                    })
+                raise QuickfileError(error.strip() or "Could not move item to Trash", "trash-failed")
+            current = trash_rows()
+            match = next((row for row in current
+                          if row["uri"] not in before
+                          and normalized_path(row["originalPath"]) == normalized_path(path)), None)
+            if match:
+                trashed.append(match)
+                before.add(match["uri"])
+            reporter.emit("trashing", force=True, itemsDone=index, itemsTotal=len(paths),
+                          bytesDone=0, bytesTotal=0)
+        if trashed:
+            record_operation("trash", "move to Trash", {
+                "type": "restore-trash",
+                "items": [{"uri": row["uri"], "path": row["originalPath"]} for row in trashed],
+            })
+        return operation_result(action, "Moved to Trash" if len(paths) == 1
+                                else f"Moved {len(paths)} items to Trash")
+
+    if action not in {"copy", "move", "duplicate"}:
+        raise QuickfileError(f"Unsupported operation: {action}", "unsupported-action")
+    destination = destination_from_args(args) if action != "duplicate" else ""
+    if destination and not os.path.isdir(destination):
+        raise QuickfileError("Destination is not a directory", "not-a-directory")
+
+    plans: list[dict[str, Any]] = []
+    total_items = 0
+    total_bytes = 0
+    for source in paths:
+        destination_dir = os.path.dirname(source) if action == "duplicate" else destination
+        if action == "move" and os.path.dirname(source) == destination_dir:
+            plans.append({"source": source, "destination": destination_dir, "unchanged": True})
+            continue
+        if os.path.isdir(source) and not os.path.islink(source):
+            try:
+                common = os.path.commonpath((os.path.realpath(source), os.path.realpath(destination_dir)))
+            except ValueError:
+                common = ""
+            if common == os.path.realpath(source):
+                raise QuickfileError("A folder cannot be copied or moved into itself", "recursive-transfer")
+        same_device_move = action == "move" and os.stat(source, follow_symlinks=False).st_dev == os.stat(destination_dir).st_dev
+        if same_device_move:
+            entries, bytes_count = [], 0
+        else:
+            entries, bytes_count = scan_copy_source(source, reporter)
+            total_items += len(entries)
+            total_bytes += bytes_count
+            if total_items > OPERATION_ENTRY_LIMIT:
+                raise QuickfileError(
+                    f"Selection contains more than {OPERATION_ENTRY_LIMIT:,} items",
+                    "copy-entry-limit",
+                )
+        plans.append({"source": source, "destination": destination_dir,
+                      "entries": entries, "bytes": bytes_count,
+                      "atomicMove": same_device_move, "unchanged": False})
+
+    totals = {"itemsDone": 0, "itemsTotal": total_items + sum(
+        1 for plan in plans if plan.get("atomicMove") is True),
+        "bytesDone": 0, "bytesTotal": total_bytes}
+    completed: list[dict[str, Any]] = []
+    for plan in plans:
+        try:
+            result = execute_transfer_plan(plan, action, totals, reporter)
+        except BaseException:
+            # A later item can fail after earlier batch items completed. Keep
+            # those completed changes undoable instead of orphaning them.
+            record_transfer_undo(action, completed)
+            raise
+        if result is not None:
+            completed.append(result)
+            if action == "move":
+                try:
+                    rebase_saved_metadata(str(result["source"]), str(result["target"]))
+                except BaseException:
+                    record_transfer_undo(action, completed)
+                    raise
+
+    record_transfer_undo(action, completed)
+    results = [{"path": display_text(item["target"]), "token": encode_path(item["target"])}
+               for item in completed]
+    changed_count = len(completed)
+    message = "Already in this folder" if not changed_count else (
+        "Moved" if action == "move" else "Duplicated" if action == "duplicate" else "Copied"
+    )
+    if changed_count > 1:
+        message += f" {changed_count} items"
+    return operation_result(action, message, changed=changed_count > 0, results=results,
+                            path=results[0]["path"] if results else "",
+                            token=results[0]["token"] if results else "")
+
+
 def keep_both_path(path: str, *, directory: bool) -> str:
     if not os.path.lexists(path):
         return path
@@ -1805,13 +2593,17 @@ def keep_both_path(path: str, *, directory: bool) -> str:
         stem, suffix = os.path.splitext(name)
     candidate = os.path.join(parent, f"{stem} (copy){suffix}")
     number = 2
-    while os.path.lexists(candidate):
+    while os.path.lexists(candidate) and number <= 10000:
         candidate = os.path.join(parent, f"{stem} (copy {number}){suffix}")
         number += 1
+    if os.path.lexists(candidate):
+        raise QuickfileError("Could not choose a free destination name", "name-space-exhausted")
     return candidate
 
 
 def transfer_path(source: str, destination_dir: str, *, move: bool) -> tuple[str, bool]:
+    global _operation_cancelled
+    _operation_cancelled = False
     if not os.path.isdir(destination_dir):
         raise QuickfileError("Destination is not a directory", "not-a-directory")
     source = normalized_path(source)
@@ -1829,24 +2621,21 @@ def transfer_path(source: str, destination_dir: str, *, move: bool) -> tuple[str
         if common == os.path.realpath(source):
             raise QuickfileError("A folder cannot be copied or moved into itself", "recursive-transfer")
 
-    target = keep_both_path(
-        os.path.join(destination_dir, os.path.basename(source)),
-        directory=source_is_dir,
-    )
+    target = unique_transfer_target(source, destination_dir)
     if move:
-        shutil.move(source, target)
-    elif source_is_link:
-        os.symlink(os.readlink(source), target)
         try:
-            shutil.copystat(source, target, follow_symlinks=False)
-        except OSError:
-            pass
-    elif source_is_dir:
-        shutil.copytree(source, target, symlinks=True, copy_function=shutil.copy2)
-    elif os.path.isfile(source):
-        shutil.copy2(source, target, follow_symlinks=False)
-    else:
-        raise QuickfileError("This special file type cannot be copied", "unsupported-file-type")
+            rename_noreplace(source, target)
+            return target, True
+        except OSError as exc:
+            if exc.errno != errno.EXDEV:
+                raise
+    reporter = OperationReporter(lambda _event: None)
+    entries, total_bytes = scan_copy_source(source, reporter)
+    totals = {"itemsDone": 0, "itemsTotal": len(entries),
+              "bytesDone": 0, "bytesTotal": total_bytes}
+    copy_scanned_source(source, target, entries, total_bytes, reporter, totals)
+    if move:
+        remove_created_path(source)
     return target, True
 
 
@@ -1942,11 +2731,12 @@ def action_command(args: argparse.Namespace) -> dict[str, Any]:
         return {"ok": True, "action": action, "path": display_text(target), "token": encode_path(target)}
     if action == "rename":
         target = os.path.join(os.path.dirname(path), require_name(args.name or ""))
-        os.rename(path, target)
+        changed = rename_noreplace(path, target)
         metadata = load_metadata_store()
-        if rebase_metadata_records(metadata, path, target):
+        if changed and rebase_metadata_records(metadata, path, target):
             save_metadata_store(metadata)
-        return {"ok": True, "action": action, "path": display_text(target), "token": encode_path(target)}
+        return {"ok": True, "action": action, "path": display_text(target),
+                "token": encode_path(target), "changed": changed}
     if action in {"copy", "move"}:
         destination = destination_from_args(args)
         results: list[dict[str, Any]] = []
@@ -2079,11 +2869,32 @@ def parser() -> argparse.ArgumentParser:
     destination = action.add_mutually_exclusive_group()
     destination.add_argument("--destination")
     destination.add_argument("--destination-token")
+
+    operation = subcommands.add_parser(
+        "operation", help="Run a cancellable filesystem operation with NDJSON progress"
+    )
+    operation.add_argument("action", choices=(
+        "rename", "copy", "move", "duplicate", "trash", "restore", "trash-delete", "undo",
+    ))
+    add_path_arguments(operation)
+    operation.add_argument("--path-tokens-json")
+    operation.add_argument("--name")
+    operation_destination = operation.add_mutually_exclusive_group()
+    operation_destination.add_argument("--destination")
+    operation_destination.add_argument("--destination-token")
+    operation.add_argument("--trash-uri")
+    operation.add_argument("--trash-uris-json")
+
+    subcommands.add_parser("trash-list", help="List bounded Trash entries")
+    subcommands.add_parser("history", help="Return the latest undoable operation")
     return root
 
 
 def main(argv: Iterable[str] | None = None) -> int:
     args = parser().parse_args(list(argv) if argv is not None else None)
+    if args.command == "operation":
+        signal.signal(signal.SIGTERM, request_operation_cancel)
+        signal.signal(signal.SIGINT, request_operation_cancel)
     try:
         if args.command == "tree":
             result = tree_command(args)
@@ -2101,13 +2912,22 @@ def main(argv: Iterable[str] | None = None) -> int:
             result = knowledge_links_command(args)
         elif args.command == "metadata":
             result = metadata_command(args)
+        elif args.command == "operation":
+            result = operation_command(args)
+        elif args.command == "trash-list":
+            result = trash_list_command(args)
+        elif args.command == "history":
+            result = history_command(args)
         else:
             result = action_command(args)
         json_print(result)
         return 0
     except QuickfileError as exc:
-        json_print({"ok": False, "error": str(exc), "code": exc.code})
-        return 2
+        payload = {"ok": False, "error": str(exc), "code": exc.code}
+        if args.command == "operation":
+            payload["event"] = "result"
+        json_print(payload)
+        return 130 if isinstance(exc, OperationCancelled) else 2
     except FileExistsError as exc:
         json_print({"ok": False, "error": str(exc), "code": "already-exists"})
         return 3

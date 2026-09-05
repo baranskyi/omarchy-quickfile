@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "m0sthatedman.quickfile",
   "name": "Omarchy Quickfile",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "author": "m0sthatedman",
   "license": "MIT",
   "description": "An IDE-like file and agent-context sidebar for the Omarchy desktop.",

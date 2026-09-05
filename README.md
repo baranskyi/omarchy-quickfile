@@ -30,7 +30,16 @@ concept. It does not depend on or copy unreleased FileBlade source code.
   system Sushi QuickView for files on `Space`.
 - Open through the XDG/GIO default application.
 - Create file/folder, copy, cut, paste, duplicate, rename, and confirmed move
-  to the freedesktop Trash. Name conflicts keep both items and never overwrite.
+  to the freedesktop Trash. Rename is atomic and refuses an occupied name;
+  copy/move conflicts keep both items and never overwrite.
+- Large recursive copies are scanned within fixed depth/item limits, report live
+  item/byte progress, remain cancellable, and remove partial destinations after
+  cancellation or copy failure.
+- Persistent safe undo for rename, copy, move, duplicate, Trash and restore.
+  Copy undo verifies that its result has not been changed or replaced before
+  removing it.
+- Trash browser with restore to the original path and a separate permanent-delete
+  confirmation. Restore never forces replacement of an existing path.
 - Desktop-style multi-selection with `Ctrl`, `Shift`, keyboard ranges and
   batch copy, cut, paste, duplicate, and Trash actions.
 - Native Wayland drag sources with `text/uri-list` and shell-quoted plain text,
@@ -78,6 +87,7 @@ concept. It does not depend on or copy unreleased FileBlade source code.
 | `Ctrl+R` | Refresh |
 | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy / cut / paste selected items |
 | `Ctrl+D` | Duplicate selected items |
+| `Ctrl+Z` | Undo the latest reversible Quickfile operation |
 | `Space` | QuickView the hovered file, otherwise the selected file |
 | `Ctrl+click` | Toggle one item in the selection |
 | `Shift+click` | Select a range from the anchor |
@@ -138,6 +148,14 @@ Quickfile-specific metadata is stored privately in
 outside the files themselves, so choosing a color or adding a note does not
 modify their contents or extended attributes. Metadata follows renames and
 moves performed from Quickfile.
+
+The bounded operation journal is stored privately in
+`$XDG_STATE_HOME/omarchy/quickfile/operations.json` (normally
+`~/.local/state/omarchy/quickfile/operations.json`) with mode `0600`. It stores
+only the information needed for safe undo, never file contents. The footer shows
+recursive-operation progress and exposes Cancel; when idle it exposes the latest
+available Undo. The Trash button in the top toolbar opens restore and permanent
+delete controls.
 
 ## Development install
 
@@ -209,13 +227,14 @@ models reconcile changed rows by path token instead of replacing the model.
 
 ## Next milestones
 
-- Progress reporting and full conflict-resolution UI for batch operations.
-- Trash browser with restore and separately confirmed permanent deletion.
+- Optional full conflict-resolution UI (merge, skip, replace, and apply-to-all);
+  current operations deliberately use safe keep-both or refuse the conflict.
 - Quick Nav backed by zoxide and recent project roots.
 - Optional explicit conflict-resolution workflow for agent configuration links.
 - Optional read-only activity adapter for genuinely running agent sessions.
 - Resizable/reorderable left and right blades.
-- Declarative extension modules plus an explicitly trusted QML extension tier.
+- Declarative extension modules plus an explicitly trusted QML extension tier
+  remain deferred while everyday file-management workflows are completed.
 
 ## License
 

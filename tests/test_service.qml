@@ -193,6 +193,17 @@ ShellRoot {
     synthetic.listWatch = null
     synthetic.knowledgeWatch = null
     synthetic.syncWatchConfiguration()
+    synthetic.handleOperationEvent(JSON.stringify({ event: "progress", phase: "copying",
+      itemsDone: 3, itemsTotal: 5, bytesDone: 25, bytesTotal: 100 }))
+    check(synthetic.operationPhase === "copying"
+      && synthetic.operationItemsDone === 3 && synthetic.operationItemsTotal === 5,
+      "Operation progress did not preserve item counts")
+    check(Math.abs(synthetic.operationProgress - 0.25) < 0.001,
+      "Operation byte progress was not calculated")
+    synthetic.handleOperationEvent(JSON.stringify({ event: "result", ok: false,
+      error: "name conflict", code: "name-conflict" }))
+    check(synthetic.operationResult && synthetic.operationResult.code === "name-conflict",
+      "Operation result did not preserve a structured failure")
     console.log("QuickFile service model assertions passed:", assertions)
   }
 

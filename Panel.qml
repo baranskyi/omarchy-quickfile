@@ -25,6 +25,13 @@ Item {
   property string editorValue: ""
   property string editorError: ""
   property var pendingTrashEntry: null
+  property var pendingDrop: null
+  property var conflictRows: []
+  property string quickNavQuery: ""
+  property int quickNavIndex: 0
+  property bool inlinePreviewOpen: false
+  readonly property var quickNavResults: filteredQuickLocations()
+  readonly property bool conflictsCanMerge: canMergeConflicts()
   property string hoveredToken: ""
   property string metadataToken: service ? String(service.selectedToken || "") : ""
   property string noteDraft: ""
@@ -140,7 +147,7 @@ Item {
   }
 
   function close() {
-    editorMode = ""
+    dismissEditor()
     hoveredToken = ""
     focusPrimeTimer.stop()
     focusPrimed = false
@@ -245,14 +252,230 @@ Item {
     syncingMetadata = false
   }
 
-  function previewHoveredOrSelected() {
+  function previewHoveredOrSelected(external) {
     if (!service) return false
     var hovered = hoveredToken !== ""
       ? service.visibleEntryForToken(hoveredToken) : null
-    return hovered ? service.previewEntry(hovered) : service.previewSelected()
+    var entry = hovered || service.selectedEntry
+    return external === true ? service.openPreviewExternally(entry) : showInlinePreview(entry)
   }
 
-  onMetadataTokenChanged: syncMetadataEditor()
+  function showInlinePreview(entry) {
+    if (!service || !entry) return false
+    inlinePreviewOpen = true
+    return service.loadPreview(entry)
+  }
+
+  function closeInlinePreview() {
+    inlinePreviewOpen = false
+    if (service) service.clearPreview()
+  }
+
+  function previewSummary() {
+    var data = service ? service.previewData : null
+    if (!data) return ""
+    var values = [String(data.mime || data.kind || ""), String(data.sizeText || "")]
+    if (data.width > 0 && data.height > 0)
+      values.push(data.width + " × " + data.height)
+    if (data.truncated === true) values.push("Excerpt")
+    return values.filter(function(value) { return value !== "" }).join("  ·  ")
+  }
+
+  function previewTextContent() {
+    var data = service ? service.previewData : null
+    if (!data) return ""
+    if (data.kind === "text") return String(data.text || "")
+    if (data.kind === "directory") {
+      var children = Array.isArray(data.entries) ? data.entries : []
+      return children.map(function(entry) {
+        return (entry.isDir === true ? "󰉋  " : "󰈔  ") + String(entry.name || "")
+      }).join("\n") || "This folder is empty"
+    }
+    var details = [String(data.path || ""), String(data.modified || ""),
+      String(data.permissions || "")]
+    if (data.symlinkTarget) details.push("Link → " + String(data.symlinkTarget))
+    return details.filter(function(value) { return value !== "" }).join("\n")
+  }
+
+  onMetadataTokenChanged: {
+    syncMetadataEditor()
+    if (inlinePreviewOpen) {
+      if (service && service.selectedEntry) service.loadPreview(service.selectedEntry)
+      else closeInlinePreview()
+    }
+  }
+
+  function filteredQuickLocations() {
+    var entries = service && Array.isArray(service.quickNavEntries)
+      ? service.quickNavEntries : []
+    var words = String(quickNavQuery || "").trim().toLowerCase().split(/\s+/)
+    return entries.filter(function(entry) {
+      var text = [entry.name, entry.path, entry.kind, entry.source,
+        root.quickLocationLabel(entry)].join(" ").toLowerCase()
+      return words.every(function(word) { return text.indexOf(word) >= 0 })
+    })
+  }
+
+  function openQuickNav() {
+    if (!service) return false
+    editorError = ""
+    quickNavQuery = ""
+    quickNavIndex = 0
+    editorMode = "quick-nav"
+    service.reloadQuickNav()
+    return true
+  }
+
+  function activateQuickLocation(index) {
+    if (!service || index < 0 || index >= quickNavResults.length) return false
+    if (!service.navigateQuickNav(quickNavResults[index])) return false
+    editorMode = ""
+    return true
+  }
+
+  function quickLocationLabel(entry) {
+    var names = ({ home: "Home", xdg: "Places", recent: "Recent", git: "Project",
+      worktree: "Worktree", zoxide: "Frequent" })
+    return names[String(entry.kind || entry.source || "")] || "Folder"
+  }
+
+  function dragMimeData(entry) {
+    if (!service || !entry) return ({})
+    return ({
+      "application/x-quickfile-tokens": JSON.stringify(
+        service.effectiveSelectionTokens(String(entry.token || ""))),
+      "text/uri-list": service.dragUriList(entry),
+      "text/plain": service.dragText(entry)
+    })
+  }
+
+  function directoryDropPayload(event) {
+    if (!event) return null
+    var canReadMime = typeof event.getDataAsString === "function"
+    var formats = event.formats || []
+    if (formats.indexOf("application/x-quickfile-tokens") >= 0) {
+      if (!canReadMime) return null
+      var raw = event.getDataAsString("application/x-quickfile-tokens")
+      if (raw.length > 1048576) return null
+      var tokens = null
+      try { tokens = JSON.parse(raw) } catch (error) { return null }
+      if (!Array.isArray(tokens) || tokens.length === 0 || tokens.length > 500) return null
+      for (var i = 0; i < tokens.length; i++) {
+        if (typeof tokens[i] !== "string" || tokens[i] === "" || tokens[i].length > 32768)
+          return null
+      }
+      return ({ tokens: tokens.slice(), uris: [] })
+    }
+    if (formats.indexOf("text/uri-list") < 0 && !(event.urls && event.urls.length > 0)) return null
+    var uris = []
+    var uriText = canReadMime ? event.getDataAsString("text/uri-list") : ""
+    if (uriText.length > 4194304) return null
+    var lines = uriText.split(/\r?\n/)
+    // Only URI-list is interpreted. text/plain may contain arbitrary prose or
+    // shell quoting and is deliberately never treated as filesystem paths.
+    for (var j = 0; j < lines.length; j++) {
+      var uri = String(lines[j]).trim()
+      if (uri === "" || uri.charAt(0) === "#") continue
+      if (uri.indexOf("file://") !== 0 || uri.length > 32768 || uris.length >= 500) return null
+      uris.push(uri)
+    }
+    if (uris.length === 0 && event.urls) {
+      for (var k = 0; k < event.urls.length; k++) {
+        var value = String(event.urls[k])
+        if (value.indexOf("file://") !== 0 || value.length > 32768 || uris.length >= 500)
+          return null
+        uris.push(value)
+      }
+    }
+    return uris.length > 0 ? ({ tokens: [], uris: uris }) : null
+  }
+
+  function canEnterDirectoryDrop(event, destination) {
+    if (!event || !service || service.actionBusy || editorMode !== "" || !destination
+        || destination.isDir !== true || !destination.token
+        || (event.supportedActions & Qt.CopyAction) === 0) return false
+    var formats = event.formats || []
+    return formats.indexOf("application/x-quickfile-tokens") >= 0
+      || formats.indexOf("text/uri-list") >= 0 || !!(event.urls && event.urls.length > 0)
+  }
+
+  function canAcceptDirectoryDrop(event, destination) {
+    if (!canEnterDirectoryDrop(event, destination)) return false
+    var payload = directoryDropPayload(event)
+    return payload !== null && payload.tokens.indexOf(String(destination.token)) < 0
+  }
+
+  function beginDirectoryDrop(event, destination) {
+    if (!canAcceptDirectoryDrop(event, destination)) return false
+    var payload = directoryDropPayload(event)
+    pendingDrop = ({ destinationToken: String(destination.token),
+      destinationPath: String(destination.path || destination.name || "Folder"),
+      tokens: payload.tokens, uris: payload.uris,
+      count: payload.tokens.length + payload.uris.length })
+    editorError = ""
+    editorMode = "drop-choice"
+    return true
+  }
+
+  function commitDirectoryDrop(move) {
+    if (!service || !pendingDrop) return false
+    var request = pendingDrop
+    var started = request.tokens.length > 0
+      ? service.dropOnDirectory(request.destinationToken, request.tokens, move === true)
+      : service.dropExternalUrisOnDirectory(request.destinationToken, request.uris, move === true)
+    if (started) {
+      pendingDrop = null
+      editorMode = ""
+    } else editorError = "Could not start the transfer. Try again when the current operation finishes."
+    return started
+  }
+
+  function canMergeConflicts() {
+    if (conflictRows.length === 0) return false
+    return conflictRows.every(function(row) {
+      return row.canMerge === true || (row.sourceKind === "directory" && row.targetKind === "directory")
+    })
+  }
+
+  function chooseConflictPolicy(policy) {
+    if (!service || !service.pendingOperation || service.actionBusy) return false
+    if (policy === "merge" && !conflictsCanMerge) return false
+    if (policy === "replace") {
+      editorError = ""
+      editorMode = "conflict-replace"
+      return true
+    }
+    return resolveOperationConflict(policy)
+  }
+
+  function resolveOperationConflict(policy) {
+    if (!service || (policy === "replace" && editorMode !== "conflict-replace")) return false
+    if (!service.retryOperation(policy)) {
+      editorError = "Could not resume this operation"
+      return false
+    }
+    conflictRows = []
+    editorError = ""
+    editorMode = ""
+    return true
+  }
+
+  function dismissEditor() {
+    if (editorMode === "conflict" || editorMode === "conflict-replace") {
+      if (service) service.dismissOperationConflict()
+      conflictRows = []
+    }
+    pendingDrop = null
+    editorMode = ""
+    editorError = ""
+  }
+
+  function cancelEditor() {
+    if (editorMode === "conflict-replace") {
+      editorMode = "conflict"
+      editorError = ""
+    } else dismissEditor()
+  }
 
   function shortTime(value) {
     var text = String(value || "")
@@ -509,6 +732,10 @@ Item {
 
   function commitEditor() {
     if (!service) return
+    if (editorMode === "conflict-replace") {
+      resolveOperationConflict("replace")
+      return
+    }
     if (editorMode === "knowledge-links") {
       if (!service.applyKnowledgeLinks())
         editorError = "There are no safe links to create"
@@ -540,6 +767,11 @@ Item {
 
   Connections {
     target: root.service
+    function onConflictRequested(conflicts) {
+      root.conflictRows = Array.isArray(conflicts) ? conflicts.slice() : []
+      root.editorError = ""
+      root.editorMode = "conflict"
+    }
     function onListingAboutToChange() {
       root.rememberKeyboardCursor()
     }
@@ -568,6 +800,49 @@ Item {
     function onKnowledgeLinksFinished(ok, applied, message) {
       if (!ok) root.editorError = message
       else root.editorError = ""
+    }
+  }
+
+  component DirectoryDropTarget: DropArea {
+    id: directoryTarget
+    objectName: "quickfileDirectoryDropTarget"
+    property var destinationEntry: null
+    anchors.fill: parent
+    z: 6
+    enabled: root.service && !root.service.actionBusy && root.editorMode === ""
+      && !!destinationEntry && destinationEntry.isDir === true
+    // DropArea.keys filters Drag.keys, not MIME formats. Leave it empty so
+    // native file-manager drags can enter; canEnterDirectoryDrop() and
+    // directoryDropPayload() validate the advertised and delivered MIME data.
+    keys: []
+    onEntered: function(drag) {
+      // Wayland sources may supply their actual data only after the drop.
+      // Hover inspects advertised types; payload validation happens on drop.
+      drag.accepted = root.canEnterDirectoryDrop(drag, destinationEntry)
+    }
+    onDropped: function(drop) {
+      if (root.beginDirectoryDrop(drop, destinationEntry)) {
+        // The backend owns both copy and move. Do not ask an external drag
+        // source to delete anything while our choice/transfer is still pending.
+        drop.accept(Qt.CopyAction)
+      } else drop.accepted = false
+    }
+    Rectangle {
+      anchors.fill: parent
+      visible: directoryTarget.containsDrag
+      color: Qt.alpha(root.accent, 0.16)
+      border.width: 2
+      border.color: root.accent
+      radius: Style.space(3)
+      Text {
+        anchors.centerIn: parent
+        text: "Drop here · choose Copy or Move"
+        color: root.foreground
+        font.family: Style.font.family
+        font.pixelSize: Style.font.caption
+        style: Text.Outline
+        styleColor: root.background
+      }
     }
   }
 
@@ -648,11 +923,14 @@ Item {
     id: actionButton
     property string glyph: ""
     property string label: ""
+    property string tooltip: ""
+    property bool destructive: false
     signal clicked()
     implicitWidth: actionContent.implicitWidth + Style.space(16)
     implicitHeight: Style.space(28)
     radius: Style.cornerRadius > 0 ? Style.space(5) : 0
-    color: actionMouse.containsMouse ? Style.hoverFill : Style.normalFill
+    color: destructive ? Qt.alpha(Color.urgent, actionMouse.containsMouse ? 0.24 : 0.12)
+      : actionMouse.containsMouse ? Style.hoverFill : Style.normalFill
     opacity: enabled ? 1 : 0.35
     Row {
       id: actionContent
@@ -680,6 +958,9 @@ Item {
       enabled: actionButton.enabled
       cursorShape: Qt.PointingHandCursor
       onClicked: actionButton.clicked()
+      ToolTip.visible: containsMouse && actionButton.tooltip !== ""
+      ToolTip.delay: 500
+      ToolTip.text: actionButton.tooltip
     }
   }
 
@@ -740,7 +1021,12 @@ Item {
           Keys.priority: Keys.BeforeItem
           Keys.onPressed: function(event) {
             if (root.editorMode !== "") return
-            if (noteEditor.activeFocus || pathField.activeFocus) return
+            if (event.key === Qt.Key_P && (event.modifiers & Qt.ControlModifier) !== 0) {
+              root.openQuickNav()
+              event.accepted = true
+              return
+            }
+            if (noteEditor.activeFocus || pathField.activeFocus || previewText.activeFocus) return
             if (searchField.activeFocus) {
               if (event.key === Qt.Key_Escape) {
                 if (searchField.text !== "") searchField.clear()
@@ -750,7 +1036,8 @@ Item {
               return
             }
             if (event.key === Qt.Key_Escape) {
-              if (root.service && root.service.selectedTokens.length > 0)
+              if (root.inlinePreviewOpen) root.closeInlinePreview()
+              else if (root.service && root.service.selectedTokens.length > 0)
                 root.service.clearSelection()
               else root.requestClose()
               event.accepted = true
@@ -784,7 +1071,7 @@ Item {
               if (root.keyboardIndex >= 0) root.service.toggleIndex(root.keyboardIndex)
               event.accepted = true
             } else if (event.key === Qt.Key_Space) {
-              root.previewHoveredOrSelected()
+              root.previewHoveredOrSelected((event.modifiers & Qt.ShiftModifier) !== 0)
               event.accepted = true
             } else if (event.key === Qt.Key_Up || event.key === Qt.Key_K) {
               root.moveSelection(-1, event.modifiers)
@@ -870,6 +1157,16 @@ Item {
                 onClicked: if (root.service) root.service.setShowHidden(!root.service.showHidden)
               }
               Components.IconButton {
+                glyph: "󰈈"
+                tooltip: "Inline preview · Space (Shift+Space: Sushi)"
+                active: root.inlinePreviewOpen
+                available: root.service && root.service.selectedEntry !== null
+                onClicked: {
+                  if (root.inlinePreviewOpen) root.closeInlinePreview()
+                  else root.showInlinePreview(root.service.selectedEntry)
+                }
+              }
+              Components.IconButton {
                 glyph: "󰏘"
                 tooltip: "Color, note, and properties"
                 active: root.inspectorOpen
@@ -931,6 +1228,12 @@ Item {
                 buttonSize: Style.space(26)
                 onClicked: if (root.service) root.service.goHome()
               }
+              Components.IconButton {
+                glyph: "󰍉"
+                tooltip: "Quick Nav · Ctrl+P"
+                buttonSize: Style.space(26)
+                onClicked: root.openQuickNav()
+              }
             }
 
             Text {
@@ -946,6 +1249,11 @@ Item {
               font.family: Style.font.family
               font.pixelSize: root.primaryFontSize
               renderType: Text.NativeRendering
+            }
+            DirectoryDropTarget {
+              objectName: "quickfileCurrentFolderDrop"
+              destinationEntry: root.service ? ({ isDir: true,
+                token: root.service.rootToken, path: root.service.rootPath }) : null
             }
           }
 
@@ -1119,6 +1427,10 @@ Item {
               readonly property bool current: root.volumeIsCurrent(modelData)
               color: current ? Style.focusFillColor
                 : (deviceMouse.containsMouse ? Style.hoverFill : "transparent")
+              DirectoryDropTarget {
+                destinationEntry: deviceRow.modelData.mounted === true ? ({ isDir: true,
+                  token: deviceRow.modelData.mountToken, path: deviceRow.modelData.mountPath }) : null
+              }
 
               Text {
                 id: deviceIcon
@@ -1261,6 +1573,7 @@ Item {
                 : (root.service && root.service.selectedToken === String(modelData.token || ""))
                   ? Style.focusFillColor
                   : (favoriteMouse.containsMouse ? Style.hoverFill : "transparent")
+              DirectoryDropTarget { destinationEntry: favoriteRow.modelData }
 
               Text {
                 id: favoriteIcon
@@ -1356,11 +1669,8 @@ Item {
               }
               Drag.active: favoriteDrag.active
               Drag.dragType: Drag.Automatic
-              Drag.supportedActions: Qt.CopyAction
-              Drag.mimeData: ({
-                "text/uri-list": root.service ? root.service.dragUriList(favoriteRow.modelData) : "",
-                "text/plain": root.service ? root.service.dragText(favoriteRow.modelData) : ""
-              })
+              Drag.supportedActions: Qt.CopyAction | Qt.MoveAction
+              Drag.mimeData: root.dragMimeData(favoriteRow.modelData)
             }
 
             ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
@@ -1579,13 +1889,8 @@ Item {
               }
               Drag.active: knowledgeDrag.active
               Drag.dragType: Drag.Automatic
-              Drag.supportedActions: Qt.CopyAction
-              Drag.mimeData: ({
-                "text/uri-list": root.service
-                  ? root.service.dragUriList(knowledgeRow.modelData) : "",
-                "text/plain": root.service
-                  ? root.service.dragText(knowledgeRow.modelData) : ""
-              })
+              Drag.supportedActions: Qt.CopyAction | Qt.MoveAction
+              Drag.mimeData: root.dragMimeData(knowledgeRow.modelData)
             }
 
             ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
@@ -1621,6 +1926,7 @@ Item {
                 : root.service.selectedTokens.length > 1
                   ? root.service.selectedTokens.length + " selected"
                   : (root.service.entries.length + (root.service.truncated ? "+" : "") + " items")
+                    + (root.service.query !== "" && root.service.searchEngine === "rg" ? " · rg" : "")
               color: root.muted
               font.family: Style.font.family
               font.pixelSize: Style.font.bodySmall
@@ -2243,13 +2549,156 @@ Item {
             }
           }
 
+          Rectangle {
+            id: inlinePreviewPane
+            objectName: "quickfileInlinePreview"
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.bottom: inspector.visible ? inspector.top : footer.top
+            height: visible ? Math.min(Style.space(184), blade.height * 0.24) : 0
+            visible: root.inlinePreviewOpen
+            color: Qt.alpha(root.foreground, 0.028)
+            clip: true
+
+            Components.Divider {
+              anchors.top: parent.top
+              anchors.left: parent.left
+              anchors.right: parent.right
+            }
+            Text {
+              id: previewTitle
+              anchors.top: parent.top
+              anchors.topMargin: Style.space(7)
+              anchors.left: parent.left
+              anchors.leftMargin: Style.space(11)
+              anchors.right: externalPreviewButton.left
+              anchors.rightMargin: Style.space(8)
+              text: "PREVIEW" + (root.service && root.service.previewData
+                ? "  ·  " + String(root.service.previewData.name || "") : "")
+              textFormat: Text.PlainText
+              elide: Text.ElideMiddle
+              color: root.foreground
+              opacity: 0.8
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              font.bold: true
+            }
+            Components.IconButton {
+              id: externalPreviewButton
+              anchors.top: parent.top
+              anchors.right: closePreviewButton.left
+              glyph: "󰏌"
+              tooltip: "Open in Sushi · Shift+Space"
+              buttonSize: Style.space(25)
+              available: root.service && !!root.service.previewData
+                && root.service.previewData.kind !== "directory"
+              onClicked: root.service.openPreviewExternally({ token: root.service.previewToken,
+                isDir: root.service.previewData.kind === "directory" })
+            }
+            Components.IconButton {
+              id: closePreviewButton
+              anchors.top: parent.top
+              anchors.right: parent.right
+              anchors.rightMargin: Style.space(5)
+              glyph: "󰅖"
+              tooltip: "Close preview · Escape"
+              buttonSize: Style.space(25)
+              onClicked: root.closeInlinePreview()
+            }
+            Text {
+              id: previewSummaryText
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.bottom: parent.bottom
+              anchors.margins: Style.space(9)
+              text: root.previewSummary()
+              elide: Text.ElideMiddle
+              color: root.foreground
+              opacity: 0.8
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+            }
+            Item {
+              anchors.top: closePreviewButton.bottom
+              anchors.bottom: previewSummaryText.top
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.margins: Style.space(8)
+              clip: true
+
+              Image {
+                id: previewImage
+                objectName: "quickfilePreviewImage"
+                anchors.fill: parent
+                visible: root.service && !!root.service.previewData
+                  && root.service.previewData.kind === "image" && status !== Image.Error
+                source: root.inlinePreviewOpen && root.service && root.service.previewData
+                  && root.service.previewData.kind === "image"
+                  && String(root.service.previewData.uri || "").indexOf("file://") === 0
+                    ? String(root.service.previewData.uri) : ""
+                sourceSize.width: 720
+                sourceSize.height: 360
+                asynchronous: true
+                cache: false
+                autoTransform: true
+                fillMode: Image.PreserveAspectFit
+              }
+              Flickable {
+                id: previewScroll
+                anchors.fill: parent
+                clip: true
+                visible: root.service && !!root.service.previewData
+                  && (root.service.previewData.kind !== "image" || previewImage.status === Image.Error)
+                contentWidth: width
+                contentHeight: previewText.height
+                boundsBehavior: Flickable.StopAtBounds
+                TextEdit {
+                  id: previewText
+                  objectName: "quickfilePreviewText"
+                  width: previewScroll.width
+                  height: Math.max(previewScroll.height, contentHeight)
+                  text: root.previewTextContent()
+                  textFormat: TextEdit.PlainText
+                  readOnly: true
+                  selectByMouse: true
+                  wrapMode: TextEdit.Wrap
+                  color: root.foreground
+                  selectionColor: Style.selectionFill
+                  selectedTextColor: root.foreground
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                  Keys.onEscapePressed: function(event) {
+                    root.closeInlinePreview()
+                    keyScope.forceActiveFocus()
+                    event.accepted = true
+                  }
+                }
+                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+              }
+              Text {
+                anchors.centerIn: parent
+                width: parent.width
+                visible: root.service && !root.service.previewData
+                text: !root.service ? "" : root.service.previewError
+                  ? root.service.previewError : "Loading preview…"
+                textFormat: Text.PlainText
+                wrapMode: Text.Wrap
+                horizontalAlignment: Text.AlignHCenter
+                color: root.service && root.service.previewError ? Color.urgent : root.muted
+                font.family: Style.font.family
+                font.pixelSize: Style.font.bodySmall
+              }
+            }
+          }
+
           StableListView {
             id: fileList
             objectName: "quickfileFileList"
             anchors.top: contextStrip.bottom
             anchors.left: parent.left
             anchors.right: parent.right
-            anchors.bottom: inspector.visible ? inspector.top : footer.top
+            anchors.bottom: inlinePreviewPane.visible ? inlinePreviewPane.top
+              : inspector.visible ? inspector.top : footer.top
             anchors.topMargin: Style.space(2)
             anchors.bottomMargin: Style.space(2)
             clip: true
@@ -2276,6 +2725,7 @@ Item {
                 && root.service.isSelected(String(modelData.token || ""))
               color: persistentSelected ? Style.selectedFill
                 : (rowMouse.containsMouse ? Style.hoverFill : "transparent")
+              DirectoryDropTarget { destinationEntry: fileRow.modelData }
 
               Rectangle {
                 visible: root.keyboardIndex === fileRow.index
@@ -2459,13 +2909,8 @@ Item {
               }
               Drag.active: rowDrag.active
               Drag.dragType: Drag.Automatic
-              Drag.supportedActions: Qt.CopyAction
-              Drag.mimeData: ({
-                "text/uri-list": root.service
-                  ? root.service.dragUriList(fileRow.modelData) : "",
-                "text/plain": root.service
-                  ? root.service.dragText(fileRow.modelData) : ""
-              })
+              Drag.supportedActions: Qt.CopyAction | Qt.MoveAction
+              Drag.mimeData: root.dragMimeData(fileRow.modelData)
 
               MouseArea {
                 anchors.left: parent.left
@@ -2515,20 +2960,28 @@ Item {
           }
 
           Rectangle {
+            id: editorDialog
             anchors.fill: parent
             visible: root.editorMode !== ""
             color: Qt.rgba(root.background.r, root.background.g, root.background.b, 0.84)
             z: 20
             MouseArea { anchors.fill: parent; onClicked: {} }
-
-            onVisibleChanged: {
-              if (visible && root.editorMode !== "trash"
-                  && root.editorMode !== "trash-browser"
-                  && root.editorMode !== "trash-delete"
-                  && root.editorMode !== "knowledge-links") {
+            Keys.onEscapePressed: function(event) {
+              root.cancelEditor()
+              if (root.editorMode === "") keyScope.forceActiveFocus()
+              event.accepted = true
+            }
+            Connections {
+              target: root
+              function onEditorModeChanged() {
                 Qt.callLater(function() {
-                  editorField.selectAll()
-                  editorField.forceActiveFocus()
+                  if (root.editorMode === "quick-nav") {
+                    quickNavField.forceActiveFocus()
+                    quickNavField.selectAll()
+                  } else if (["new-file", "new-folder", "rename"].indexOf(root.editorMode) >= 0) {
+                    editorField.selectAll()
+                    editorField.forceActiveFocus()
+                  } else if (root.editorMode !== "") editorDialog.forceActiveFocus()
                 })
               }
             }
@@ -2556,6 +3009,10 @@ Item {
                     : root.editorMode === "rename" ? "Rename item"
                     : root.editorMode === "trash-browser" ? "Trash"
                     : root.editorMode === "trash-delete" ? "Delete permanently?"
+                    : root.editorMode === "quick-nav" ? "Quick Nav"
+                    : root.editorMode === "drop-choice" ? "Copy or move here?"
+                    : root.editorMode === "conflict" ? "Files already exist"
+                    : root.editorMode === "conflict-replace" ? "Replace existing items?"
                     : root.editorMode === "knowledge-links"
                       ? "Connect Project Knowledge"
                     : "Move to Trash?"
@@ -2564,6 +3021,284 @@ Item {
                   font.pixelSize: Style.font.body
                   font.bold: true
                   renderType: Text.NativeRendering
+                }
+
+                TextField {
+                  id: quickNavField
+                  objectName: "quickfileQuickNavSearch"
+                  visible: root.editorMode === "quick-nav"
+                  width: parent.width
+                  height: Style.space(35)
+                  text: root.quickNavQuery
+                  placeholderText: "Filter places, projects and recent folders…"
+                  placeholderTextColor: root.muted
+                  color: root.foreground
+                  selectByMouse: true
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.bodySmall
+                  background: Rectangle {
+                    radius: Style.space(4)
+                    color: Style.focusFillColor
+                    border.width: Style.focusBorderWidth
+                    border.color: Style.focusBorderColor
+                  }
+                  onTextEdited: {
+                    root.quickNavQuery = text
+                    root.quickNavIndex = 0
+                  }
+                  Keys.onPressed: function(event) {
+                    if (event.key === Qt.Key_Down || event.key === Qt.Key_Up) {
+                      root.quickNavIndex = Math.max(0, Math.min(root.quickNavResults.length - 1,
+                        root.quickNavIndex + (event.key === Qt.Key_Down ? 1 : -1)))
+                      quickNavList.positionViewAtIndex(root.quickNavIndex, ListView.Contain)
+                      event.accepted = true
+                    } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                      if (root.activateQuickLocation(root.quickNavIndex)) keyScope.forceActiveFocus()
+                      event.accepted = true
+                    } else if (event.key === Qt.Key_Escape) {
+                      root.dismissEditor()
+                      keyScope.forceActiveFocus()
+                      event.accepted = true
+                    }
+                  }
+                }
+
+                ListView {
+                  id: quickNavList
+                  objectName: "quickfileQuickNavList"
+                  visible: root.editorMode === "quick-nav" && count > 0
+                  width: parent.width
+                  height: visible ? Math.min(contentHeight, Style.space(308), blade.height * 0.42) : 0
+                  model: root.quickNavResults
+                  currentIndex: root.quickNavIndex
+                  clip: true
+                  boundsBehavior: Flickable.StopAtBounds
+                  spacing: Style.space(3)
+                  delegate: Rectangle {
+                    id: locationRow
+                    required property var modelData
+                    required property int index
+                    width: quickNavList.width
+                    height: Style.space(51)
+                    radius: Style.space(4)
+                    color: index === root.quickNavIndex ? Style.focusFillColor
+                      : locationMouse.containsMouse ? Style.hoverFill : "transparent"
+                    Text {
+                      id: locationSource
+                      anchors.top: parent.top
+                      anchors.right: parent.right
+                      anchors.margins: Style.space(7)
+                      text: root.quickLocationLabel(locationRow.modelData)
+                      color: root.foreground
+                      opacity: 0.75
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.caption
+                    }
+                    Column {
+                      anchors.left: parent.left
+                      anchors.right: parent.right
+                      anchors.margins: Style.space(7)
+                      anchors.verticalCenter: parent.verticalCenter
+                      spacing: Style.space(3)
+                      Text {
+                        width: parent.width - locationSource.width - Style.space(9)
+                        text: String(locationRow.modelData.name || "Folder")
+                        textFormat: Text.PlainText
+                        elide: Text.ElideMiddle
+                        color: root.foreground
+                        font.family: Style.font.family
+                        font.pixelSize: Style.font.bodySmall
+                      }
+                      Text {
+                        width: parent.width
+                        text: String(locationRow.modelData.path || "")
+                        textFormat: Text.PlainText
+                        elide: Text.ElideMiddle
+                        color: root.foreground
+                        opacity: 0.8
+                        font.family: Style.font.family
+                        font.pixelSize: Style.font.caption
+                      }
+                    }
+                    MouseArea {
+                      id: locationMouse
+                      anchors.fill: parent
+                      hoverEnabled: true
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: {
+                        if (root.activateQuickLocation(locationRow.index)) keyScope.forceActiveFocus()
+                      }
+                      ToolTip.visible: containsMouse
+                      ToolTip.delay: 650
+                      ToolTip.text: String(locationRow.modelData.path || "")
+                    }
+                  }
+                  ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                }
+
+                Text {
+                  visible: root.editorMode === "quick-nav" && root.service
+                    && (root.service.quickNavBusy || root.service.quickNavError !== ""
+                      || root.quickNavResults.length === 0)
+                  width: parent.width
+                  text: !root.service ? "" : root.service.quickNavError
+                    ? root.service.quickNavError : root.service.quickNavBusy
+                      ? "Loading locations…" : "No matching locations"
+                  textFormat: Text.PlainText
+                  wrapMode: Text.Wrap
+                  color: root.service && root.service.quickNavError ? Color.urgent : root.muted
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                }
+
+                Text {
+                  visible: root.editorMode === "drop-choice"
+                  width: parent.width
+                  text: root.pendingDrop ? root.pendingDrop.count
+                    + (root.pendingDrop.count === 1 ? " item\n" : " items\n")
+                    + "Destination: " + root.pendingDrop.destinationPath : ""
+                  textFormat: Text.PlainText
+                  wrapMode: Text.Wrap
+                  color: root.foreground
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.bodySmall
+                }
+                Row {
+                  visible: root.editorMode === "drop-choice"
+                  spacing: Style.space(8)
+                  ActionButton {
+                    glyph: "󰆏"
+                    label: "Copy here"
+                    tooltip: "Keep the originals in their current location"
+                    enabled: root.service && !root.service.actionBusy
+                    onClicked: root.commitDirectoryDrop(false)
+                  }
+                  ActionButton {
+                    glyph: "󰆐"
+                    label: "Move here"
+                    tooltip: "Move the originals to this folder"
+                    enabled: root.service && !root.service.actionBusy
+                    onClicked: root.commitDirectoryDrop(true)
+                  }
+                }
+
+                Text {
+                  visible: root.editorMode === "conflict" || root.editorMode === "conflict-replace"
+                  width: parent.width
+                  text: root.editorMode === "conflict-replace"
+                    ? "Existing items below will be moved to Trash, then replaced with the incoming items. Undo restores them."
+                    : "Choose how to handle the existing destination items."
+                  wrapMode: Text.Wrap
+                  color: root.editorMode === "conflict-replace" ? Color.urgent : root.foreground
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.bodySmall
+                }
+                ListView {
+                  id: conflictsList
+                  objectName: "quickfileConflictsList"
+                  visible: root.editorMode === "conflict" || root.editorMode === "conflict-replace"
+                  width: parent.width
+                  height: visible ? Math.min(contentHeight, Style.space(234), blade.height * 0.28) : 0
+                  model: root.conflictRows
+                  spacing: Style.space(5)
+                  clip: true
+                  boundsBehavior: Flickable.StopAtBounds
+                  delegate: Rectangle {
+                    id: conflictRow
+                    required property var modelData
+                    width: conflictsList.width
+                    height: Style.space(73)
+                    radius: Style.space(4)
+                    color: Style.normalFill
+                    Column {
+                      anchors.fill: parent
+                      anchors.margins: Style.space(7)
+                      spacing: Style.space(3)
+                      Text {
+                        width: parent.width
+                        text: String(conflictRow.modelData.name || "Existing item")
+                          + " · " + String(conflictRow.modelData.targetKind || "file")
+                        textFormat: Text.PlainText
+                        elide: Text.ElideMiddle
+                        color: root.foreground
+                        font.family: Style.font.family
+                        font.pixelSize: Style.font.bodySmall
+                      }
+                      Text {
+                        width: parent.width
+                        text: "Existing: " + String(conflictRow.modelData.targetPath || "")
+                        textFormat: Text.PlainText
+                        elide: Text.ElideMiddle
+                        color: root.foreground
+                        font.family: Style.font.family
+                        font.pixelSize: Style.font.caption
+                      }
+                      Text {
+                        width: parent.width
+                        text: "Incoming: " + String(conflictRow.modelData.sourcePath || "")
+                        textFormat: Text.PlainText
+                        elide: Text.ElideMiddle
+                        color: root.foreground
+                        font.family: Style.font.family
+                        font.pixelSize: Style.font.caption
+                      }
+                    }
+                    MouseArea {
+                      anchors.fill: parent
+                      hoverEnabled: true
+                      acceptedButtons: Qt.NoButton
+                      ToolTip.visible: containsMouse
+                      ToolTip.delay: 600
+                      ToolTip.text: String(conflictRow.modelData.sourcePath || "") + "\n→ "
+                        + String(conflictRow.modelData.targetPath || "")
+                    }
+                  }
+                  ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                }
+                Text {
+                  visible: root.editorMode === "conflict" || root.editorMode === "conflict-replace"
+                  width: parent.width
+                  text: root.conflictRows.length > 1
+                    ? "This choice applies to all " + root.conflictRows.length + " conflicts in this operation."
+                    : "This choice applies to this operation."
+                  wrapMode: Text.Wrap
+                  color: root.foreground
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                }
+                Grid {
+                  visible: root.editorMode === "conflict"
+                  columns: 2
+                  spacing: Style.space(8)
+                  ActionButton {
+                    glyph: "󰆴"
+                    label: "Keep both"
+                    tooltip: "Give incoming items a new, unused name"
+                    enabled: root.service && !root.service.actionBusy
+                    onClicked: root.chooseConflictPolicy("keep-both")
+                  }
+                  ActionButton {
+                    glyph: "󰒭"
+                    label: "Skip"
+                    tooltip: "Keep existing items and skip conflicting incoming items"
+                    enabled: root.service && !root.service.actionBusy
+                    onClicked: root.chooseConflictPolicy("skip")
+                  }
+                  ActionButton {
+                    glyph: "󰝰"
+                    label: "Merge folders"
+                    tooltip: "Combine folder contents; existing files remain protected"
+                    enabled: root.service && !root.service.actionBusy && root.conflictsCanMerge
+                    onClicked: root.chooseConflictPolicy("merge")
+                  }
+                  ActionButton {
+                    glyph: "󰁯"
+                    label: "Replace…"
+                    destructive: true
+                    tooltip: "Review a separate confirmation before replacing existing items"
+                    enabled: root.service && !root.service.actionBusy
+                    onClicked: root.chooseConflictPolicy("replace")
+                  }
                 }
 
                 Text {
@@ -2846,24 +3581,28 @@ Item {
                   spacing: Style.space(7)
                   ActionButton {
                     glyph: "󰅖"
-                    label: root.editorMode === "trash-browser" ? "Close" : "Cancel"
+                    label: root.editorMode === "trash-browser" ? "Close"
+                      : root.editorMode === "conflict-replace" ? "Back" : "Cancel"
                     onClicked: {
-                      root.editorMode = ""
-                      keyScope.forceActiveFocus()
+                      root.cancelEditor()
+                      if (root.editorMode === "") keyScope.forceActiveFocus()
                     }
                   }
                   ActionButton {
-                    visible: root.editorMode !== "trash-browser"
+                    visible: ["trash-browser", "quick-nav", "drop-choice", "conflict"].indexOf(root.editorMode) < 0
                     glyph: root.editorMode === "trash" ? "󰩺"
                       : root.editorMode === "trash-delete" ? "󰆴"
+                      : root.editorMode === "conflict-replace" ? "󰁯"
                       : root.editorMode === "knowledge-links" ? "󰌷" : "󰄬"
                     label: root.editorMode === "trash" ? "Move to Trash"
                       : root.editorMode === "trash-delete" ? "Delete permanently"
+                      : root.editorMode === "conflict-replace" ? "Replace existing items"
                       : root.editorMode === "knowledge-links"
                         ? (!root.service || !root.service.knowledgeLinkPlan
                           ? "Preparing…"
                           : "Create " + root.service.knowledgeLinkPlan.createCount)
                       : "Confirm"
+                    destructive: root.editorMode === "trash-delete" || root.editorMode === "conflict-replace"
                     enabled: root.service && !root.service.actionBusy
                       && (root.editorMode !== "knowledge-links"
                       || (root.service && root.service.knowledgeLinkPlan

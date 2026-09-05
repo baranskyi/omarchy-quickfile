@@ -21,17 +21,24 @@ concept. It does not depend on or copy unreleased FileBlade source code.
 - Fuzzy, contains, exact, prefix, suffix, and regular-expression search across
   file names, folder names, relative paths, and bounded text-file contents.
 - Live search badges distinguish `FOLDER`, `NAME`, `PATH`, and `CONTENT`;
-  content hits include the matching line number and a short snippet.
+  content hits include the matching line number and a short snippet. When
+  ripgrep (`rg`) is available it safely prefilters content candidates, with a
+  transparent bounded Python fallback.
+- Quick Nav (`Ctrl+P`) combines XDG folders, recent locations, Git roots and
+  worktrees, plus zoxide history when zoxide is installed.
 - Hidden-file toggle and native filesystem monitoring while the blade is
   visible. External changes update rows quietly without resetting the list;
   `Ctrl+R` remains available for an explicit refresh.
 - Keyboard navigation with arrows or `HJKL`.
 - Persistent click/keyboard selection, independent hover highlighting, and
-  system Sushi QuickView for files on `Space`.
+  an in-blade bounded text, image, directory, or metadata preview on `Space`.
+  `Shift+Space` opens the hovered or selected file in system Sushi QuickView.
 - Open through the XDG/GIO default application.
 - Create file/folder, copy, cut, paste, duplicate, rename, and confirmed move
-  to the freedesktop Trash. Rename is atomic and refuses an occupied name;
-  copy/move conflicts keep both items and never overwrite.
+  to the freedesktop Trash. Rename is atomic and refuses an occupied name.
+  Copy/move conflicts are resolved explicitly for the entire operation with
+  Keep Both, Skip, non-destructive folder Merge, or separately confirmed
+  Replace. Replace preserves the previous destination in Trash for safe Undo.
 - Large recursive copies are scanned within fixed depth/item limits, report live
   item/byte progress, remain cancellable, and remove partial destinations after
   cancellation or copy failure.
@@ -44,6 +51,8 @@ concept. It does not depend on or copy unreleased FileBlade source code.
   batch copy, cut, paste, duplicate, and Trash actions.
 - Native Wayland drag sources with `text/uri-list` and shell-quoted plain text,
   so one or several files can be dragged into terminals and other applications.
+- Folder rows, the current-folder header, favorites and mounted devices accept
+  internal or local `file://` drops, then ask whether to Copy or Move.
 - Per-file and per-folder theme-aware colors, private notes, and starred
   favorites. The collapsible favorites module stays above the regular `FILES`
   tree, and semantic colors follow the active Omarchy palette.
@@ -83,12 +92,14 @@ concept. It does not depend on or copy unreleased FileBlade source code.
 | `→` / `L` | Enter a directory or open a file |
 | `←` / `H`, `Backspace` | Parent directory |
 | `/`, `Ctrl+F` | Focus search |
+| `Ctrl+P` | Open Quick Nav |
 | `.` | Toggle hidden files |
 | `Ctrl+R` | Refresh |
 | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy / cut / paste selected items |
 | `Ctrl+D` | Duplicate selected items |
 | `Ctrl+Z` | Undo the latest reversible Quickfile operation |
-| `Space` | QuickView the hovered file, otherwise the selected file |
+| `Space` | Preview the hovered item, otherwise the selected item, in the blade |
+| `Shift+Space` | Open the hovered/selected file in Sushi QuickView |
 | `Ctrl+click` | Toggle one item in the selection |
 | `Shift+click` | Select a range from the anchor |
 | Drag | Export selected files to a terminal or another application |
@@ -148,6 +159,11 @@ Quickfile-specific metadata is stored privately in
 outside the files themselves, so choosing a color or adding a note does not
 modify their contents or extended attributes. Metadata follows renames and
 moves performed from Quickfile.
+
+Quick Nav recent locations are stored as private binary path tokens in
+`$XDG_STATE_HOME/omarchy/quickfile/recent-locations.json` (normally
+`~/.local/state/omarchy/quickfile/recent-locations.json`) with mode `0600`.
+Both `rg` and zoxide are optional; Quickfile remains functional without them.
 
 The bounded operation journal is stored privately in
 `$XDG_STATE_HOME/omarchy/quickfile/operations.json` (normally
@@ -227,9 +243,6 @@ models reconcile changed rows by path token instead of replacing the model.
 
 ## Next milestones
 
-- Optional full conflict-resolution UI (merge, skip, replace, and apply-to-all);
-  current operations deliberately use safe keep-both or refuse the conflict.
-- Quick Nav backed by zoxide and recent project roots.
 - Optional explicit conflict-resolution workflow for agent configuration links.
 - Optional read-only activity adapter for genuinely running agent sessions.
 - Resizable/reorderable left and right blades.

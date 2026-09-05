@@ -14,7 +14,8 @@ identity, navigation/search, metadata, and a small set of recoverable actions.
 - [x] Desktop-style multi-selection and batch copy, cut, paste, duplicate and Trash.
 - [x] Per-operation progress reporting and cancellation for recursive transfers.
 - [x] Atomic no-replace rename; copy/move collisions use bounded keep-both naming.
-- [ ] Optional advanced collision policy: merge, skip, replace, and apply-to-all.
+- [x] Explicit collision policy for each operation: keep both, skip,
+  non-destructive folder merge, or confirmed replace with Trash-backed Undo.
 - [x] Persistent operation journal with guarded undo for reversible operations.
 - [x] Trash module using GIO metadata, restore to original path, and explicit
   permanent-delete confirmation.
@@ -24,15 +25,17 @@ identity, navigation/search, metadata, and a small set of recoverable actions.
 
 - [x] Collapsible starred favorites above the file tree.
 - [x] Per-item colors and private notes stored outside file contents/xattrs.
-- zoxide Quick Nav, XDG roots, recent locations and Git worktrees.
+- [x] Quick Nav for XDG roots, private recent locations, Git roots/worktrees,
+  and optional zoxide history.
 - [x] Bounded text-content search with labeled live results and snippets;
-  optional `rg` acceleration remains future work.
-- [x] System Sushi QuickView on `Space` for the hovered or selected file.
+  optional `rg` prefilter acceleration with a bounded Python fallback.
+- [x] Bounded text, image, directory and metadata previews in-blade on `Space`;
+  system Sushi QuickView remains available on `Shift+Space`.
 - [x] Race-free folder navigation that clears stale rows, rejects stale backend
   results and suppresses accidental double-entry clicks.
-- Lightweight text/image metadata previews in-blade.
 - [x] Standards-based `text/uri-list` drag source for external applications.
-- Drop targets for moving/copying items into folders.
+- [x] Internal-token and local-URI drop targets for copying or moving items to
+  folders, the current location, favorites and mounted devices.
 
 ## 0.4 — agent context (complete)
 

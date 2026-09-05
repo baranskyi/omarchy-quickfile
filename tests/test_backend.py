@@ -30,7 +30,9 @@ class BackendTests(unittest.TestCase):
             {
                 "QUICKFILE_METADATA_FILE": str(self.root / "quickfile-metadata.json"),
                 "QUICKFILE_STATE_FILE": str(self.root / "quickfile-operations.json"),
+                "QUICKFILE_NAV_FILE": str(self.root / "quickfile-recent.json"),
                 "QUICKFILE_HOME": str(self.root),
+                "XDG_CONFIG_HOME": str(self.root / "xdg-config"),
                 "XDG_DATA_HOME": str(self.root / "xdg-data"),
                 "XDG_STATE_HOME": str(self.root / "xdg-state"),
             },
@@ -737,6 +739,339 @@ class BackendTests(unittest.TestCase):
         result = quickfile.search_command(args)
         self.assertTrue(result["truncated"])
         self.assertLessEqual(result["scanned"], 2)
+
+    def test_external_drop_accepts_only_bounded_local_file_uris(self) -> None:
+        dropped = self.root / "name with spaces.txt"
+        dropped.write_text("drop", encoding="utf-8")
+        uri = dropped.as_uri()
+        args = argparse.Namespace(
+            path=None, path_token=None, path_tokens_json=None,
+            source_uris_json=json.dumps([uri]),
+        )
+        self.assertEqual(quickfile.action_paths_from_args(args), [str(dropped)])
+        with self.assertRaises(quickfile.QuickfileError) as remote:
+            quickfile.local_file_uri_path("file://remote-host/tmp/file")
+        self.assertEqual(remote.exception.code, "invalid-source-uri")
+        with self.assertRaises(quickfile.QuickfileError):
+            quickfile.action_paths_from_args(argparse.Namespace(
+                path=None, path_token=None, path_tokens_json=None,
+                source_uris_json=json.dumps(["file:///tmp/a"] * 501),
+            ))
+
+    def test_external_drop_uses_regular_safe_transfer_operation(self) -> None:
+        source = self.root / "drop source.txt"
+        destination = self.root / "drop-target"
+        source.write_text("dragged", encoding="utf-8")
+        destination.mkdir()
+        result = quickfile.operation_command(argparse.Namespace(
+            action="copy", path=None, path_token=None, path_tokens_json=None,
+            source_uris_json=json.dumps([source.as_uri()]), name=None,
+            destination=str(destination), destination_token=None,
+            conflict_policy="ask",
+        ), lambda _event: None)
+        self.assertTrue(result["changed"])
+        self.assertEqual((destination / source.name).read_text(encoding="utf-8"), "dragged")
+
+    def test_quick_nav_recents_are_private_bounded_tokens(self) -> None:
+        visited = self.root / "visited"
+        visited.mkdir()
+        with mock.patch.object(quickfile, "git_navigation_rows", return_value=[]), \
+                mock.patch.object(quickfile, "zoxide_navigation_paths", return_value=[]):
+            result = quickfile.quick_nav_command(argparse.Namespace(
+                path=str(visited), path_token=None, record=True,
+                no_zoxide=False, limit=20,
+            ))
+        recent = next(row for row in result["entries"] if row["path"] == str(visited))
+        self.assertEqual(recent["kind"], "recent")
+        state = self.root / "quickfile-recent.json"
+        self.assertEqual(state.stat().st_mode & 0o777, 0o600)
+        self.assertNotIn(str(visited), state.read_text(encoding="utf-8"))
+
+    def test_quick_nav_reads_xdg_dirs_and_bounds_optional_tools(self) -> None:
+        config = self.root / "xdg-config"
+        downloads = self.root / "Downloads"
+        config.mkdir()
+        downloads.mkdir()
+        (config / "user-dirs.dirs").write_text(
+            f'XDG_DOWNLOAD_DIR="{downloads}"\nXDG_BOGUS_DIR="/private"\n',
+            encoding="utf-8",
+        )
+        self.assertEqual(quickfile.xdg_user_directories(), [("Downloads", str(downloads))])
+        with mock.patch.object(quickfile.shutil, "which", return_value="/usr/bin/zoxide"), \
+                mock.patch.object(quickfile, "run_bounded", return_value=(0, str(downloads) + "\n", "")) as runner:
+            self.assertEqual(quickfile.zoxide_navigation_paths(quickfile.time.monotonic() + 2),
+                             [str(downloads)])
+        runner.assert_called_once_with(
+            ["/usr/bin/zoxide", "query", "--list"], timeout=2,
+            limit=quickfile.QUICK_NAV_COMMAND_LIMIT,
+        )
+
+    def test_quick_nav_discovers_git_root_and_worktrees_with_fixed_argv(self) -> None:
+        repository = self.root / "repository"
+        worktree = self.root / "worktree"
+        repository.mkdir()
+        worktree.mkdir()
+        outputs = [
+            (0, str(repository) + "\n", ""),
+            (0, f"worktree {repository}\nHEAD deadbeef\n\nworktree {worktree}\nHEAD cafe\n", ""),
+        ]
+        with mock.patch.object(quickfile, "run_bounded", side_effect=outputs) as runner:
+            rows = quickfile.git_navigation_rows(
+                [str(repository)], quickfile.time.monotonic() + 2
+            )
+        self.assertEqual(rows, [("git", str(repository)), ("worktree", str(worktree))])
+        self.assertEqual(runner.call_args_list[0].args[0], [
+            "git", "-C", str(repository), "rev-parse", "--show-toplevel",
+        ])
+        self.assertEqual(runner.call_args_list[1].args[0], [
+            "git", "-C", str(repository), "worktree", "list", "--porcelain",
+        ])
+
+    def test_inline_text_preview_is_bounded(self) -> None:
+        document = self.root / "preview.txt"
+        document.write_text("a" * 10000, encoding="utf-8")
+        result = quickfile.inline_preview_command(argparse.Namespace(
+            path=str(document), path_token=None, byte_limit=1024,
+        ))["preview"]
+        self.assertEqual(result["kind"], "text")
+        self.assertEqual(result["bytesRead"], 1024)
+        self.assertTrue(result["truncated"])
+        self.assertEqual(len(result["text"]), 1024)
+
+    def test_inline_image_preview_reads_only_header_and_dimensions(self) -> None:
+        image = self.root / "pixel.png"
+        image.write_bytes(
+            b"\x89PNG\r\n\x1a\n" + b"\x00" * 8
+            + (320).to_bytes(4, "big") + (200).to_bytes(4, "big") + b"x" * 4000
+        )
+        preview = quickfile.inline_preview_command(argparse.Namespace(
+            path=str(image), path_token=None, byte_limit=1024,
+        ))["preview"]
+        self.assertEqual(preview["kind"], "image")
+        self.assertEqual((preview["width"], preview["height"]), (320, 200))
+        self.assertEqual(preview["bytesRead"], 1024)
+        self.assertNotIn("data", preview)
+
+    def test_inline_directory_preview_is_hard_bounded(self) -> None:
+        directory = self.root / "preview-folder"
+        directory.mkdir()
+        for number in range(5):
+            (directory / str(number)).write_text("x", encoding="utf-8")
+        with mock.patch.object(quickfile, "PREVIEW_DIRECTORY_LIMIT", 2):
+            preview = quickfile.inline_preview_command(argparse.Namespace(
+                path=str(directory), path_token=None,
+            ))["preview"]
+        self.assertEqual(preview["kind"], "directory")
+        self.assertEqual(len(preview["entries"]), 2)
+        self.assertTrue(preview["truncated"])
+
+    def test_operation_ask_reports_all_root_conflicts_before_mutation(self) -> None:
+        destination = self.root / "ask-destination"
+        destination.mkdir()
+        first = self.root / "first.txt"
+        second = self.root / "second.txt"
+        first.write_text("new-first", encoding="utf-8")
+        second.write_text("new-second", encoding="utf-8")
+        (destination / first.name).write_text("old-first", encoding="utf-8")
+        (destination / second.name).write_text("old-second", encoding="utf-8")
+        with self.assertRaises(quickfile.OperationConflict) as raised:
+            quickfile.operation_command(argparse.Namespace(
+                action="copy", path=None, path_token=None,
+                path_tokens_json=json.dumps([
+                    quickfile.encode_path(str(first)), quickfile.encode_path(str(second)),
+                ]), source_uris_json=None, name=None,
+                destination=str(destination), destination_token=None,
+                conflict_policy="ask",
+            ), lambda _event: None)
+        self.assertEqual(len(raised.exception.conflicts), 2)
+        self.assertEqual((destination / first.name).read_text(encoding="utf-8"), "old-first")
+        self.assertEqual((destination / second.name).read_text(encoding="utf-8"), "old-second")
+
+    def test_operation_skip_and_keep_both_never_overwrite(self) -> None:
+        destination = self.root / "policy-destination"
+        destination.mkdir()
+        source = self.root / "policy.txt"
+        source.write_text("new", encoding="utf-8")
+        existing = destination / source.name
+        existing.write_text("old", encoding="utf-8")
+        common = dict(
+            action="copy", path=str(source), path_token=None, path_tokens_json=None,
+            source_uris_json=None, name=None, destination=str(destination), destination_token=None,
+        )
+        skipped = quickfile.operation_command(
+            argparse.Namespace(**common, conflict_policy="skip"), lambda _event: None
+        )
+        self.assertFalse(skipped["changed"])
+        self.assertEqual(skipped["skippedCount"], 1)
+        kept = quickfile.operation_command(
+            argparse.Namespace(**common, conflict_policy="keep-both"), lambda _event: None
+        )
+        self.assertEqual(existing.read_text(encoding="utf-8"), "old")
+        self.assertEqual((destination / "policy (copy).txt").read_text(encoding="utf-8"), "new")
+        self.assertEqual(kept["conflictPolicyApplied"], "keep-both")
+
+    def test_merge_copies_only_missing_children_and_is_undoable(self) -> None:
+        source = self.root / "merge-tree"
+        destination = self.root / "merge-destination"
+        target = destination / source.name
+        source.mkdir()
+        destination.mkdir()
+        target.mkdir()
+        (source / "same.txt").write_text("new", encoding="utf-8")
+        (source / "added.txt").write_text("added", encoding="utf-8")
+        (target / "same.txt").write_text("old", encoding="utf-8")
+        result = quickfile.operation_command(argparse.Namespace(
+            action="copy", path=str(source), path_token=None, path_tokens_json=None,
+            source_uris_json=None, name=None, destination=str(destination),
+            destination_token=None, conflict_policy="merge",
+        ), lambda _event: None)
+        self.assertTrue(result["changed"])
+        self.assertEqual((target / "same.txt").read_text(encoding="utf-8"), "old")
+        self.assertEqual((target / "added.txt").read_text(encoding="utf-8"), "added")
+        quickfile.operation_command(argparse.Namespace(action="undo"), lambda _event: None)
+        self.assertTrue((target / "same.txt").exists())
+        self.assertFalse((target / "added.txt").exists())
+
+    def test_merge_never_traverses_an_existing_destination_symlink(self) -> None:
+        source = self.root / "symlink-merge"
+        destination = self.root / "symlink-merge-destination"
+        target = destination / source.name
+        outside = self.root / "outside"
+        (source / "nested").mkdir(parents=True)
+        (source / "nested" / "must-not-escape.txt").write_text("new", encoding="utf-8")
+        target.mkdir(parents=True)
+        outside.mkdir()
+        (target / "nested").symlink_to(outside, target_is_directory=True)
+        result = quickfile.operation_command(argparse.Namespace(
+            action="copy", path=str(source), path_token=None, path_tokens_json=None,
+            source_uris_json=None, name=None, destination=str(destination),
+            destination_token=None, conflict_policy="merge",
+        ), lambda _event: None)
+        self.assertFalse(result["changed"])
+        self.assertFalse((outside / "must-not-escape.txt").exists())
+
+    def test_merge_move_leaves_conflicts_and_undoes_transferred_children(self) -> None:
+        source = self.root / "move-merge"
+        destination = self.root / "move-merge-destination"
+        target = destination / source.name
+        source.mkdir()
+        destination.mkdir()
+        target.mkdir()
+        (source / "same.txt").write_text("source", encoding="utf-8")
+        (source / "moved.txt").write_text("moved", encoding="utf-8")
+        (target / "same.txt").write_text("target", encoding="utf-8")
+        result = quickfile.operation_command(argparse.Namespace(
+            action="move", path=str(source), path_token=None, path_tokens_json=None,
+            source_uris_json=None, name=None, destination=str(destination),
+            destination_token=None, conflict_policy="merge",
+        ), lambda _event: None)
+        self.assertTrue(result["changed"])
+        self.assertTrue((source / "same.txt").exists())
+        self.assertFalse((source / "moved.txt").exists())
+        self.assertEqual((target / "same.txt").read_text(encoding="utf-8"), "target")
+        quickfile.operation_command(argparse.Namespace(action="undo"), lambda _event: None)
+        self.assertEqual((source / "moved.txt").read_text(encoding="utf-8"), "moved")
+        self.assertFalse((target / "moved.txt").exists())
+
+    def test_replace_moves_old_target_to_trash_and_undo_restores_it(self) -> None:
+        source = self.root / "replace.txt"
+        destination = self.root / "replace-destination"
+        target = destination / source.name
+        backup = self.root / "trashed-replace.txt"
+        uri = "trash:///replace.txt"
+        destination.mkdir()
+        source.write_text("new", encoding="utf-8")
+        target.write_text("old", encoding="utf-8")
+        in_trash = set()
+
+        def fake_gio(argv, *, timeout=quickfile.COMMAND_TIMEOUT, limit=131072):
+            if argv == ["gio", "trash", "--list"]:
+                output = f"{uri}\t{target}\n" if uri in in_trash else ""
+                return 0, output, ""
+            if argv == ["gio", "trash", "--", str(target)]:
+                target.rename(backup)
+                in_trash.add(uri)
+                return 0, "", ""
+            if argv == ["gio", "trash", "--restore", uri]:
+                backup.rename(target)
+                in_trash.discard(uri)
+                return 0, "", ""
+            self.fail(f"Unexpected argv: {argv}")
+
+        with mock.patch.object(quickfile, "run_bounded", side_effect=fake_gio):
+            result = quickfile.operation_command(argparse.Namespace(
+                action="copy", path=str(source), path_token=None, path_tokens_json=None,
+                source_uris_json=None, name=None, destination=str(destination),
+                destination_token=None, conflict_policy="replace",
+            ), lambda _event: None)
+            self.assertEqual(target.read_text(encoding="utf-8"), "new")
+            self.assertTrue(result["changed"])
+            quickfile.operation_command(argparse.Namespace(action="undo"), lambda _event: None)
+        self.assertEqual(target.read_text(encoding="utf-8"), "old")
+        self.assertTrue(source.exists())
+
+    def test_replace_restores_backup_when_copy_fails(self) -> None:
+        source = self.root / "failed-replace.txt"
+        destination = self.root / "failed-replace-destination"
+        target = destination / source.name
+        backup = self.root / "failed-replace-backup.txt"
+        uri = "trash:///failed-replace.txt"
+        destination.mkdir()
+        source.write_text("new", encoding="utf-8")
+        target.write_text("old", encoding="utf-8")
+        in_trash = set()
+
+        def fake_gio(argv, *, timeout=quickfile.COMMAND_TIMEOUT, limit=131072):
+            if argv == ["gio", "trash", "--list"]:
+                return 0, (f"{uri}\t{target}\n" if uri in in_trash else ""), ""
+            if argv == ["gio", "trash", "--", str(target)]:
+                target.rename(backup)
+                in_trash.add(uri)
+                return 0, "", ""
+            if argv == ["gio", "trash", "--restore", uri]:
+                backup.rename(target)
+                in_trash.discard(uri)
+                return 0, "", ""
+            self.fail(f"Unexpected argv: {argv}")
+
+        with mock.patch.object(quickfile, "run_bounded", side_effect=fake_gio), \
+                mock.patch.object(quickfile, "copy_scanned_source", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                quickfile.operation_command(argparse.Namespace(
+                    action="copy", path=str(source), path_token=None, path_tokens_json=None,
+                    source_uris_json=None, name=None, destination=str(destination),
+                    destination_token=None, conflict_policy="replace",
+                ), lambda _event: None)
+        self.assertEqual(target.read_text(encoding="utf-8"), "old")
+        self.assertFalse(in_trash)
+        self.assertFalse(quickfile.history_command(argparse.Namespace())["undoAvailable"])
+
+    def test_rg_content_acceleration_uses_fixed_bounded_argv(self) -> None:
+        matched = self.root / "notes.txt"
+        with mock.patch.object(quickfile.shutil, "which", return_value="/usr/bin/rg"), \
+                mock.patch.object(quickfile, "run_bounded", return_value=(0, str(matched) + "\0", "")) as runner:
+            candidates = quickfile.rg_content_candidates(
+                str(self.root), "hello; touch /tmp/no", "contains", False, False,
+                4096, quickfile.time.monotonic() + 2,
+            )
+        self.assertEqual(candidates, {str(matched)})
+        argv = runner.call_args.args[0]
+        self.assertIn("--fixed-strings", argv)
+        self.assertIn("hello; touch /tmp/no", argv)
+        self.assertEqual(argv[-2:], ["--", str(self.root)])
+        self.assertNotIn("sh", argv)
+
+    def test_search_transparently_falls_back_without_rg(self) -> None:
+        args = argparse.Namespace(
+            path=str(self.root), path_token=None, query="hello", mode="contains",
+            case_sensitive=False, show_hidden=False, no_git=True, limit=100,
+            scan_limit=1000, timeout=2.0, content_file_limit=1024 * 1024,
+            content_byte_limit=8 * 1024 * 1024,
+        )
+        with mock.patch.object(quickfile.shutil, "which", return_value=None):
+            result = quickfile.search_command(args)
+        self.assertEqual(result["engine"], "python")
+        self.assertEqual(result["entries"][0]["matchKind"], "content")
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ ShellRoot {
   property int beforeSignals: 0
   property int changedSignals: 0
   property int metadataSignals: 0
+  property int conflictSignals: 0
   property int createdDelegates: 0
   property int destroyedDelegates: 0
   property bool finished: false
@@ -48,6 +49,7 @@ ShellRoot {
       suite.metadataSignals++
       suite.lastMetadata = { token: token, values: values }
     }
+    function onConflictRequested(conflicts) { suite.conflictSignals++ }
   }
 
   Item {
@@ -204,6 +206,83 @@ ShellRoot {
       error: "name conflict", code: "name-conflict" }))
     check(synthetic.operationResult && synthetic.operationResult.code === "name-conflict",
       "Operation result did not preserve a structured failure")
+
+    var selectedBeforeBackgroundFeatures = synthetic.selectedToken
+    check(synthetic.applyQuickNav(JSON.stringify({ ok: true, entries: [
+      { token: "home-token", path: "/home/test", name: "Home", kind: "xdg" },
+      { token: "recent-token", path: "/work/recent", name: "Recent", kind: "recent" }
+    ] })), "Quick Nav response was rejected")
+    check(synthetic.quickNavEntries.length === 2 && synthetic.quickNavModel.count === 2,
+      "Quick Nav did not publish its bounded model")
+    check(synthetic.selectedToken === selectedBeforeBackgroundFeatures,
+      "Quick Nav loading changed the file selection")
+    var recordCommand = synthetic.buildQuickNavRecordCommand("recent-token", "")
+    check(recordCommand[3] === "quick-nav" && recordCommand.indexOf("--record") >= 0
+      && recordCommand[recordCommand.indexOf("--path-token") + 1] === "recent-token",
+      "Recent-location recording does not use a fixed token argument")
+
+    prepareRequest()
+    var accelerated = JSON.parse(response(synthetic.entries))
+    accelerated.engine = "rg"
+    check(synthetic.applyListing(JSON.stringify(accelerated)),
+      "Accelerated search listing was rejected")
+    check(synthetic.searchEngine === "rg", "Search engine identity was discarded")
+
+    synthetic.previewToken = "b"
+    synthetic.previewRevision = 7
+    synthetic.previewData = { kind: "metadata", name: "retained" }
+    check(synthetic.applyPreview(JSON.stringify({ ok: true,
+      preview: { kind: "text", text: "stale" } }), "a", 6),
+      "Stale preview was not ignored cleanly")
+    check(synthetic.previewData.name === "retained"
+      && synthetic.selectedToken === selectedBeforeBackgroundFeatures,
+      "Stale preview replaced current state or selection")
+    check(synthetic.applyPreview(JSON.stringify({ ok: true,
+      preview: { kind: "text", text: "current" } }), "b", 7),
+      "Current preview was rejected")
+    check(synthetic.previewData.kind === "text" && synthetic.previewData.text === "current",
+      "Current inline preview was not published")
+    var previewCommand = synthetic.buildPreviewCommand("opaque-preview-token")
+    check(previewCommand.join("|").indexOf("preview|--path-token|opaque-preview-token") >= 0,
+      "Preview command does not pass the opaque path token as a fixed argv value")
+
+    var operationCommand = synthetic.buildOperationCommand({ kind: "copy",
+      tokens: ["first-token", "second-token"], destinationToken: "folder-token",
+      name: "", trashUris: [], sourceUris: [], conflictPolicy: "ask" })
+    check(operationCommand[3] === "operation" && operationCommand[4] === "copy"
+      && operationCommand[operationCommand.indexOf("--destination-token") + 1] === "folder-token"
+      && operationCommand[operationCommand.indexOf("--conflict-policy") + 1] === "ask",
+      "Drop operation command lost its destination token or safe conflict default")
+    check(JSON.parse(operationCommand[operationCommand.indexOf("--path-tokens-json") + 1]).join(",")
+      === "first-token,second-token", "Internal drops did not preserve opaque token values")
+    var externalCommand = synthetic.buildOperationCommand({ kind: "copy", tokens: [],
+      destinationToken: "folder-token", name: "", trashUris: [],
+      sourceUris: ["file:///tmp/from-file-manager"], conflictPolicy: "ask" })
+    check(JSON.parse(externalCommand[externalCommand.indexOf("--source-uris-json") + 1])[0]
+      === "file:///tmp/from-file-manager", "External file drop did not use the URI argv channel")
+    var tooManyTokens = []
+    for (var tokenIndex = 0; tokenIndex < 501; tokenIndex++) tooManyTokens.push("t" + tokenIndex)
+    check(!synthetic.dropOnDirectory("folder-token", tooManyTokens, false),
+      "Drop token input was not bounded")
+
+    synthetic.pendingOperation = { kind: "copy", tokens: ["first-token"],
+      destinationToken: "folder-token", name: "", trashUris: [], sourceUris: [],
+      conflictPolicy: "ask" }
+    var conflicts = [{ sourceToken: "first-token", targetToken: "existing-token" }]
+    check(synthetic.applyOperationCompletion({ ok: false, code: "operation-conflict",
+      error: "A destination exists", conflicts: conflicts }),
+      "Structured operation conflict was not recognized")
+    check(synthetic.operationResult.code === "operation-conflict"
+      && synthetic.operationConflicts.length === 1 && synthetic.pendingOperation !== null
+      && conflictSignals === 1, "Conflict details or pending retry request were discarded")
+    check(synthetic.dismissOperationConflict() && synthetic.pendingOperation === null
+      && synthetic.operationConflicts.length === 0 && synthetic.operationResult === null,
+      "Dismissing a conflict did not clear its pending request")
+    synthetic.pendingOperation = { kind: "copy", tokens: ["first-token"] }
+    check(!synthetic.applyOperationCompletion({ ok: true }),
+      "Successful operation was mistaken for a conflict")
+    check(synthetic.pendingOperation === null && synthetic.operationConflicts.length === 0,
+      "Completed operation retained obsolete conflict state")
     console.log("QuickFile service model assertions passed:", assertions)
   }
 

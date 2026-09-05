@@ -46,6 +46,30 @@ Item {
   property string undoId: ""
   property string undoLabel: ""
   property bool historyReloadPending: false
+  property var quickNavEntries: []
+  property bool quickNavBusy: quickNavProcess.running || quickNavRecordProcess.running
+  readonly property bool quickNavLoading: quickNavBusy
+  property string quickNavError: ""
+  property bool quickNavReloadPending: false
+  property string quickNavStdout: ""
+  property string quickNavStderr: ""
+  property bool quickNavRecordPending: false
+  property string quickNavRecordToken: ""
+  property string quickNavRecordPath: ""
+  property bool recordNavigationOnListing: false
+  property var previewData: null
+  property bool previewBusy: previewProcess.running
+  readonly property bool previewLoading: previewBusy
+  property string previewError: ""
+  property string previewToken: ""
+  property string previewInFlightToken: ""
+  property string previewPendingToken: ""
+  property int previewRevision: 0
+  property int previewInFlightRevision: 0
+  property string previewStdout: ""
+  property string previewStderr: ""
+  property var pendingOperation: null
+  property var operationConflicts: []
 
   property string rootPath: homePath
   property string rootToken: ""
@@ -84,6 +108,7 @@ Item {
   property string searchMode: "fuzzy"
   property bool caseSensitive: false
   property bool truncated: false
+  property string searchEngine: ""
   property var git: ({ root: "", branch: "" })
 
   // Keep QML delegates alive. The arrays above remain the service's snapshots;
@@ -92,10 +117,12 @@ Item {
   property alias favoritesModel: favoriteRows
   property alias knowledgeModel: knowledgeRows
   property alias volumesModel: volumeRows
+  property alias quickNavModel: quickNavRows
   ListModel { id: fileRows; dynamicRoles: true }
   ListModel { id: favoriteRows; dynamicRoles: true }
   ListModel { id: knowledgeRows; dynamicRoles: true }
   ListModel { id: volumeRows; dynamicRoles: true }
+  ListModel { id: quickNavRows; dynamicRoles: true }
 
   property var listWatch: null
   property var knowledgeWatch: null
@@ -155,6 +182,7 @@ Item {
   signal metadataSaved(string token, var values)
   signal actionFinished(string kind, bool ok, string message)
   signal knowledgeLinksFinished(bool ok, bool applied, string message)
+  signal conflictRequested(var conflicts)
 
   function setPanelVisible(value) {
     if (panelVisible === (value === true)) return
@@ -174,15 +202,18 @@ Item {
   function ensureLoaded() {
     if (!initialized) {
       initialized = true
+      recordNavigationOnListing = true
       reload()
       reloadVolumes()
       reloadHistory()
+      reloadQuickNav()
     } else {
       // Reconcile changes that happened while the panel (and watcher) was shut.
       reload(true)
       reloadKnowledge()
       reloadVolumes()
       reloadHistory()
+      reloadQuickNav()
     }
   }
 
@@ -220,6 +251,41 @@ Item {
         }
         if (!sameData(previousByKey[key], next[n]))
           model.set(n, { rowData: next[n], scope: String(next[n].scope || "") })
+      }
+    }
+  }
+
+  function quickNavRowKey(row) {
+    return String(row.token || row.path || row.uri || row.name || "")
+  }
+
+  function reconcileQuickNav(previous, next) {
+    var keys = previous.map(quickNavRowKey)
+    var wanted = ({})
+    var previousByKey = ({})
+    for (var i = 0; i < previous.length; i++)
+      previousByKey[quickNavRowKey(previous[i])] = previous[i]
+    for (var j = 0; j < next.length; j++) wanted[quickNavRowKey(next[j])] = true
+    for (var k = keys.length - 1; k >= 0; k--) {
+      if (!wanted[keys[k]]) {
+        quickNavRows.remove(k)
+        keys.splice(k, 1)
+      }
+    }
+    for (var n = 0; n < next.length; n++) {
+      var key = quickNavRowKey(next[n])
+      var index = keys.indexOf(key, n)
+      if (index < 0) {
+        quickNavRows.insert(n, { rowData: next[n] })
+        keys.splice(n, 0, key)
+      } else {
+        if (index !== n) {
+          quickNavRows.move(index, n, 1)
+          keys.splice(index, 1)
+          keys.splice(n, 0, key)
+        }
+        if (!sameData(previousByKey[key], next[n]))
+          quickNavRows.set(n, { rowData: next[n] })
       }
     }
   }
@@ -359,6 +425,80 @@ Item {
     volumesProcess.command = ["/usr/bin/env", "python3", cliPath, "volumes"]
     volumesProcess.running = true
     return true
+  }
+
+  function buildQuickNavCommand() {
+    return ["/usr/bin/env", "python3", cliPath, "quick-nav"]
+  }
+
+  function reloadQuickNav() {
+    if (quickNavProcess.running || quickNavRecordProcess.running) {
+      quickNavReloadPending = true
+      return false
+    }
+    quickNavStdout = ""
+    quickNavStderr = ""
+    quickNavError = ""
+    quickNavProcess.command = buildQuickNavCommand()
+    quickNavProcess.running = true
+    return true
+  }
+
+  function applyQuickNav(raw) {
+    var parsed = null
+    try { parsed = JSON.parse(String(raw || "")) } catch (error) {
+      quickNavError = "Quick Nav returned invalid data"
+      return false
+    }
+    if (!parsed || parsed.ok !== true) {
+      quickNavError = parsed && parsed.error
+        ? String(parsed.error) : "Could not load Quick Nav"
+      return false
+    }
+    var next = Array.isArray(parsed.entries) ? parsed.entries : []
+    if (!sameData(quickNavEntries, next)) {
+      reconcileQuickNav(quickNavEntries, next)
+      quickNavEntries = next
+    }
+    quickNavError = ""
+    return true
+  }
+
+  function buildQuickNavRecordCommand(token, path) {
+    var command = ["/usr/bin/env", "python3", cliPath, "quick-nav", "--record"]
+    if (String(token || "") !== "") {
+      command.push("--path-token")
+      command.push(String(token))
+    } else {
+      command.push("--path")
+      command.push(String(path || ""))
+    }
+    return command
+  }
+
+  function recordRecentLocation(token, path) {
+    var valueToken = String(token || "")
+    var valuePath = String(path || "")
+    if (valueToken === "" && valuePath === "") return false
+    if (quickNavRecordProcess.running || quickNavProcess.running) {
+      quickNavRecordToken = valueToken
+      quickNavRecordPath = valuePath
+      quickNavRecordPending = true
+      return false
+    }
+    quickNavRecordToken = valueToken
+    quickNavRecordPath = valuePath
+    quickNavRecordPending = false
+    quickNavStdout = ""
+    quickNavStderr = ""
+    quickNavRecordProcess.command = buildQuickNavRecordCommand(valueToken, valuePath)
+    quickNavRecordProcess.running = true
+    return true
+  }
+
+  function navigateQuickNav(entry) {
+    if (!entry) return false
+    return navigate(String(entry.path || ""), String(entry.token || ""), true)
   }
 
   function applyVolumes(raw) {
@@ -507,6 +647,7 @@ Item {
     var nextGit = parsed.git || ({ root: "", branch: "" })
     var changed = !sameData(entries, nextEntries) || !sameData(favorites, nextFavorites)
       || !sameData(git, nextGit) || truncated !== (parsed.truncated === true)
+      || searchEngine !== String(parsed.engine || "")
     var anchorToken = selectionAnchorIndex >= 0 && selectionAnchorIndex < entries.length
       ? String(entries[selectionAnchorIndex].token || "") : ""
     if (changed) listingAboutToChange()
@@ -526,6 +667,7 @@ Item {
     }
     if (!sameData(git, nextGit)) git = nextGit
     truncated = parsed.truncated === true
+    searchEngine = String(parsed.engine || "")
     errorMessage = ""
 
     var selected = null
@@ -560,6 +702,7 @@ Item {
           selectionAnchorIndex = anchorIndex
     }
     if (!selected) {
+      if (previewToken !== "") clearPreview()
       selectedToken = ""
       selectedProperties = null
       selectionAnchorIndex = -1
@@ -570,6 +713,10 @@ Item {
     }
     listWatch = parsed.watch || null
     syncWatchConfiguration()
+    if (recordNavigationOnListing) {
+      recordNavigationOnListing = false
+      recordRecentLocation(rootToken, rootPath)
+    }
     if (knowledgeRootToken !== rootToken) Qt.callLater(root.reloadKnowledge)
     return true
   }
@@ -591,6 +738,7 @@ Item {
     }
     rootPath = nextPath || rootPath
     rootToken = nextToken
+    recordNavigationOnListing = true
     parentPath = rootPath
     parentToken = rootToken
     expandedTokens = []
@@ -606,6 +754,7 @@ Item {
     knowledgeWatch = null
     syncWatchConfiguration()
     query = ""
+    clearPreview()
     selectedToken = ""
     selectedTokens = []
     selectionAnchorIndex = -1
@@ -678,11 +827,14 @@ Item {
 
   function setActiveEntry(entry) {
     if (!entry) {
+      clearPreview()
       selectedToken = ""
       selectedEntry = null
       selectedProperties = null
       return false
     }
+    if (selectedToken !== "" && selectedToken !== String(entry.token || ""))
+      clearPreview()
     selectedEntry = entry
     selectedToken = String(entry.token || "")
     inspect(selectedToken)
@@ -752,6 +904,7 @@ Item {
   }
 
   function clearSelection() {
+    clearPreview()
     selectedTokens = []
     selectionAnchorIndex = -1
     selectedToken = ""
@@ -873,6 +1026,68 @@ Item {
     return true
   }
 
+  function buildPreviewCommand(token) {
+    return ["/usr/bin/env", "python3", cliPath,
+      "preview", "--path-token", String(token || "")]
+  }
+
+  function clearPreview() {
+    previewRevision++
+    previewToken = ""
+    previewPendingToken = ""
+    previewData = null
+    previewError = ""
+  }
+
+  function loadPreview(entry) {
+    if (!entry || String(entry.token || "") === "") {
+      clearPreview()
+      previewError = "Select an item to preview"
+      return false
+    }
+    var token = String(entry.token)
+    previewRevision++
+    previewToken = token
+    previewData = null
+    previewError = ""
+    previewPendingToken = token
+    if (!previewProcess.running) startPendingPreview()
+    return true
+  }
+
+  function startPendingPreview() {
+    if (previewProcess.running || previewPendingToken === "") return false
+    previewInFlightToken = previewPendingToken
+    previewInFlightRevision = previewRevision
+    previewPendingToken = ""
+    previewStdout = ""
+    previewStderr = ""
+    previewProcess.command = buildPreviewCommand(previewInFlightToken)
+    previewProcess.running = true
+    return true
+  }
+
+  function applyPreview(raw, token, revision) {
+    // Selection can change while thumbnail/text extraction is running. Never
+    // let that old result replace the preview for the newly selected entry.
+    if (Number(revision) !== previewRevision || String(token || "") !== previewToken)
+      return true
+    var parsed = null
+    try { parsed = JSON.parse(String(raw || "")) } catch (error) {
+      previewError = "Preview returned invalid data"
+      previewData = null
+      return false
+    }
+    if (!parsed || parsed.ok !== true || !parsed.preview) {
+      previewError = parsed && parsed.error ? String(parsed.error) : "Could not preview this file"
+      previewData = null
+      return false
+    }
+    previewData = parsed.preview
+    previewError = ""
+    return true
+  }
+
   function runBatchAction(kind, tokens, destinationToken) {
     var values = Array.isArray(tokens) ? tokens : []
     if (actionBusy || values.length === 0) return false
@@ -895,12 +1110,52 @@ Item {
     return runOperation(kind, sourceTokens, destinationToken)
   }
 
-  function runOperation(kind, tokens, destinationToken, name, trashUris) {
-    var values = Array.isArray(tokens) ? tokens : []
-    var uris = Array.isArray(trashUris) ? trashUris : []
-    if (actionBusy) return false
-    if (kind !== "undo" && values.length === 0 && uris.length === 0) return false
-    actionKind = String(kind || "")
+  function buildOperationCommand(request) {
+    var command = ["/usr/bin/env", "python3", cliPath,
+      "operation", String(request.kind || "")]
+    var values = Array.isArray(request.tokens) ? request.tokens : []
+    var uris = Array.isArray(request.trashUris) ? request.trashUris : []
+    var sourceUris = Array.isArray(request.sourceUris) ? request.sourceUris : []
+    if (values.length === 1) {
+      command.push("--path-token")
+      command.push(String(values[0]))
+    } else if (values.length > 1) {
+      command.push("--path-tokens-json")
+      command.push(JSON.stringify(values))
+    }
+    if (sourceUris.length > 0) {
+      command.push("--source-uris-json")
+      command.push(JSON.stringify(sourceUris))
+    }
+    if (request.destinationToken) {
+      command.push("--destination-token")
+      command.push(String(request.destinationToken))
+    }
+    if (request.name !== undefined && request.name !== null && String(request.name) !== "") {
+      command.push("--name")
+      command.push(String(request.name))
+    }
+    if (uris.length === 1) {
+      command.push("--trash-uri")
+      command.push(String(uris[0]))
+    } else if (uris.length > 1) {
+      command.push("--trash-uris-json")
+      command.push(JSON.stringify(uris))
+    }
+    command.push("--conflict-policy")
+    command.push(String(request.conflictPolicy || "ask"))
+    return command
+  }
+
+  function startOperationRequest(request) {
+    if (actionBusy || !request) return false
+    pendingOperation = Object.assign({}, request, {
+      tokens: (request.tokens || []).slice(),
+      trashUris: (request.trashUris || []).slice(),
+      sourceUris: (request.sourceUris || []).slice()
+    })
+    operationConflicts = []
+    actionKind = String(request.kind || "")
     actionMessage = ""
     operationPhase = "starting"
     operationProgress = -1
@@ -911,32 +1166,74 @@ Item {
     operationCancelling = false
     operationResult = null
     operationStderr = ""
-    var command = ["/usr/bin/env", "python3", cliPath, "operation", actionKind]
-    if (values.length === 1) {
-      command.push("--path-token")
-      command.push(String(values[0]))
-    } else if (values.length > 1) {
-      command.push("--path-tokens-json")
-      command.push(JSON.stringify(values))
-    }
-    if (destinationToken) {
-      command.push("--destination-token")
-      command.push(String(destinationToken))
-    }
-    if (name !== undefined && name !== null && String(name) !== "") {
-      command.push("--name")
-      command.push(String(name))
-    }
-    if (uris.length === 1) {
-      command.push("--trash-uri")
-      command.push(String(uris[0]))
-    } else if (uris.length > 1) {
-      command.push("--trash-uris-json")
-      command.push(JSON.stringify(uris))
-    }
-    operationProcess.command = command
+    operationProcess.command = buildOperationCommand(pendingOperation)
     operationProcess.running = true
     return true
+  }
+
+  function runOperation(kind, tokens, destinationToken, name, trashUris,
+      conflictPolicy, sourceUris) {
+    var values = Array.isArray(tokens) ? tokens : []
+    var uris = Array.isArray(trashUris) ? trashUris : []
+    var externalUris = Array.isArray(sourceUris) ? sourceUris : []
+    if (String(kind || "") !== "undo" && values.length === 0
+        && uris.length === 0 && externalUris.length === 0) return false
+    return startOperationRequest({
+      kind: String(kind || ""), tokens: values, destinationToken: String(destinationToken || ""),
+      name: name === undefined || name === null ? "" : String(name), trashUris: uris,
+      conflictPolicy: String(conflictPolicy || "ask"), sourceUris: externalUris
+    })
+  }
+
+  function retryOperation(policy) {
+    var value = String(policy || "")
+    if (["keep-both", "skip", "merge", "replace"].indexOf(value) < 0
+        || !pendingOperation || actionBusy) return false
+    var request = Object.assign({}, pendingOperation, { conflictPolicy: value })
+    return startOperationRequest(request)
+  }
+
+  function dismissOperationConflict() {
+    if (operationBusy || !pendingOperation) return false
+    pendingOperation = null
+    operationConflicts = []
+    if (operationResult && operationResult.code === "operation-conflict")
+      operationResult = null
+    return true
+  }
+
+  function boundedArgumentValues(values, maxLength) {
+    if (!Array.isArray(values) || values.length === 0 || values.length > 500) return null
+    var output = []
+    var total = 0
+    for (var i = 0; i < values.length; i++) {
+      var value = String(values[i] || "")
+      total += value.length
+      if (value === "" || value.length > maxLength || total > 1048576) return null
+      output.push(value)
+    }
+    return output
+  }
+
+  function dropOnDirectory(destinationToken, sourceTokens, move) {
+    var destination = String(destinationToken || "")
+    var values = boundedArgumentValues(sourceTokens, 8192)
+    if (destination === "" || destination.length > 8192 || values === null) return false
+    return runOperation(move === true ? "move" : "copy", values, destination)
+  }
+
+  function dropExternalUrisOnDirectory(destinationToken, sourceUris, move) {
+    var destination = String(destinationToken || "")
+    var supplied = boundedArgumentValues(sourceUris, 16384)
+    if (destination === "" || destination.length > 8192 || supplied === null) return false
+    var localUris = []
+    for (var i = 0; i < supplied.length; i++) {
+      var value = String(supplied[i] || "").trim()
+      if (value.indexOf("file://") === 0) localUris.push(value)
+    }
+    if (localUris.length !== supplied.length) return false
+    return runOperation(move === true ? "move" : "copy", [], destination,
+      "", [], "ask", localUris)
   }
 
   function handleOperationEvent(raw) {
@@ -957,6 +1254,19 @@ Item {
     else if (operationItemsTotal > 0)
       operationProgress = Math.max(0, Math.min(1, operationItemsDone / operationItemsTotal))
     else operationProgress = -1
+  }
+
+  function applyOperationCompletion(result) {
+    var conflict = result && result.code === "operation-conflict"
+    if (conflict) {
+      operationResult = result
+      operationConflicts = Array.isArray(result.conflicts) ? result.conflicts : []
+      conflictRequested(operationConflicts)
+    } else {
+      pendingOperation = null
+      operationConflicts = []
+    }
+    return conflict
   }
 
   function cancelOperation() {
@@ -1050,11 +1360,12 @@ Item {
   }
 
   function previewEntry(entry) {
-    if (!entry || entry.isDir === true) {
-      actionMessage = "Select a file to preview"
-      return false
-    }
-    return runAction("preview", String(entry.token || ""))
+    return loadPreview(entry)
+  }
+  function openPreviewExternally(entry) {
+    var target = entry || selectedEntry
+    return target && target.isDir !== true
+      ? runAction("preview", String(target.token || "")) : false
   }
   function copySelectedPath() { return runAction("copy-path", selectedToken) }
   function duplicateSelected() {
@@ -1448,6 +1759,79 @@ Item {
   }
 
   Process {
+    id: quickNavProcess
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.quickNavStdout = text
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.quickNavStderr = text.slice(-2000)
+    }
+    onExited: function(exitCode) {
+      if (!root.applyQuickNav(root.quickNavStdout) && !root.quickNavError)
+        root.quickNavError = root.quickNavStderr.trim() || ("Quick Nav exited " + exitCode)
+      if (root.quickNavRecordPending) {
+        var token = root.quickNavRecordToken
+        var path = root.quickNavRecordPath
+        root.quickNavRecordPending = false
+        Qt.callLater(function() { root.recordRecentLocation(token, path) })
+      } else if (root.quickNavReloadPending) {
+        root.quickNavReloadPending = false
+        Qt.callLater(root.reloadQuickNav)
+      }
+    }
+  }
+
+  Process {
+    id: quickNavRecordProcess
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.quickNavStdout = text
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.quickNavStderr = text.slice(-2000)
+    }
+    onExited: function(exitCode) {
+      if (exitCode !== 0 && root.quickNavStderr.trim() !== "")
+        root.quickNavError = root.quickNavStderr.trim()
+      if (root.quickNavRecordPending) {
+        var token = root.quickNavRecordToken
+        var path = root.quickNavRecordPath
+        root.quickNavRecordPending = false
+        Qt.callLater(function() { root.recordRecentLocation(token, path) })
+      } else {
+        root.quickNavReloadPending = false
+        if (!root.applyQuickNav(root.quickNavStdout) && !root.quickNavError)
+          root.quickNavError = root.quickNavStderr.trim() || ("Quick Nav record exited " + exitCode)
+      }
+    }
+  }
+
+  Process {
+    id: previewProcess
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.previewStdout = text
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.previewStderr = text.slice(-2000)
+    }
+    onExited: function(exitCode) {
+      var token = root.previewInFlightToken
+      var revision = root.previewInFlightRevision
+      var isCurrent = token === root.previewToken && revision === root.previewRevision
+      if (!root.applyPreview(root.previewStdout, token, revision) && isCurrent
+          && root.previewError === "")
+        root.previewError = root.previewStderr.trim() || ("Preview exited " + exitCode)
+      root.previewInFlightToken = ""
+      if (root.previewPendingToken !== "") Qt.callLater(root.startPendingPreview)
+    }
+  }
+
+  Process {
     id: operationProcess
     stdout: SplitParser {
       onRead: function(data) { root.handleOperationEvent(data) }
@@ -1469,6 +1853,7 @@ Item {
       root.operationProgress = -1
       root.operationCancelling = false
       root.actionKind = ""
+      root.applyOperationCompletion(parsed)
       if (ok && kind === "move") root.clearClipboard()
       root.actionFinished(kind, ok, message)
       Qt.callLater(root.reloadHistory)

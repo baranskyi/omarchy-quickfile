@@ -29,12 +29,13 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 import uuid
 from pathlib import Path
 from typing import Any, Iterable
 
 
-VERSION = "0.8.0"
+VERSION = "0.9.0"
 DEFAULT_LIMIT = 2000
 COMMAND_TIMEOUT = 3
 DEFAULT_CONTENT_FILE_LIMIT = 1024 * 1024
@@ -51,7 +52,16 @@ OPERATION_ENTRY_LIMIT = 250000
 OPERATION_DEPTH_LIMIT = 128
 OPERATION_HISTORY_LIMIT = 50
 OPERATION_HISTORY_SIZE_LIMIT = 2 * 1024 * 1024
+OPERATION_JOURNAL_BUDGET = 1024 * 1024
 COPY_CHUNK_SIZE = 1024 * 1024
+QUICK_NAV_LIMIT = 200
+QUICK_NAV_SIZE_LIMIT = 256 * 1024
+QUICK_NAV_COMMAND_LIMIT = 512 * 1024
+PREVIEW_READ_LIMIT = 256 * 1024
+PREVIEW_TEXT_LIMIT = 65536
+PREVIEW_DIRECTORY_LIMIT = 64
+RG_OUTPUT_LIMIT = 4 * 1024 * 1024
+CONFLICT_POLICIES = ("ask", "keep-both", "skip", "merge", "replace")
 KNOWLEDGE_AGENT_ORDER = (
     "codex", "claude", "gemini", "cursor", "copilot", "windsurf",
 )
@@ -67,6 +77,15 @@ class QuickfileError(Exception):
 class OperationCancelled(QuickfileError):
     def __init__(self) -> None:
         super().__init__("Operation cancelled", "cancelled")
+
+
+class OperationConflict(QuickfileError):
+    def __init__(self, conflicts: list[dict[str, Any]]) -> None:
+        super().__init__(
+            "One or more items already exist at the destination",
+            "operation-conflict",
+        )
+        self.conflicts = conflicts
 
 
 def json_print(value: dict[str, Any]) -> None:
@@ -117,6 +136,213 @@ def metadata_file() -> Path:
 def quickfile_home() -> str:
     override = os.environ.get("QUICKFILE_HOME", "").strip()
     return normalized_path(override) if override else normalized_path(str(Path.home()))
+
+
+def quick_nav_file() -> Path:
+    override = os.environ.get("QUICKFILE_NAV_FILE", "").strip()
+    if override:
+        return Path(override).expanduser()
+    state_home = os.environ.get("XDG_STATE_HOME", "").strip()
+    base = Path(state_home).expanduser() if state_home else Path.home() / ".local" / "state"
+    return base / "omarchy" / "quickfile" / "recent-locations.json"
+
+
+def load_quick_nav_recents() -> list[dict[str, Any]]:
+    path = quick_nav_file()
+    try:
+        if not path.exists():
+            return []
+        if path.stat().st_size > QUICK_NAV_SIZE_LIMIT:
+            raise QuickfileError("Recent locations are too large", "quick-nav-too-large")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except QuickfileError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise QuickfileError(
+            f"Could not read recent locations: {exc}", "quick-nav-read-failed"
+        ) from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("locations"), list):
+        raise QuickfileError("Recent locations have an invalid format", "quick-nav-invalid")
+    rows: list[dict[str, Any]] = []
+    for item in payload["locations"][:QUICK_NAV_LIMIT]:
+        if not isinstance(item, dict) or not isinstance(item.get("token"), str):
+            continue
+        try:
+            location = normalized_path(decode_path(item["token"]))
+        except QuickfileError:
+            continue
+        rows.append({"path": location, "visitedAt": str(item.get("visitedAt", ""))})
+    return rows
+
+
+def save_quick_nav_recents(rows: list[dict[str, Any]]) -> None:
+    path = quick_nav_file()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    locations = [
+        {"token": encode_path(str(row["path"])), "visitedAt": str(row.get("visitedAt", ""))}
+        for row in rows[:QUICK_NAV_LIMIT]
+    ]
+    payload = json.dumps(
+        {"version": 1, "locations": locations},
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ) + "\n"
+    if len(payload.encode("utf-8")) > QUICK_NAV_SIZE_LIMIT:
+        raise QuickfileError("Recent locations are too large", "quick-nav-too-large")
+    descriptor, temporary = tempfile.mkstemp(prefix=".recent-locations.", dir=path.parent)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            descriptor = -1
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except OSError as exc:
+        raise QuickfileError(
+            f"Could not save recent locations: {exc}", "quick-nav-write-failed"
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def record_quick_nav_location(path: str) -> list[dict[str, Any]]:
+    location = normalized_path(path)
+    if not os.path.isdir(location):
+        raise QuickfileError("Only folders can be added to recent locations", "not-a-directory")
+    rows = [row for row in load_quick_nav_recents() if row["path"] != location]
+    rows.insert(0, {"path": location, "visitedAt": iso_time(time.time())})
+    rows = rows[:QUICK_NAV_LIMIT]
+    save_quick_nav_recents(rows)
+    return rows
+
+
+def xdg_user_directories() -> list[tuple[str, str]]:
+    labels = {
+        "DESKTOP": "Desktop", "DOCUMENTS": "Documents", "DOWNLOAD": "Downloads",
+        "MUSIC": "Music", "PICTURES": "Pictures", "PUBLICSHARE": "Public",
+        "TEMPLATES": "Templates", "VIDEOS": "Videos",
+    }
+    values: dict[str, str] = {}
+    config_home = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    config = (Path(config_home).expanduser() if config_home else Path.home() / ".config") / "user-dirs.dirs"
+    try:
+        if config.exists() and config.stat().st_size <= 65536:
+            for line in config.read_text(encoding="utf-8").splitlines():
+                match = re.fullmatch(r'XDG_([A-Z]+)_DIR="([^"\x00]*)"', line.strip())
+                if not match or match.group(1) not in labels:
+                    continue
+                raw = match.group(2)
+                home = str(Path.home())
+                if raw == "$HOME":
+                    raw = home
+                elif raw.startswith("$HOME/"):
+                    raw = os.path.join(home, raw[6:])
+                elif not os.path.isabs(raw):
+                    continue
+                values[match.group(1)] = normalized_path(raw)
+    except (OSError, UnicodeError):
+        pass
+    return [(labels[key], path) for key, path in values.items() if os.path.isdir(path)]
+
+
+def git_navigation_rows(seeds: list[str], deadline: float) -> list[tuple[str, str]]:
+    roots: list[str] = []
+    worktrees: list[str] = []
+    for seed in seeds[:12]:
+        if time.monotonic() >= deadline or not os.path.isdir(seed):
+            break
+        code, output, _ = run_bounded(
+            ["git", "-C", seed, "rev-parse", "--show-toplevel"], timeout=1, limit=8192
+        )
+        if code != 0 or not output.strip():
+            continue
+        root = normalized_path(output.splitlines()[0])
+        if root not in roots:
+            roots.append(root)
+        if time.monotonic() >= deadline:
+            break
+        code, output, _ = run_bounded(
+            ["git", "-C", root, "worktree", "list", "--porcelain"],
+            timeout=1,
+            limit=QUICK_NAV_COMMAND_LIMIT,
+        )
+        if code == 0:
+            for line in output.splitlines():
+                if not line.startswith("worktree "):
+                    continue
+                candidate = normalized_path(line[9:])
+                if os.path.isdir(candidate) and candidate not in worktrees:
+                    worktrees.append(candidate)
+                    if len(worktrees) >= QUICK_NAV_LIMIT:
+                        break
+    rows = [("git", path) for path in roots]
+    rows.extend(("worktree", path) for path in worktrees if path not in roots)
+    return rows[:QUICK_NAV_LIMIT]
+
+
+def zoxide_navigation_paths(deadline: float) -> list[str]:
+    executable = shutil.which("zoxide")
+    if not executable or time.monotonic() >= deadline:
+        return []
+    code, output, _ = run_bounded(
+        [executable, "query", "--list"], timeout=2, limit=QUICK_NAV_COMMAND_LIMIT
+    )
+    if code != 0:
+        return []
+    paths: list[str] = []
+    for line in output.splitlines():
+        if len(paths) >= QUICK_NAV_LIMIT:
+            break
+        candidate = normalized_path(line)
+        if line and os.path.isdir(candidate) and candidate not in paths:
+            paths.append(candidate)
+    return paths
+
+
+def quick_nav_command(args: argparse.Namespace) -> dict[str, Any]:
+    limit = min(QUICK_NAV_LIMIT, max(1, int(getattr(args, "limit", QUICK_NAV_LIMIT))))
+    current = path_from_args(args, required=False)
+    recents = (
+        record_quick_nav_location(current)
+        if getattr(args, "record", False)
+        else load_quick_nav_recents()
+    )
+    home = normalized_path(str(Path.home()))
+    xdg = xdg_user_directories()
+    seeds = [current, *[row["path"] for row in recents], *[path for _, path in xdg], home]
+    deadline = time.monotonic() + 3.0
+    git_rows = git_navigation_rows(seeds, deadline)
+    zoxide = [] if getattr(args, "no_zoxide", False) else zoxide_navigation_paths(deadline)
+
+    candidates: list[tuple[str, str, str]] = [("Home", home, "home")]
+    candidates.extend((label, path, "xdg") for label, path in xdg if path != home)
+    candidates.extend((os.path.basename(path) or path, path, kind) for kind, path in git_rows)
+    candidates.extend((os.path.basename(row["path"]) or row["path"], row["path"], "recent")
+                      for row in recents)
+    candidates.extend((os.path.basename(path) or path, path, "zoxide") for path in zoxide)
+    entries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for label, path, source in candidates:
+        normalized = normalized_path(path)
+        if normalized in seen or not os.path.isdir(normalized):
+            continue
+        seen.add(normalized)
+        entries.append({
+            "name": display_text(label), "path": display_text(normalized),
+            "token": encode_path(normalized), "kind": source, "source": source,
+        })
+        if len(entries) >= limit:
+            break
+    return {
+        "ok": True, "entries": entries, "count": len(entries),
+        "truncated": len(seen) >= limit and len(candidates) > len(entries),
+    }
 
 
 class WatchPaths:
@@ -1358,6 +1584,61 @@ def content_match(
     return None, len(raw)
 
 
+def rg_content_candidates(
+    root: str,
+    query: str,
+    mode: str,
+    case_sensitive: bool,
+    show_hidden: bool,
+    file_limit: int,
+    deadline: float,
+) -> set[str] | None:
+    """Return rg-prefiltered files, or None when Python must be used."""
+    executable = shutil.which("rg")
+    remaining = deadline - time.monotonic()
+    if not executable or remaining < 0.15 or file_limit <= 0:
+        return None
+    if mode == "regex":
+        try:
+            re.compile(query, 0 if case_sensitive else re.IGNORECASE)
+        except re.error as exc:
+            raise QuickfileError(f"Invalid regular expression: {exc}", "invalid-regex") from exc
+        pattern = query
+        fixed = False
+    elif mode == "exact":
+        pattern, fixed = rf"^\s*{re.escape(query)}\s*$", False
+    elif mode == "prefix":
+        pattern, fixed = rf"^\s*{re.escape(query)}", False
+    elif mode == "suffix":
+        pattern, fixed = rf"{re.escape(query)}\s*$", False
+    else:
+        pattern, fixed = query, True
+    argv = [
+        executable, "--files-with-matches", "--null", "--no-messages", "--color", "never",
+        "--max-count", "1", "--max-filesize", str(file_limit), "--glob", "!.git/**",
+        "--no-ignore",
+        "--case-sensitive" if case_sensitive else "--ignore-case",
+    ]
+    if show_hidden:
+        argv.append("--hidden")
+    if fixed:
+        argv.append("--fixed-strings")
+    argv.extend(["-e", pattern, "--", root])
+    code, output, _ = run_bounded(
+        argv, timeout=max(0.1, min(1.0, remaining / 3)), limit=RG_OUTPUT_LIMIT
+    )
+    if (code not in {0, 1} or "\ufffd" in output
+            or len(output.encode("utf-8", "replace")) >= RG_OUTPUT_LIMIT):
+        return None
+    candidates: set[str] = set()
+    for item in output.split("\0"):
+        if not item:
+            continue
+        candidate = item if os.path.isabs(item) else os.path.join(root, item)
+        candidates.add(normalized_path(candidate))
+    return candidates
+
+
 def search_command(args: argparse.Namespace) -> dict[str, Any]:
     root = path_from_args(args, required=False)
     query = args.query.strip()
@@ -1379,6 +1660,11 @@ def search_command(args: argparse.Namespace) -> dict[str, Any]:
         0, int(getattr(args, "content_byte_limit", DEFAULT_CONTENT_BYTE_LIMIT))
     )
     deadline = time.monotonic() + max(0.25, float(args.timeout))
+    rg_candidates = rg_content_candidates(
+        root, query, args.mode, args.case_sensitive, args.show_hidden,
+        content_file_limit, deadline,
+    ) if content_byte_limit > 0 else None
+    content_search_backend = "rg" if rg_candidates is not None else "python"
     root_depth = root.rstrip(os.sep).count(os.sep)
     watch = WatchPaths()
     watch.add_git(git)
@@ -1420,7 +1706,9 @@ def search_command(args: argparse.Namespace) -> dict[str, Any]:
                     }
                     score += 1800
 
-            if match is None and not is_directory and content_bytes_scanned < content_byte_limit:
+            if (match is None and not is_directory
+                    and content_bytes_scanned < content_byte_limit
+                    and (rg_candidates is None or normalized_path(path) in rg_candidates)):
                 remaining = content_byte_limit - content_bytes_scanned
                 per_file_limit = min(content_file_limit, remaining)
                 match, bytes_read = content_match(
@@ -1463,6 +1751,8 @@ def search_command(args: argparse.Namespace) -> dict[str, Any]:
         "truncated": truncated,
         "scanned": scanned,
         "contentBytesScanned": content_bytes_scanned,
+        "contentSearchBackend": content_search_backend,
+        "engine": content_search_backend,
         "limit": args.limit,
         "watch": watch.payload(),
     }
@@ -1657,6 +1947,145 @@ def properties_command(args: argparse.Namespace) -> dict[str, Any]:
     return {"ok": True, "properties": properties}
 
 
+def image_dimensions(raw: bytes) -> tuple[int, int]:
+    """Read common image dimensions from a bounded header without decoders."""
+    if raw.startswith(b"\x89PNG\r\n\x1a\n") and len(raw) >= 24:
+        return int.from_bytes(raw[16:20], "big"), int.from_bytes(raw[20:24], "big")
+    if raw[:6] in {b"GIF87a", b"GIF89a"} and len(raw) >= 10:
+        return int.from_bytes(raw[6:8], "little"), int.from_bytes(raw[8:10], "little")
+    if raw.startswith(b"RIFF") and raw[8:12] == b"WEBP" and len(raw) >= 30:
+        kind = raw[12:16]
+        if kind == b"VP8X":
+            return (
+                1 + int.from_bytes(raw[24:27], "little"),
+                1 + int.from_bytes(raw[27:30], "little"),
+            )
+    if raw.startswith(b"\xff\xd8"):
+        position = 2
+        sof = {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+               0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
+        while position + 9 <= len(raw):
+            if raw[position] != 0xFF:
+                position += 1
+                continue
+            marker = raw[position + 1]
+            position += 2
+            if marker in {0xD8, 0xD9} or 0xD0 <= marker <= 0xD7:
+                continue
+            if position + 2 > len(raw):
+                break
+            length = int.from_bytes(raw[position:position + 2], "big")
+            if length < 2 or position + length > len(raw):
+                break
+            if marker in sof and length >= 7:
+                return (
+                    int.from_bytes(raw[position + 5:position + 7], "big"),
+                    int.from_bytes(raw[position + 3:position + 5], "big"),
+                )
+            position += length
+    return 0, 0
+
+
+def inline_preview_command(args: argparse.Namespace) -> dict[str, Any]:
+    path = path_from_args(args)
+    info = safe_stat(path)
+    mode = info.st_mode
+    mime = mime_for(path, mode)
+    preview: dict[str, Any] = {
+        "kind": "metadata",
+        "path": display_text(path),
+        "token": encode_path(path),
+        "name": display_text(os.path.basename(path) or path),
+        "mime": mime,
+        "size": info.st_size,
+        "sizeText": human_size(info.st_size),
+        "modified": iso_time(info.st_mtime),
+        "permissions": stat.filemode(mode),
+        "uri": uri_for(path),
+    }
+    if stat.S_ISDIR(mode):
+        children: list[dict[str, Any]] = []
+        truncated = False
+        visited = 0
+        try:
+            with os.scandir(path) as iterator:
+                for child in iterator:
+                    visited += 1
+                    if len(children) >= PREVIEW_DIRECTORY_LIMIT:
+                        truncated = True
+                        break
+                    if visited > PREVIEW_DIRECTORY_LIMIT * 2:
+                        truncated = True
+                        break
+                    try:
+                        child_info = child.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    children.append({
+                        "name": display_text(child.name),
+                        "path": display_text(child.path),
+                        "token": encode_path(child.path),
+                        "kind": file_kind(child_info.st_mode),
+                        "isDir": child.is_dir(follow_symlinks=True),
+                        "size": child_info.st_size,
+                    })
+        except OSError as exc:
+            raise QuickfileError(str(exc), "preview-read-failed") from exc
+        children.sort(key=lambda row: (not row["isDir"], row["name"].casefold()))
+        preview.update(kind="directory", entries=children, truncated=truncated)
+        return {"ok": True, "preview": preview}
+    if not stat.S_ISREG(mode):
+        if stat.S_ISLNK(mode):
+            try:
+                preview["symlinkTarget"] = display_text(os.readlink(path))
+            except OSError:
+                preview["symlinkTarget"] = ""
+        return {"ok": True, "preview": preview}
+
+    read_limit = min(PREVIEW_READ_LIMIT, max(1024, int(getattr(args, "byte_limit", PREVIEW_READ_LIMIT))))
+    try:
+        with open(path, "rb") as stream:
+            raw = stream.read(read_limit + 1)
+    except OSError as exc:
+        raise QuickfileError(str(exc), "preview-read-failed") from exc
+    bounded = raw[:read_limit]
+    if mime.startswith("image/"):
+        width, height = image_dimensions(bounded)
+        preview.update(
+            kind="image", width=width, height=height,
+            bytesRead=len(bounded), truncated=len(raw) > read_limit,
+        )
+        return {"ok": True, "preview": preview}
+
+    textual_mime = (
+        mime.startswith("text/")
+        or mime in {"application/json", "application/xml", "application/javascript",
+                    "application/x-sh", "application/toml", "application/yaml"}
+    )
+    decoded = ""
+    likely_text = textual_mime or not bounded
+    if b"\x00" not in bounded[:8192] and not likely_text:
+        try:
+            strict = bounded.decode("utf-8")
+            sample = strict[:4096]
+            printable = sum(char.isprintable() or char in "\r\n\t" for char in sample)
+            likely_text = not sample or printable / len(sample) >= 0.85
+            decoded = strict
+        except UnicodeDecodeError:
+            pass
+    if b"\x00" not in bounded[:8192] and likely_text:
+        if not decoded:
+            decoded = bounded.decode("utf-8", "replace")
+        rendered = display_text(decoded[:PREVIEW_TEXT_LIMIT])
+        preview.update(
+            kind="text", text=rendered, bytesRead=len(bounded),
+            truncated=len(raw) > read_limit or len(decoded) > PREVIEW_TEXT_LIMIT,
+        )
+    else:
+        preview.update(bytesRead=len(bounded), truncated=len(raw) > read_limit)
+    return {"ok": True, "preview": preview}
+
+
 def metadata_command(args: argparse.Namespace) -> dict[str, Any]:
     path = path_from_args(args)
     safe_stat(path)
@@ -1818,22 +2247,58 @@ def destination_from_args(args: argparse.Namespace) -> str:
     raise QuickfileError("A destination path is required", "missing-destination")
 
 
+def local_file_uri_path(uri: str) -> str:
+    if not isinstance(uri, str) or len(uri) > 16384 or "\x00" in uri:
+        raise QuickfileError("Invalid dropped file URI", "invalid-source-uri")
+    try:
+        parsed = urllib.parse.urlsplit(uri)
+        raw_path = urllib.parse.unquote_to_bytes(parsed.path)
+    except (UnicodeError, ValueError) as exc:
+        raise QuickfileError("Invalid dropped file URI", "invalid-source-uri") from exc
+    if (parsed.scheme.lower() != "file" or parsed.netloc not in {"", "localhost"}
+            or parsed.query or parsed.fragment or not raw_path.startswith(b"/")
+            or b"\x00" in raw_path):
+        raise QuickfileError("Only local file:// URIs can be dropped", "invalid-source-uri")
+    return normalized_path(os.fsdecode(raw_path))
+
+
 def action_paths_from_args(args: argparse.Namespace) -> list[str]:
     raw = getattr(args, "path_tokens_json", None)
-    if raw is None:
+    uri_raw = getattr(args, "source_uris_json", None)
+    if uri_raw is not None and (
+            raw is not None or getattr(args, "path_token", None) or getattr(args, "path", None)):
+        raise QuickfileError("Use one dropped-item representation", "invalid-path-list")
+    if uri_raw is not None:
+        try:
+            uris = json.loads(uri_raw)
+        except json.JSONDecodeError as exc:
+            raise QuickfileError("Invalid dropped-file list", "invalid-source-uri-list") from exc
+        if not isinstance(uris, list) or not uris or len(uris) > 500:
+            raise QuickfileError(
+                "Drop between 1 and 500 local files", "invalid-source-uri-list"
+            )
+        raw_paths = []
+        for uri in uris:
+            if not isinstance(uri, str):
+                raise QuickfileError("Invalid dropped-file list", "invalid-source-uri-list")
+            raw_paths.append(local_file_uri_path(uri))
+    elif raw is None:
         return [path_from_args(args)]
-    try:
-        tokens = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise QuickfileError("Invalid selected-path list", "invalid-path-list") from exc
-    if not isinstance(tokens, list) or not tokens or len(tokens) > 500:
-        raise QuickfileError("Select between 1 and 500 items", "invalid-path-list")
+    else:
+        try:
+            tokens = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise QuickfileError("Invalid selected-path list", "invalid-path-list") from exc
+        if not isinstance(tokens, list) or not tokens or len(tokens) > 500:
+            raise QuickfileError("Select between 1 and 500 items", "invalid-path-list")
+        raw_paths = []
+        for token in tokens:
+            if not isinstance(token, str):
+                raise QuickfileError("Invalid selected-path list", "invalid-path-list")
+            raw_paths.append(normalized_path(decode_path(token)))
     paths: list[str] = []
     seen: set[str] = set()
-    for token in tokens:
-        if not isinstance(token, str):
-            raise QuickfileError("Invalid selected-path list", "invalid-path-list")
-        path = normalized_path(decode_path(token))
+    for path in raw_paths:
         if path not in seen:
             seen.add(path)
             paths.append(path)
@@ -2265,6 +2730,192 @@ def unique_transfer_target(source: str, destination_dir: str) -> str:
     raise QuickfileError("Could not choose a free destination name", "name-space-exhausted")
 
 
+def conflict_row(source: str, target: str) -> dict[str, Any]:
+    source_info = os.lstat(source)
+    target_info = os.lstat(target)
+    return {
+        "sourcePath": display_text(source), "sourceToken": encode_path(source),
+        "targetPath": display_text(target), "targetToken": encode_path(target),
+        "name": display_text(os.path.basename(target)),
+        "sourceKind": file_kind(source_info.st_mode),
+        "targetKind": file_kind(target_info.st_mode),
+        "canMerge": stat.S_ISDIR(source_info.st_mode) and stat.S_ISDIR(target_info.st_mode),
+    }
+
+
+def shallow_path_identity(path: str) -> dict[str, Any]:
+    details = os.lstat(path)
+    return {
+        "device": details.st_dev, "inode": details.st_ino,
+        "mode": stat.S_IFMT(details.st_mode), "size": details.st_size,
+        "mtimeNs": details.st_mtime_ns,
+    }
+
+
+def trash_existing_for_replace(path: str, expected: dict[str, Any]) -> dict[str, Any]:
+    try:
+        matches_expected = shallow_path_identity(path) == expected
+    except FileNotFoundError:
+        matches_expected = False
+    if not matches_expected:
+        raise QuickfileError(
+            "The destination changed while resolving the conflict", "conflict-target-changed"
+        )
+    before = {str(row["uri"]) for row in trash_rows()}
+    code, _, error = run_bounded(["gio", "trash", "--", path], timeout=30)
+    if code != 0:
+        raise QuickfileError(error.strip() or "Could not preserve the replaced item in Trash",
+                             "replace-backup-failed")
+    for row in trash_rows():
+        if (str(row["uri"]) not in before
+                and normalized_path(str(row["originalPath"])) == normalized_path(path)):
+            return row
+    raise QuickfileError(
+        "The previous item was moved to Trash but could not be tracked for Undo",
+        "replace-backup-untracked",
+    )
+
+
+def restore_replaced_item(row: dict[str, Any]) -> None:
+    uri = str(row.get("uri", ""))
+    require_trash_uri(uri)
+    code, _, error = run_bounded(["gio", "trash", "--restore", uri], timeout=30)
+    if code != 0:
+        raise QuickfileError(error.strip() or "Could not restore the replaced item",
+                             "replace-restore-failed")
+
+
+def copy_merge_entry(entry: dict[str, Any], target: str, reporter: OperationReporter,
+                     totals: dict[str, int]) -> bool:
+    kind = str(entry["kind"])
+    if kind == "directory":
+        try:
+            os.mkdir(target, os.stat(entry["path"], follow_symlinks=False).st_mode & 0o777)
+        except FileExistsError:
+            return False
+    elif kind == "link":
+        try:
+            os.symlink(os.readlink(entry["path"]), target)
+        except FileExistsError:
+            return False
+    else:
+        try:
+            copy_regular_file(str(entry["path"]), target, reporter, totals)
+        except FileExistsError:
+            return False
+    totals["itemsDone"] += 1
+    reporter.emit("merging", force=True, **totals)
+    return True
+
+
+def execute_merge_plan(plan: dict[str, Any], action: str, totals: dict[str, int],
+                       reporter: OperationReporter) -> dict[str, Any]:
+    source = str(plan["source"])
+    target_root = str(plan["target"])
+    try:
+        if (shallow_path_identity(target_root) != plan.get("conflictIdentity", {})
+                or os.path.islink(target_root) or not os.path.isdir(target_root)):
+            raise QuickfileError(
+                "The destination changed while resolving the conflict",
+                "conflict-target-changed",
+            )
+    except FileNotFoundError as exc:
+        raise QuickfileError(
+            "The destination changed while resolving the conflict",
+            "conflict-target-changed",
+        ) from exc
+    resolved_target_root = os.path.realpath(target_root)
+    entries = list(plan["entries"])
+    created: list[dict[str, Any]] = []
+    moved: list[dict[str, Any]] = []
+    created_directories: list[dict[str, str]] = []
+    source_directories = [
+        {
+            "source": str(entry["path"]),
+            "target": target_root if not entry["relative"] else os.path.join(target_root, str(entry["relative"])),
+        }
+        for entry in entries if str(entry["kind"]) == "directory"
+    ]
+    skipped_directory_prefixes: list[str] = []
+    try:
+        totals["itemsDone"] += 1  # Existing merge root.
+        for entry in entries[1:]:
+            check_operation_cancelled()
+            relative = str(entry["relative"])
+            if any(relative == prefix or relative.startswith(prefix + os.sep)
+                   for prefix in skipped_directory_prefixes):
+                totals["itemsDone"] += 1
+                totals["bytesTotal"] -= int(entry.get("size", 0))
+                reporter.emit("merging", force=True, **totals)
+                continue
+            target = os.path.join(target_root, str(entry["relative"]))
+            kind = str(entry["kind"])
+            if os.path.lexists(target):
+                # Merge is deliberately non-destructive: existing children win.
+                if (kind == "directory"
+                        and (not os.path.isdir(target) or os.path.islink(target))):
+                    skipped_directory_prefixes.append(relative)
+                totals["itemsDone"] += 1
+                totals["bytesTotal"] -= int(entry.get("size", 0))
+                reporter.emit("merging", force=True, **totals)
+                continue
+            if not path_within(os.path.realpath(os.path.dirname(target)), resolved_target_root):
+                raise QuickfileError(
+                    "A destination folder changed to an unsafe symlink during merge",
+                    "unsafe-merge-target",
+                )
+            if not copy_merge_entry(entry, target, reporter, totals):
+                totals["itemsDone"] += 1
+                totals["bytesTotal"] -= int(entry.get("size", 0))
+                reporter.emit("merging", force=True, **totals)
+                continue
+            created_item = {"path": target, "identity": {}}
+            created.append(created_item)
+            if kind == "directory":
+                created_directories.append({"source": str(entry["path"]), "target": target})
+            elif action == "move":
+                remove_created_path(str(entry["path"]))
+                moved.append({"source": str(entry["path"]), "target": target})
+                rebase_saved_metadata(str(entry["path"]), target)
+
+        if action == "move":
+            for entry in reversed(entries):
+                if str(entry["kind"]) != "directory":
+                    continue
+                try:
+                    os.rmdir(str(entry["path"]))
+                except OSError as exc:
+                    if exc.errno not in {errno.ENOTEMPTY, errno.EEXIST}:
+                        raise
+    except BaseException:
+        # Roll back only paths created by this merge. Existing destination
+        # children are never touched.
+        if action == "move":
+            for directory in source_directories:
+                os.makedirs(directory["source"], exist_ok=True)
+            for item in reversed(moved):
+                if os.path.lexists(item["target"]) and not os.path.lexists(item["source"]):
+                    move_path_noreplace(item["target"], item["source"], reporter)
+        for item in reversed(created):
+            path = str(item["path"])
+            if os.path.lexists(path):
+                try:
+                    remove_created_path(path)
+                except OSError:
+                    pass
+        raise
+    # Fingerprints are captured only after the complete merge so Undo can
+    # validate all created paths before removing any of them.
+    for item in created:
+        if os.path.lexists(str(item["path"])):
+            item["identity"] = shallow_path_identity(str(item["path"]))
+    return {
+        "source": source, "target": target_root, "identity": {}, "merged": True,
+        "createdItems": created, "movedItems": moved,
+        "createdDirectories": created_directories, "sourceDirectories": source_directories,
+    }
+
+
 def operation_result(action: str, message: str, **values: Any) -> dict[str, Any]:
     return {"event": "result", "ok": True, "action": action, "message": message, **values}
 
@@ -2299,6 +2950,11 @@ def move_path_noreplace(source: str, target: str, reporter: OperationReporter) -
 def record_transfer_undo(action: str, completed: list[dict[str, Any]]) -> None:
     if not completed:
         return
+    if any(item.get("merged") or item.get("replaced") for item in completed):
+        record_operation(action, action, {
+            "type": "transfer-batch", "action": action, "items": completed,
+        })
+        return
     if action == "move":
         inverse = {"type": "move-back", "items": [
             {"source": item["target"], "target": item["source"]} for item in completed
@@ -2316,14 +2972,28 @@ def execute_transfer_plan(plan: dict[str, Any], action: str, totals: dict[str, i
     if plan.get("unchanged"):
         return None
     source = str(plan["source"])
-    target = unique_transfer_target(source, str(plan["destination"]))
+    policy = str(plan.get("conflictPolicy", "keep-both"))
+    base_target = str(plan.get("target") or os.path.join(
+        str(plan["destination"]), os.path.basename(source)
+    ))
+    if policy == "skip" and os.path.lexists(base_target):
+        return {"source": source, "target": base_target, "skipped": True, "identity": {}}
+    if policy == "merge" and plan.get("merge"):
+        return execute_merge_plan(plan, action, totals, reporter)
+    target = unique_transfer_target(source, str(plan["destination"])) \
+        if policy == "keep-both" else base_target
+    replaced: dict[str, Any] | None = None
+    if policy == "replace" and os.path.lexists(target):
+        replaced = trash_existing_for_replace(target, dict(plan["conflictIdentity"]))
+        plan["_replaced"] = replaced
     if plan.get("atomicMove"):
-        for _attempt in range(100):
+        attempts = 100 if policy == "keep-both" else 1
+        for _attempt in range(attempts):
             try:
                 rename_noreplace(source, target)
                 break
             except QuickfileError as exc:
-                if exc.code != "name-conflict":
+                if exc.code != "name-conflict" or policy != "keep-both":
                     raise
                 target = unique_transfer_target(source, str(plan["destination"]))
         else:
@@ -2331,11 +3001,17 @@ def execute_transfer_plan(plan: dict[str, Any], action: str, totals: dict[str, i
         totals["itemsDone"] += 1
         reporter.emit("moving", force=True, **totals)
     else:
-        for _attempt in range(100):
+        attempts = 100 if policy == "keep-both" else 1
+        for _attempt in range(attempts):
             try:
                 copy_scanned_source(source, target, plan["entries"], plan["bytes"], reporter, totals)
                 break
             except FileExistsError:
+                if policy != "keep-both":
+                    raise QuickfileError(
+                        "The destination changed while resolving the conflict",
+                        "conflict-target-changed",
+                    )
                 target = unique_transfer_target(source, str(plan["destination"]))
         else:
             raise QuickfileError("Destination names keep changing", "name-conflict")
@@ -2352,6 +3028,8 @@ def execute_transfer_plan(plan: dict[str, Any], action: str, totals: dict[str, i
             remove_created_path(target)
             raise
     completed = {"source": source, "target": target, "identity": identity}
+    if replaced is not None:
+        completed["replaced"] = replaced
     return completed
 
 
@@ -2367,7 +3045,59 @@ def run_undo(reporter: OperationReporter) -> dict[str, Any]:
         raise QuickfileError("The undo record is invalid", "history-invalid")
     reporter.emit("undoing", force=True, itemsDone=0, itemsTotal=len(items),
                   bytesDone=0, bytesTotal=0)
-    if inverse_type == "delete-created":
+    if inverse_type == "transfer-batch":
+        transfer_action = str(inverse.get("action", ""))
+        for item in items:
+            if not isinstance(item, dict):
+                raise QuickfileError("The undo record is invalid", "history-invalid")
+            if item.get("merged"):
+                for created in item.get("createdItems", []):
+                    path = str(created.get("path", ""))
+                    if (not os.path.lexists(path)
+                            or shallow_path_identity(path) != created.get("identity", {})):
+                        raise QuickfileError(
+                            "Undo stopped because a merged item was changed or replaced",
+                            "undo-target-changed",
+                        )
+            elif transfer_action != "move" and not identity_matches(
+                    str(item.get("target", "")), item.get("identity", {})):
+                raise QuickfileError(
+                    "Undo stopped because a created item was changed or replaced",
+                    "undo-target-changed",
+                )
+        for index, item in enumerate(reversed(items), 1):
+            check_operation_cancelled()
+            if item.get("merged"):
+                created = list(item.get("createdItems", []))
+                if transfer_action == "move":
+                    directories = list(item.get("sourceDirectories", []))
+                    for directory in directories:
+                        os.makedirs(str(directory["source"]), exist_ok=True)
+                    for moved in reversed(list(item.get("movedItems", []))):
+                        move_path_noreplace(
+                            str(moved["target"]), str(moved["source"]), reporter
+                        )
+                for created_item in reversed(created):
+                    path = str(created_item["path"])
+                    if not os.path.lexists(path):
+                        continue
+                    if os.path.isdir(path) and not os.path.islink(path):
+                        try:
+                            os.rmdir(path)
+                        except OSError as exc:
+                            if exc.errno not in {errno.ENOTEMPTY, errno.EEXIST}:
+                                raise
+                    else:
+                        os.unlink(path)
+            elif transfer_action == "move":
+                move_path_noreplace(str(item["target"]), str(item["source"]), reporter)
+            else:
+                remove_created_path(str(item["target"]))
+            if isinstance(item.get("replaced"), dict):
+                restore_replaced_item(item["replaced"])
+            reporter.emit("undoing", force=True, itemsDone=index, itemsTotal=len(items),
+                          bytesDone=0, bytesTotal=0)
+    elif inverse_type == "delete-created":
         for item in items:
             if not isinstance(item, dict) or not identity_matches(str(item.get("path", "")), item.get("identity", {})):
                 raise QuickfileError(
@@ -2515,15 +3245,61 @@ def operation_command(args: argparse.Namespace, callback: Any = json_print) -> d
     destination = destination_from_args(args) if action != "duplicate" else ""
     if destination and not os.path.isdir(destination):
         raise QuickfileError("Destination is not a directory", "not-a-directory")
+    policy = str(getattr(args, "conflict_policy", "keep-both") or "keep-both")
+    if policy not in CONFLICT_POLICIES:
+        raise QuickfileError("Invalid conflict policy", "invalid-conflict-policy")
+    if action == "duplicate" and policy == "ask":
+        policy = "keep-both"
+    for source in paths:
+        if not os.path.lexists(source):
+            raise QuickfileError(
+                f'“{display_text(os.path.basename(source))}” no longer exists', "missing-path"
+            )
+    for source in paths:
+        if not os.path.isdir(source) or os.path.islink(source):
+            continue
+        prefix = source.rstrip(os.sep) + os.sep
+        if any(other != source and other.startswith(prefix) for other in paths):
+            raise QuickfileError(
+                "A selection cannot contain both a folder and its child", "nested-selection"
+            )
+
+    conflicts: list[dict[str, Any]] = []
+    for source in paths:
+        destination_dir = os.path.dirname(source) if action == "duplicate" else destination
+        if action == "move" and os.path.dirname(source) == destination_dir:
+            continue
+        target = os.path.join(destination_dir, os.path.basename(source))
+        if os.path.lexists(target):
+            conflicts.append(conflict_row(source, target))
+    if policy == "ask" and conflicts:
+        raise OperationConflict(conflicts)
+    if policy == "merge":
+        invalid = [row for row in conflicts if not row["canMerge"]]
+        if invalid:
+            raise OperationConflict(invalid)
+    if policy == "replace":
+        for row in conflicts:
+            if normalized_path(str(row["sourcePath"])) == normalized_path(str(row["targetPath"])):
+                raise QuickfileError(
+                    "An item cannot replace itself; use Keep Both or Skip",
+                    "self-replace",
+                )
 
     plans: list[dict[str, Any]] = []
     total_items = 0
     total_bytes = 0
+    journal_estimate = 0
+    late_conflicts: list[dict[str, Any]] = []
     for source in paths:
         destination_dir = os.path.dirname(source) if action == "duplicate" else destination
         if action == "move" and os.path.dirname(source) == destination_dir:
             plans.append({"source": source, "destination": destination_dir, "unchanged": True})
             continue
+        target = os.path.join(destination_dir, os.path.basename(source))
+        has_conflict = os.path.lexists(target)
+        if policy == "ask" and has_conflict:
+            late_conflicts.append(conflict_row(source, target))
         if os.path.isdir(source) and not os.path.islink(source):
             try:
                 common = os.path.commonpath((os.path.realpath(source), os.path.realpath(destination_dir)))
@@ -2531,8 +3307,18 @@ def operation_command(args: argparse.Namespace, callback: Any = json_print) -> d
                 common = ""
             if common == os.path.realpath(source):
                 raise QuickfileError("A folder cannot be copied or moved into itself", "recursive-transfer")
-        same_device_move = action == "move" and os.stat(source, follow_symlinks=False).st_dev == os.stat(destination_dir).st_dev
-        if same_device_move:
+        merge = policy == "merge" and has_conflict
+        journal_estimate += 4 * (
+            len(os.fsencode(source)) + len(os.fsencode(target))
+        ) + 1024
+        same_device_move = (
+            action == "move" and not merge
+            and os.stat(source, follow_symlinks=False).st_dev == os.stat(destination_dir).st_dev
+        )
+        if policy == "skip" and has_conflict:
+            entries, bytes_count = [], 0
+            same_device_move = False
+        elif same_device_move:
             entries, bytes_count = [], 0
         else:
             entries, bytes_count = scan_copy_source(source, reporter)
@@ -2543,25 +3329,51 @@ def operation_command(args: argparse.Namespace, callback: Any = json_print) -> d
                     f"Selection contains more than {OPERATION_ENTRY_LIMIT:,} items",
                     "copy-entry-limit",
                 )
+            if merge:
+                journal_estimate += sum(
+                    4 * len(os.fsencode(str(entry["relative"]))) + 512
+                    for entry in entries
+                )
+        if journal_estimate > OPERATION_JOURNAL_BUDGET:
+            raise QuickfileError(
+                "This operation is too large to keep a safe Undo journal; transfer fewer items",
+                "operation-journal-limit",
+            )
         plans.append({"source": source, "destination": destination_dir,
+                      "target": target, "conflictPolicy": policy, "merge": merge,
+                      "conflictIdentity": shallow_path_identity(target) if has_conflict else {},
                       "entries": entries, "bytes": bytes_count,
                       "atomicMove": same_device_move, "unchanged": False})
+
+    if late_conflicts:
+        raise OperationConflict(late_conflicts)
 
     totals = {"itemsDone": 0, "itemsTotal": total_items + sum(
         1 for plan in plans if plan.get("atomicMove") is True),
         "bytesDone": 0, "bytesTotal": total_bytes}
     completed: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
     for plan in plans:
         try:
             result = execute_transfer_plan(plan, action, totals, reporter)
         except BaseException:
+            replaced = plan.get("_replaced")
+            target = str(plan.get("target", ""))
+            if isinstance(replaced, dict) and target and not os.path.lexists(target):
+                restore_replaced_item(replaced)
             # A later item can fail after earlier batch items completed. Keep
             # those completed changes undoable instead of orphaning them.
             record_transfer_undo(action, completed)
             raise
         if result is not None:
+            if result.get("skipped"):
+                skipped.append(result)
+                continue
+            if result.get("merged") and not result.get("createdItems"):
+                skipped.append(result)
+                continue
             completed.append(result)
-            if action == "move":
+            if action == "move" and not result.get("merged"):
                 try:
                     rebase_saved_metadata(str(result["source"]), str(result["target"]))
                 except BaseException:
@@ -2569,15 +3381,20 @@ def operation_command(args: argparse.Namespace, callback: Any = json_print) -> d
                     raise
 
     record_transfer_undo(action, completed)
-    results = [{"path": display_text(item["target"]), "token": encode_path(item["target"])}
+    results = [{"path": display_text(item["target"]), "token": encode_path(item["target"]),
+                "status": "merged" if item.get("merged") else "completed"}
                for item in completed]
+    results.extend({"path": display_text(item["target"]), "token": encode_path(item["target"]),
+                    "status": "skipped"} for item in skipped)
     changed_count = len(completed)
-    message = "Already in this folder" if not changed_count else (
+    message = (f"Skipped {len(skipped)} existing item" + ("s" if len(skipped) != 1 else "")) \
+        if not changed_count and skipped else "Already in this folder" if not changed_count else (
         "Moved" if action == "move" else "Duplicated" if action == "duplicate" else "Copied"
     )
     if changed_count > 1:
         message += f" {changed_count} items"
     return operation_result(action, message, changed=changed_count > 0, results=results,
+                            skippedCount=len(skipped), conflictPolicyApplied=policy,
                             path=results[0]["path"] if results else "",
                             token=results[0]["token"] if results else "")
 
@@ -2817,6 +3634,16 @@ def parser() -> argparse.ArgumentParser:
     search.add_argument("--content-file-limit", type=int, default=DEFAULT_CONTENT_FILE_LIMIT)
     search.add_argument("--content-byte-limit", type=int, default=DEFAULT_CONTENT_BYTE_LIMIT)
 
+    quick_nav = subcommands.add_parser("quick-nav", help="Return bounded navigation locations")
+    add_path_arguments(quick_nav)
+    quick_nav.add_argument("--record", action="store_true")
+    quick_nav.add_argument("--no-zoxide", action="store_true")
+    quick_nav.add_argument("--limit", type=int, default=QUICK_NAV_LIMIT)
+
+    inline_preview = subcommands.add_parser("preview", help="Return a bounded inline preview")
+    add_path_arguments(inline_preview)
+    inline_preview.add_argument("--byte-limit", type=int, default=PREVIEW_READ_LIMIT)
+
     properties = subcommands.add_parser("properties", help="Return filesystem metadata")
     add_path_arguments(properties)
 
@@ -2865,6 +3692,7 @@ def parser() -> argparse.ArgumentParser:
     ))
     add_path_arguments(action)
     action.add_argument("--path-tokens-json")
+    action.add_argument("--source-uris-json")
     action.add_argument("--name")
     destination = action.add_mutually_exclusive_group()
     destination.add_argument("--destination")
@@ -2878,12 +3706,14 @@ def parser() -> argparse.ArgumentParser:
     ))
     add_path_arguments(operation)
     operation.add_argument("--path-tokens-json")
+    operation.add_argument("--source-uris-json")
     operation.add_argument("--name")
     operation_destination = operation.add_mutually_exclusive_group()
     operation_destination.add_argument("--destination")
     operation_destination.add_argument("--destination-token")
     operation.add_argument("--trash-uri")
     operation.add_argument("--trash-uris-json")
+    operation.add_argument("--conflict-policy", choices=CONFLICT_POLICIES, default="ask")
 
     subcommands.add_parser("trash-list", help="List bounded Trash entries")
     subcommands.add_parser("history", help="Return the latest undoable operation")
@@ -2900,6 +3730,10 @@ def main(argv: Iterable[str] | None = None) -> int:
             result = tree_command(args)
         elif args.command == "search":
             result = search_command(args)
+        elif args.command == "quick-nav":
+            result = quick_nav_command(args)
+        elif args.command == "preview":
+            result = inline_preview_command(args)
         elif args.command == "properties":
             result = properties_command(args)
         elif args.command == "volumes":
@@ -2924,6 +3758,9 @@ def main(argv: Iterable[str] | None = None) -> int:
         return 0
     except QuickfileError as exc:
         payload = {"ok": False, "error": str(exc), "code": exc.code}
+        if isinstance(exc, OperationConflict):
+            payload["conflicts"] = exc.conflicts
+            payload["conflictPolicyOptions"] = list(CONFLICT_POLICIES[1:])
         if args.command == "operation":
             payload["event"] = "result"
         json_print(payload)

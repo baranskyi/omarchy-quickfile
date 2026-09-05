@@ -26,6 +26,9 @@ concept. It does not depend on or copy unreleased FileBlade source code.
   transparent bounded Python fallback.
 - Quick Nav (`Ctrl+P`) combines XDG folders, recent locations, Git roots and
   worktrees, plus zoxide history when zoxide is installed.
+- Back, Forward and Parent navigation remember each directory's exact top row,
+  pixel offset and selected entry. Returning to a long directory therefore
+  resumes where it was left instead of jumping to the beginning.
 - Hidden-file toggle and native filesystem monitoring while the blade is
   visible. External changes update rows quietly without resetting the list;
   `Ctrl+R` remains available for an explicit refresh.

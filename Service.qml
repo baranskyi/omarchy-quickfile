@@ -199,6 +199,7 @@ Item {
 
   signal listingAboutToChange()
   signal modelChanged()
+  signal navigationAboutToChange(string path, string token)
   signal metadataSaved(string token, var values)
   signal actionFinished(string kind, bool ok, string message)
   signal knowledgeLinksFinished(bool ok, bool applied, string message)
@@ -949,6 +950,7 @@ Item {
     var nextPath = String(path || "")
     var nextToken = String(token || "")
     if (!nextPath && !nextToken) return false
+    navigationAboutToChange(rootPath, rootToken)
     if (recordHistory !== false && rootPath !== "") {
       var back = backStack.slice()
       back.push(location())

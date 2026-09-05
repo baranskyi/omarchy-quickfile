@@ -934,6 +934,11 @@ Item {
     id: stableView
     property var viewportAnchor: null
     property int interactionRevision: 0
+    property bool rememberLocations: false
+    property bool navigationResetPending: false
+    property bool locationRestorePending: false
+    property var locationStates: ({})
+    property var locationStateOrder: []
     readonly property bool scrollbarPressed: ScrollBar.vertical
       ? ScrollBar.vertical.pressed : false
     highlightFollowsCurrentItem: false
@@ -942,6 +947,96 @@ Item {
       if (!model || index < 0 || index >= count) return ""
       var row = model.get(index).rowData
       return row ? String(row.token || row.device || row.sessionKey || "") : ""
+    }
+
+    function locationKey(path, token) {
+      var valueToken = String(token || "")
+      return valueToken !== "" ? "token:" + valueToken : "path:" + String(path || "")
+    }
+
+    function rowIndexForKey(key) {
+      var value = String(key || "")
+      if (value === "") return -1
+      for (var i = 0; i < count; i++)
+        if (rowKey(i) === value) return i
+      return -1
+    }
+
+    function firstVisibleRowIndex() {
+      if (!visible || count === 0 || height <= 0) return -1
+      for (var offset = 1; offset < Math.min(height, 80); offset += 4) {
+        var index = indexAt(1, contentY + offset)
+        if (index >= 0) return index
+      }
+      return -1
+    }
+
+    function rememberLocation(path, token) {
+      if (!rememberLocations) return
+      navigationResetPending = true
+      locationRestorePending = true
+      viewportAnchor = null
+      var index = firstVisibleRowIndex()
+      if (index < 0) return
+      var row = itemAtIndex(index)
+      if (!row) return
+      var key = locationKey(path, token)
+      var keyboardToken = root.keyboardIndex >= 0 && root.keyboardIndex < count
+        ? rowKey(root.keyboardIndex) : ""
+      var nextStates = Object.assign({}, locationStates)
+      nextStates[key] = {
+        anchorToken: rowKey(index),
+        anchorOffset: row.y - contentY,
+        selectedToken: root.service ? String(root.service.selectedToken || "") : "",
+        keyboardToken: keyboardToken
+      }
+      var order = locationStateOrder.filter(function(savedKey) { return savedKey !== key })
+      order.push(key)
+      while (order.length > 100) {
+        var expired = order.shift()
+        delete nextStates[expired]
+      }
+      locationStates = nextStates
+      locationStateOrder = order
+    }
+
+    function restoreLocationPosition(saved) {
+      if (!saved || count === 0 || height <= 0) return false
+      var anchorIndex = rowIndexForKey(saved.anchorToken)
+      if (anchorIndex < 0) {
+        var fallbackIndex = rowIndexForKey(saved.keyboardToken || saved.selectedToken)
+        if (fallbackIndex >= 0) positionViewAtIndex(fallbackIndex, ListView.Center)
+        return fallbackIndex >= 0
+      }
+      forceLayout()
+      var row = itemAtIndex(anchorIndex)
+      if (!row) {
+        positionViewAtIndex(anchorIndex, ListView.Beginning)
+        forceLayout()
+        row = itemAtIndex(anchorIndex)
+      }
+      if (!row) return false
+      contentY = Math.max(originY, Math.min(row.y - Number(saved.anchorOffset || 0),
+        originY + Math.max(0, contentHeight - height)))
+      return true
+    }
+
+    function restoreLocation() {
+      if (!rememberLocations || !locationRestorePending || !root.service
+          || count === 0 || height <= 0) return
+      locationRestorePending = false
+      var saved = locationStates[locationKey(root.service.rootPath, root.service.rootToken)]
+      if (!saved) return
+      restoreLocationPosition(saved)
+      var selectedIndex = rowIndexForKey(saved.selectedToken)
+      if (selectedIndex < 0) selectedIndex = rowIndexForKey(saved.keyboardToken)
+      if (selectedIndex >= 0) {
+        root.keyboardIndex = selectedIndex
+        root.service.selectIndex(selectedIndex, "replace")
+      }
+      // Restoring selection can reopen the inspector and change the viewport
+      // height. Reapply the stored top-row offset after that layout settles.
+      Qt.callLater(function() { stableView.restoreLocationPosition(saved) })
     }
 
     function rememberViewport() {
@@ -996,8 +1091,19 @@ Item {
     }
     Connections {
       target: root.service
-      function onListingAboutToChange() { stableView.rememberViewport() }
-      function onModelChanged() { stableView.restoreViewport() }
+      function onNavigationAboutToChange(path, token) {
+        stableView.rememberLocation(path, token)
+      }
+      function onListingAboutToChange() {
+        if (stableView.navigationResetPending) {
+          stableView.navigationResetPending = false
+          stableView.viewportAnchor = null
+        } else stableView.rememberViewport()
+      }
+      function onModelChanged() {
+        stableView.restoreViewport()
+        stableView.restoreLocation()
+      }
     }
   }
 
@@ -3168,6 +3274,7 @@ Item {
           StableListView {
             id: fileList
             objectName: "quickfileFileList"
+            rememberLocations: true
             anchors.top: contextStrip.bottom
             anchors.left: parent.left
             anchors.right: parent.right

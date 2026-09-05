@@ -345,6 +345,59 @@ ShellRoot {
         && current.y + current.height <= fileView.contentY + fileView.height + 1,
       "keyboard navigation did not bring its new selection into view")
 
+    var parentRows = fixture.entries.slice()
+    fileView.positionViewAtIndex(52, ListView.Beginning)
+    fileView.forceLayout()
+    fileView.contentY += 9
+    panel.keyboardIndex = 67
+    select(parentRows[67])
+    var rememberedTopIndex = fileView.indexAt(1, fileView.contentY + 1)
+    var rememberedTopRow = fileView.itemAtIndex(rememberedTopIndex)
+    var rememberedTopToken = String(rememberedTopRow.modelData.token)
+    var rememberedTopOffset = rememberedTopRow.y - fileView.contentY
+    var rememberedSelection = fixture.selectedToken
+
+    fixture.navigationAboutToChange(fixture.rootPath, fixture.rootToken)
+    fixture.rootPath = "/quickfile-test/child"
+    fixture.rootToken = "child-root"
+    fixture.listingAboutToChange()
+    fixture.entries = []
+    fixture.entriesModel.clear()
+    fixture.selectedToken = ""
+    fixture.selectedTokens = []
+    fixture.selectedEntry = null
+    fixture.modelChanged()
+    var childRows = [entry("inside-child", "")]
+    fixture.listingAboutToChange()
+    fixture.entries = childRows
+    fixture.entriesModel.append({ rowData: childRows[0], scope: "" })
+    fixture.modelChanged()
+
+    fixture.navigationAboutToChange(fixture.rootPath, fixture.rootToken)
+    fixture.rootPath = "/quickfile-test"
+    fixture.rootToken = "test-root"
+    fixture.listingAboutToChange()
+    fixture.entries = []
+    fixture.entriesModel.clear()
+    fixture.selectedToken = ""
+    fixture.selectedTokens = []
+    fixture.selectedEntry = null
+    fixture.modelChanged()
+    fixture.listingAboutToChange()
+    fixture.entries = parentRows
+    for (var parentIndex = 0; parentIndex < parentRows.length; parentIndex++)
+      fixture.entriesModel.append({ rowData: parentRows[parentIndex], scope: "" })
+    fixture.modelChanged()
+    fileView.forceLayout()
+    var restoredTopIndex = fileView.rowIndexForKey(rememberedTopToken)
+    var restoredTopRow = fileView.itemAtIndex(restoredTopIndex)
+    check(restoredTopRow !== null
+        && Math.abs((restoredTopRow.y - fileView.contentY) - rememberedTopOffset) < 1,
+      "returning to a directory did not restore its exact scroll position")
+    check(fixture.selectedToken === rememberedSelection
+        && panel.keyboardIndex === fileView.rowIndexForKey(rememberedSelection),
+      "returning to a directory did not restore the folder used to enter it")
+
     panel.inspectorOpen = true
     var noteEditor = objectFinder.findChild(panel, "quickfileNoteEditor")
     check(noteEditor !== null, "could not find the rendered note editor")

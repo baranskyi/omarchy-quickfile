@@ -32,7 +32,8 @@ identity, navigation/search, metadata, and a small set of recoverable actions.
 - [x] Bounded text, image, directory and metadata previews in-blade on `Space`;
   system Sushi QuickView remains available on `Shift+Space`.
 - [x] Race-free folder navigation that clears stale rows, rejects stale backend
-  results and suppresses accidental double-entry clicks.
+  results, suppresses accidental double-entry clicks, and restores the saved
+  viewport and originating folder on Back, Forward and Parent navigation.
 - [x] Standards-based `text/uri-list` drag source for external applications.
 - [x] Internal-token and local-URI drop targets for copying or moving items to
   folders, the current location, favorites and mounted devices.

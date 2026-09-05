@@ -1,0 +1,2123 @@
+#!/usr/bin/env python3
+"""Small, dependency-free backend for the Omarchy Quickfile shell plugin.
+
+The QML process only receives bounded JSON. Paths are also represented by
+URL-safe base64 tokens so every Linux filename remains addressable even when
+it is not valid UTF-8.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import datetime as dt
+import grp
+import hashlib
+import json
+import mimetypes
+import os
+import pwd
+import re
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any, Iterable
+
+
+VERSION = "0.7.0"
+DEFAULT_LIMIT = 2000
+COMMAND_TIMEOUT = 3
+DEFAULT_CONTENT_FILE_LIMIT = 1024 * 1024
+DEFAULT_CONTENT_BYTE_LIMIT = 8 * 1024 * 1024
+CONTENT_LINE_LIMIT = 4096
+CONTENT_SNIPPET_LIMIT = 160
+METADATA_SIZE_LIMIT = 8 * 1024 * 1024
+NOTE_LENGTH_LIMIT = 16384
+FAVORITES_LIMIT = 200
+COLOR_KEYS = {"red", "yellow", "orange", "green", "cyan", "blue", "magenta", "brown"}
+KNOWLEDGE_LIMIT = 128
+WATCH_PATH_LIMIT = 4096
+KNOWLEDGE_AGENT_ORDER = (
+    "codex", "claude", "gemini", "cursor", "copilot", "windsurf",
+)
+KNOWLEDGE_AGENT_KEYS = set(KNOWLEDGE_AGENT_ORDER)
+
+
+class QuickfileError(Exception):
+    def __init__(self, message: str, code: str = "quickfile-error") -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def json_print(value: dict[str, Any]) -> None:
+    print(json.dumps(value, ensure_ascii=True, separators=(",", ":")))
+
+
+def display_text(value: str) -> str:
+    """Replace surrogateescaped bytes while preserving normal Unicode."""
+    return value.encode("utf-8", "replace").decode("utf-8")
+
+
+def encode_path(path: str | bytes) -> str:
+    raw = path if isinstance(path, bytes) else os.fsencode(path)
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def decode_path(token: str) -> str:
+    try:
+        padding = "=" * (-len(token) % 4)
+        raw = base64.urlsafe_b64decode((token + padding).encode("ascii"))
+        return os.fsdecode(raw)
+    except (ValueError, UnicodeEncodeError) as exc:
+        raise QuickfileError("Invalid path token", "invalid-path-token") from exc
+
+
+def normalized_path(path: str) -> str:
+    return os.path.abspath(os.path.expanduser(path))
+
+
+def uri_for(path: str) -> str:
+    if any(0xDC80 <= ord(char) <= 0xDCFF for char in path):
+        return ""
+    try:
+        return Path(path).as_uri()
+    except ValueError:
+        return ""
+
+
+def metadata_file() -> Path:
+    override = os.environ.get("QUICKFILE_METADATA_FILE", "").strip()
+    if override:
+        return Path(override).expanduser()
+    data_home = os.environ.get("XDG_DATA_HOME", "").strip()
+    base = Path(data_home).expanduser() if data_home else Path.home() / ".local" / "share"
+    return base / "omarchy" / "quickfile" / "metadata.json"
+
+
+def quickfile_home() -> str:
+    override = os.environ.get("QUICKFILE_HOME", "").strip()
+    return normalized_path(override) if override else normalized_path(str(Path.home()))
+
+
+class WatchPaths:
+    """Bounded dependencies of a response, including not-yet-existing files."""
+
+    def __init__(self) -> None:
+        self.directories: set[str] = set()
+        self.files: set[str] = set()
+        self.truncated = False
+        self.add_file(str(metadata_file()))
+
+    def add(self, path: str, *, directory: bool = False) -> None:
+        target = self.directories if directory else self.files
+        for absolute in (normalized_path(path), os.path.realpath(normalized_path(path))):
+            if absolute in target:
+                continue
+            if len(self.directories) + len(self.files) >= WATCH_PATH_LIMIT:
+                self.truncated = True
+                return
+            target.add(absolute)
+
+    def add_file(self, path: str) -> None:
+        self.add(path)
+
+    def add_directory(self, path: str) -> None:
+        self.add(path, directory=True)
+
+    def add_git(self, git: dict[str, Any]) -> None:
+        root_token = git.get("rootToken")
+        if not root_token:
+            return
+        root = decode_path(root_token)
+        # rev-parse handles both ordinary repositories and linked worktrees.
+        code, output, _ = run_bounded([
+            "git", "-C", root, "rev-parse", "--path-format=absolute",
+            "--git-path", "HEAD", "--git-path", "index",
+            "--git-path", "packed-refs", "--git-path", "refs/heads",
+        ])
+        if code:
+            return
+        paths = output.splitlines()
+        for path in paths[:3]:
+            self.add_file(path)
+        if len(paths) > 3:
+            self.add_directory(paths[3])
+            branch = str(git.get("branch", ""))
+            if branch:
+                self.add_file(os.path.join(paths[3], branch))
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            "directories": sorted(encode_path(path) for path in self.directories),
+            "files": sorted(encode_path(path) for path in self.files),
+            "truncated": self.truncated,
+        }
+
+
+def empty_metadata_store() -> dict[str, Any]:
+    return {"version": 2, "items": {}}
+
+
+def load_metadata_store() -> dict[str, Any]:
+    path = metadata_file()
+    try:
+        if not path.exists():
+            return empty_metadata_store()
+        if path.stat().st_size > METADATA_SIZE_LIMIT:
+            raise QuickfileError("Quickfile metadata is too large", "metadata-too-large")
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except QuickfileError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise QuickfileError(f"Could not read Quickfile metadata: {exc}", "metadata-read-failed") from exc
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("items"), dict):
+        raise QuickfileError("Quickfile metadata has an invalid format", "metadata-invalid")
+    parsed["version"] = 2
+    return parsed
+
+
+def save_metadata_store(store: dict[str, Any]) -> None:
+    path = metadata_file()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    payload = json.dumps(store, ensure_ascii=True, separators=(",", ":")) + "\n"
+    if len(payload.encode("utf-8")) > METADATA_SIZE_LIMIT:
+        raise QuickfileError("Quickfile metadata is too large", "metadata-too-large")
+    descriptor, temporary = tempfile.mkstemp(prefix=".metadata.", dir=path.parent)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            descriptor = -1
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except OSError as exc:
+        raise QuickfileError(f"Could not save Quickfile metadata: {exc}", "metadata-write-failed") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def item_metadata(store: dict[str, Any], token: str) -> dict[str, Any]:
+    value = store.get("items", {}).get(token, {})
+    return value if isinstance(value, dict) else {}
+
+
+def enrich_row(row: dict[str, Any], store: dict[str, Any]) -> dict[str, Any]:
+    metadata = item_metadata(store, str(row.get("token", "")))
+    row["color"] = str(metadata.get("color", ""))
+    row["note"] = str(metadata.get("note", ""))
+    row["starred"] = metadata.get("starred") is True
+    row["registeredKnowledge"] = metadata.get("knowledge") is True
+    raw_agents = metadata.get("agents", [])
+    row["knowledgeAgents"] = [
+        agent for agent in raw_agents
+        if isinstance(agent, str) and agent in KNOWLEDGE_AGENT_KEYS
+    ] if isinstance(raw_agents, list) else []
+    return row
+
+
+def enrich_rows(rows: list[dict[str, Any]], store: dict[str, Any]) -> None:
+    for row in rows:
+        enrich_row(row, store)
+
+
+def favorite_rows(store: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[tuple[str, dict[str, Any]]] = []
+    empty_git = {"root": "", "branch": "", "statuses": {}}
+    for token, raw in store.get("items", {}).items():
+        if len(rows) >= FAVORITES_LIMIT or not isinstance(raw, dict) or raw.get("starred") is not True:
+            continue
+        try:
+            path = normalized_path(decode_path(str(token)))
+        except QuickfileError:
+            continue
+        if not os.path.lexists(path):
+            continue
+        try:
+            row = entry_row(path, 0, empty_git, set())
+        except QuickfileError:
+            continue
+        enrich_row(row, store)
+        row["parentPath"] = display_text(os.path.dirname(path) or os.sep)
+        rows.append((str(raw.get("starredAt", raw.get("updatedAt", ""))), row))
+    rows.sort(key=lambda pair: (pair[0], pair[1]["name"].casefold()), reverse=True)
+    return [row for _, row in rows]
+
+
+def path_from_args(args: argparse.Namespace, *, required: bool = True) -> str:
+    token = getattr(args, "path_token", None)
+    value = getattr(args, "path", None)
+    if token:
+        return normalized_path(decode_path(token))
+    if value:
+        return normalized_path(value)
+    if required:
+        raise QuickfileError("A path or path token is required", "missing-path")
+    return normalized_path(os.path.expanduser("~"))
+
+
+def iso_time(timestamp: float | int | None) -> str:
+    if timestamp is None:
+        return ""
+    try:
+        return dt.datetime.fromtimestamp(float(timestamp), dt.timezone.utc).astimezone().isoformat(timespec="seconds")
+    except (ValueError, OSError, OverflowError):
+        return ""
+
+
+def run_bounded(argv: list[str], *, timeout: int = COMMAND_TIMEOUT, limit: int = 131072) -> tuple[int, str, str]:
+    try:
+        result = subprocess.run(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 127, "", str(exc)
+    return (
+        result.returncode,
+        result.stdout[:limit].decode("utf-8", "replace"),
+        result.stderr[:8192].decode("utf-8", "replace"),
+    )
+
+
+def human_size(size: int) -> str:
+    amount = float(max(0, size))
+    units = ("B", "KiB", "MiB", "GiB", "TiB", "PiB")
+    index = 0
+    while amount >= 1024 and index < len(units) - 1:
+        amount /= 1024
+        index += 1
+    if index == 0:
+        return f"{int(amount)} {units[index]}"
+    return f"{amount:.1f} {units[index]}"
+
+
+EXTERNAL_TRANSPORTS = {"usb", "mmc", "firewire", "thunderbolt"}
+UNMOUNTABLE_FILESYSTEMS = {"", "swap", "crypto_luks", "lvm2_member"}
+
+
+def volume_rows_from_lsblk(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Flatten mountable external block devices from an lsblk JSON document."""
+    rows: list[dict[str, Any]] = []
+
+    def visit(node: dict[str, Any], parent: dict[str, Any]) -> None:
+        transport = str(node.get("tran") or parent.get("transport") or "").lower()
+        removable = bool(node.get("rm")) or bool(parent.get("removable"))
+        hotplug = bool(node.get("hotplug")) or bool(parent.get("hotplug"))
+        external = bool(parent.get("external")) or removable or hotplug \
+            or transport in EXTERNAL_TRANSPORTS
+        model = str(node.get("model") or parent.get("model") or "").strip()
+        vendor = str(node.get("vendor") or parent.get("vendor") or "").strip()
+        inherited = {
+            "transport": transport,
+            "removable": removable,
+            "hotplug": hotplug,
+            "external": external,
+            "model": model,
+            "vendor": vendor,
+        }
+        children = node.get("children")
+        child_nodes = children if isinstance(children, list) else []
+        fstype = str(node.get("fstype") or "")
+        device = str(node.get("path") or "")
+        mountpoints = node.get("mountpoints")
+        mount_path = ""
+        if isinstance(mountpoints, list):
+            mount_path = next(
+                (str(value) for value in mountpoints
+                 if isinstance(value, str) and value.startswith("/")),
+                "",
+            )
+        elif isinstance(node.get("mountpoint"), str):
+            value = str(node.get("mountpoint"))
+            mount_path = value if value.startswith("/") else ""
+
+        # A partitioned disk is represented by its usable child volumes. A
+        # superfloppy-style USB stick has a filesystem directly on the disk.
+        usable = bool(device) and external and fstype.lower() not in {"", "swap"}
+        if usable and (not child_nodes or mount_path or fstype.lower() != "crypto_luks"):
+            label = str(node.get("label") or "").strip()
+            kernel_name = str(node.get("name") or node.get("kname") or "").strip()
+            name = label or model or vendor or kernel_name or os.path.basename(device)
+            try:
+                size = max(0, int(node.get("size") or 0))
+            except (TypeError, ValueError):
+                size = 0
+            rows.append({
+                "id": str(node.get("uuid") or device),
+                "name": display_text(name),
+                "device": device,
+                "deviceName": kernel_name,
+                "mountPath": display_text(mount_path),
+                "mountToken": encode_path(mount_path) if mount_path else "",
+                "mounted": bool(mount_path),
+                "fstype": fstype,
+                "label": display_text(label),
+                "uuid": str(node.get("uuid") or ""),
+                "size": size,
+                "sizeText": human_size(size),
+                "transport": transport.upper(),
+                "model": display_text(model),
+                "vendor": display_text(vendor),
+                "removable": removable,
+                "hotplug": hotplug,
+                "readOnly": bool(node.get("ro")),
+                "canMount": not mount_path
+                    and fstype.lower() not in UNMOUNTABLE_FILESYSTEMS,
+                "canUnmount": bool(mount_path),
+            })
+        for child in child_nodes:
+            if isinstance(child, dict):
+                visit(child, inherited)
+
+    devices = payload.get("blockdevices")
+    for device in devices if isinstance(devices, list) else []:
+        if isinstance(device, dict):
+            visit(device, {})
+    rows.sort(key=lambda row: (
+        0 if row["mounted"] else 1,
+        str(row["name"]).casefold(),
+        str(row["device"]),
+    ))
+    return rows
+
+
+def external_volumes() -> list[dict[str, Any]]:
+    executable = shutil.which("lsblk")
+    if not executable:
+        raise QuickfileError("lsblk is not installed", "volumes-unavailable")
+    code, output, error = run_bounded([
+        executable,
+        "--json",
+        "--bytes",
+        "--output",
+        "NAME,KNAME,PATH,TYPE,FSTYPE,LABEL,UUID,SIZE,MOUNTPOINTS,RM,HOTPLUG,TRAN,MODEL,VENDOR,RO",
+    ])
+    if code != 0:
+        raise QuickfileError(error.strip() or "Could not inspect storage devices", "volumes-failed")
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise QuickfileError("lsblk returned invalid data", "volumes-invalid") from exc
+    if not isinstance(payload, dict):
+        raise QuickfileError("lsblk returned invalid data", "volumes-invalid")
+    return volume_rows_from_lsblk(payload)
+
+
+def volumes_command(_args: argparse.Namespace) -> dict[str, Any]:
+    rows = external_volumes()
+    return {"ok": True, "volumes": rows, "count": len(rows)}
+
+
+def volume_action_command(args: argparse.Namespace) -> dict[str, Any]:
+    device = str(args.device or "")
+    volumes = external_volumes()
+    volume = next((row for row in volumes if row["device"] == device), None)
+    if volume is None:
+        raise QuickfileError("This external device is no longer available", "volume-missing")
+    executable = shutil.which("udisksctl")
+    if not executable:
+        raise QuickfileError("udisksctl is not installed", "volume-actions-unavailable")
+
+    if args.action == "mount":
+        if volume["mounted"]:
+            return {
+                "ok": True,
+                "action": "mount",
+                "message": "Drive is already mounted",
+                "volume": volume,
+            }
+        if not volume["canMount"]:
+            raise QuickfileError("This external device cannot be mounted", "volume-not-mountable")
+        command = [executable, "mount", "--block-device", device, "--no-user-interaction"]
+        success_message = "Drive mounted"
+    else:
+        if not volume["mounted"]:
+            return {
+                "ok": True,
+                "action": "unmount",
+                "message": "Drive is already unmounted",
+                "volume": volume,
+            }
+        command = [executable, "unmount", "--block-device", device, "--no-user-interaction"]
+        success_message = "Drive safely unmounted"
+
+    code, _, error = run_bounded(command, timeout=30)
+    if code != 0:
+        raise QuickfileError(
+            error.strip() or f"Could not {args.action} the external device",
+            f"volume-{args.action}-failed",
+        )
+    updated = next(
+        (row for row in external_volumes() if row["device"] == device),
+        dict(volume),
+    )
+    if args.action == "unmount":
+        updated["mountPath"] = ""
+        updated["mountToken"] = ""
+        updated["mounted"] = False
+        updated["canUnmount"] = False
+    return {
+        "ok": True,
+        "action": args.action,
+        "message": success_message,
+        "volume": updated,
+    }
+
+
+def mime_for(path: str, mode: int) -> str:
+    if stat.S_ISDIR(mode):
+        return "inode/directory"
+    if stat.S_ISLNK(mode):
+        return "inode/symlink"
+    guessed, _ = mimetypes.guess_type(display_text(path), strict=False)
+    return guessed or "application/octet-stream"
+
+
+def file_kind(mode: int) -> str:
+    if stat.S_ISDIR(mode):
+        return "directory"
+    if stat.S_ISLNK(mode):
+        return "symlink"
+    if stat.S_ISREG(mode):
+        return "file"
+    if stat.S_ISSOCK(mode):
+        return "socket"
+    if stat.S_ISFIFO(mode):
+        return "fifo"
+    if stat.S_ISCHR(mode):
+        return "character-device"
+    if stat.S_ISBLK(mode):
+        return "block-device"
+    return "unknown"
+
+
+def has_children(path: str) -> bool:
+    try:
+        with os.scandir(path) as iterator:
+            next(iterator)
+        return True
+    except (OSError, StopIteration):
+        return False
+
+
+def safe_stat(path: str) -> os.stat_result:
+    try:
+        return os.lstat(path)
+    except OSError as exc:
+        raise QuickfileError(str(exc), "stat-failed") from exc
+
+
+def git_context(path: str) -> dict[str, Any]:
+    probe = path if os.path.isdir(path) else os.path.dirname(path)
+    code, out, _ = run_bounded(["git", "-C", probe, "rev-parse", "--show-toplevel"])
+    if code != 0 or not out.strip():
+        return {"root": "", "branch": "", "statuses": {}}
+    root = normalized_path(out.splitlines()[0])
+    _, branch, _ = run_bounded(["git", "-C", root, "branch", "--show-current"])
+    code, porcelain, _ = run_bounded(
+        # Prevent git's optional index refresh write from feeding the watcher.
+        ["git", "--no-optional-locks", "-C", root, "status", "--porcelain=v1", "--untracked-files=all"],
+        timeout=5,
+        limit=524288,
+    )
+    statuses: dict[str, str] = {}
+    if code == 0:
+        for line in porcelain.splitlines():
+            if len(line) < 4:
+                continue
+            status_code = line[:2]
+            rel = line[3:]
+            if " -> " in rel:
+                rel = rel.split(" -> ", 1)[1]
+            statuses[normalized_path(os.path.join(root, rel))] = status_code
+    return {
+        "root": display_text(root),
+        "rootToken": encode_path(root),
+        "branch": branch.strip(),
+        "statuses": statuses,
+    }
+
+
+def status_for(path: str, git: dict[str, Any]) -> str:
+    statuses = git.get("statuses", {})
+    exact = statuses.get(normalized_path(path))
+    if exact:
+        return exact
+    if os.path.isdir(path):
+        prefix = normalized_path(path).rstrip(os.sep) + os.sep
+        for changed, code in statuses.items():
+            if changed.startswith(prefix):
+                return code
+    return ""
+
+
+def entry_row(path: str, depth: int, git: dict[str, Any], expanded: set[str]) -> dict[str, Any]:
+    info = safe_stat(path)
+    mode = info.st_mode
+    follows_to_dir = False
+    if stat.S_ISLNK(mode):
+        try:
+            follows_to_dir = os.path.isdir(path)
+        except OSError:
+            pass
+    directory = stat.S_ISDIR(mode) or follows_to_dir
+    name = os.path.basename(path) or path
+    token = encode_path(path)
+    return {
+        "name": display_text(name),
+        "path": display_text(path),
+        "token": token,
+        "uri": uri_for(path),
+        "shellQuotedPath": shlex.quote(display_text(path)),
+        "depth": depth,
+        "kind": file_kind(mode),
+        "isDir": directory,
+        "isSymlink": stat.S_ISLNK(mode),
+        "isHidden": name.startswith("."),
+        "isExecutable": bool(mode & stat.S_IXUSR),
+        "hasChildren": directory and has_children(path),
+        "expanded": token in expanded,
+        "size": info.st_size,
+        "sizeText": human_size(info.st_size),
+        "modified": iso_time(info.st_mtime),
+        "modifiedEpoch": info.st_mtime,
+        "permissions": stat.filemode(mode),
+        "mode": f"{stat.S_IMODE(mode):04o}",
+        "mime": mime_for(path, mode),
+        "git": status_for(path, git),
+    }
+
+
+def path_within(path: str, parent: str) -> bool:
+    try:
+        return os.path.commonpath((normalized_path(path), normalized_path(parent))) == normalized_path(parent)
+    except ValueError:
+        return False
+
+
+def knowledge_ancestors(root: str, home: str) -> list[str]:
+    current = root if os.path.isdir(root) else os.path.dirname(root)
+    current = normalized_path(current)
+    boundary = normalized_path(home) if path_within(current, home) else current
+    ancestors: list[str] = []
+    for _ in range(32):
+        ancestors.append(current)
+        if current == boundary:
+            break
+        parent = os.path.dirname(current.rstrip(os.sep)) or os.sep
+        if parent == current or not path_within(parent, boundary):
+            break
+        current = parent
+    return ancestors
+
+
+def knowledge_rule_files(directory: str, suffixes: tuple[str, ...], limit: int = 64,
+                         watch: WatchPaths | None = None) -> list[str]:
+    if watch is not None:
+        watch.add_directory(directory)
+    try:
+        entries = list(os.scandir(directory))
+    except OSError:
+        return []
+    output: list[str] = []
+    for entry in sorted(entries, key=lambda item: display_text(item.name).casefold()):
+        if len(output) >= limit:
+            break
+        try:
+            if entry.is_file(follow_symlinks=True) and entry.name.lower().endswith(suffixes):
+                output.append(entry.path)
+        except OSError:
+            continue
+    return output
+
+
+def knowledge_candidates(root: str, home: str,
+                         watch: WatchPaths | None = None) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(path: str, agent: str, scope: str, source: str) -> None:
+        absolute = normalized_path(path)
+        if watch is not None:
+            watch.add_file(absolute)
+        key = (absolute, agent)
+        if key in seen or not os.path.isfile(absolute):
+            return
+        seen.add(key)
+        candidates.append({
+            "path": absolute,
+            "agent": agent,
+            "scope": scope,
+            "source": normalized_path(source),
+        })
+
+    conventional = (
+        ("CLAUDE.md", "claude"),
+        ("CLAUDE.local.md", "claude"),
+        (".claude/CLAUDE.md", "claude"),
+        ("GEMINI.md", "gemini"),
+        (".cursorrules", "cursor"),
+        (".windsurfrules", "windsurf"),
+    )
+    for ancestor in knowledge_ancestors(root, home):
+        codex_override = os.path.join(ancestor, "AGENTS.override.md")
+        if watch is not None:
+            watch.add_file(codex_override)
+            watch.add_file(os.path.join(ancestor, "AGENTS.md"))
+        add(
+            codex_override if os.path.isfile(codex_override)
+            else os.path.join(ancestor, "AGENTS.md"),
+            "codex", "PROJECT", ancestor,
+        )
+        for relative, agent in conventional:
+            add(os.path.join(ancestor, relative), agent, "PROJECT", ancestor)
+        add(
+            os.path.join(ancestor, ".github", "copilot-instructions.md"),
+            "copilot", "PROJECT", ancestor,
+        )
+        for path in knowledge_rule_files(os.path.join(ancestor, ".cursor", "rules"), (".md", ".mdc"), watch=watch):
+            add(path, "cursor", "PROJECT", ancestor)
+        for path in knowledge_rule_files(os.path.join(ancestor, ".claude", "rules"), (".md",), watch=watch):
+            add(path, "claude", "PROJECT", ancestor)
+        for path in knowledge_rule_files(os.path.join(ancestor, ".github", "instructions"), (".md",), watch=watch):
+            add(path, "copilot", "PROJECT", ancestor)
+        for path in knowledge_rule_files(os.path.join(ancestor, ".devin", "rules"), (".md",), watch=watch):
+            add(path, "windsurf", "PROJECT", ancestor)
+        for path in knowledge_rule_files(os.path.join(ancestor, ".windsurf", "rules"), (".md",), watch=watch):
+            add(path, "windsurf", "PROJECT", ancestor)
+
+    user_codex_override = os.path.join(home, ".codex", "AGENTS.override.md")
+    if watch is not None:
+        watch.add_file(user_codex_override)
+        watch.add_file(os.path.join(home, ".codex", "AGENTS.md"))
+    add(
+        user_codex_override if os.path.isfile(user_codex_override)
+        else os.path.join(home, ".codex", "AGENTS.md"),
+        "codex", "USER", home,
+    )
+    user_files = (
+        (".claude/CLAUDE.md", "claude"),
+        (".gemini/GEMINI.md", "gemini"),
+        (".copilot/copilot-instructions.md", "copilot"),
+        (".config/github-copilot/copilot-instructions.md", "copilot"),
+        (".codeium/windsurf/memories/global_rules.md", "windsurf"),
+    )
+    for relative, agent in user_files:
+        add(os.path.join(home, relative), agent, "USER", home)
+    user_rule_dirs = (
+        (".claude/rules", "claude", (".md",)),
+        (".cursor/rules", "cursor", (".md", ".mdc")),
+        (".config/Cursor/User/rules", "cursor", (".md", ".mdc")),
+        (".copilot/instructions", "copilot", (".instructions.md",)),
+        (".devin/rules", "windsurf", (".md",)),
+        (".windsurf/rules", "windsurf", (".md",)),
+    )
+    for relative, agent, suffixes in user_rule_dirs:
+        for path in knowledge_rule_files(os.path.join(home, relative), suffixes, watch=watch):
+            add(path, agent, "USER", home)
+    return candidates
+
+
+def compact_home_path(path: str, home: str) -> str:
+    absolute = normalized_path(path)
+    if path_within(absolute, home):
+        relative = os.path.relpath(absolute, home)
+        return "~" if relative == "." else "~/" + display_text(relative)
+    return display_text(absolute)
+
+
+def knowledge_command(args: argparse.Namespace) -> dict[str, Any]:
+    root = path_from_args(args, required=False)
+    if not os.path.isdir(root):
+        raise QuickfileError(f"Not a directory: {display_text(root)}", "not-a-directory")
+    home = quickfile_home()
+    limit = max(1, min(KNOWLEDGE_LIMIT, int(getattr(args, "limit", KNOWLEDGE_LIMIT))))
+    metadata = load_metadata_store()
+    watch = WatchPaths()
+    candidates = knowledge_candidates(root, home, watch)
+    for token, raw in metadata.get("items", {}).items():
+        if not isinstance(raw, dict) or raw.get("knowledge") is not True:
+            continue
+        try:
+            path = normalized_path(decode_path(str(token)))
+        except QuickfileError:
+            continue
+        watch.add_file(path)
+        if not os.path.isfile(path):
+            continue
+        raw_agents = raw.get("agents", [])
+        agents = [
+            agent for agent in raw_agents
+            if isinstance(agent, str) and agent in KNOWLEDGE_AGENT_KEYS
+        ] if isinstance(raw_agents, list) else []
+        scope = "PROJECT" if path_within(path, root) else (
+            "USER" if path_within(path, home) else "EXTERNAL"
+        )
+        for agent in agents or [""]:
+            candidates.append({
+                "path": path,
+                "agent": agent,
+                "scope": scope,
+                "source": root if scope == "PROJECT" else (
+                    home if scope == "USER" else os.path.dirname(path)
+                ),
+                "registered": True,
+            })
+    records: dict[str, dict[str, Any]] = {}
+    truncated = False
+    for candidate in candidates:
+        canonical = normalized_path(os.path.realpath(candidate["path"]))
+        if not os.path.isfile(canonical):
+            continue
+        canonical_token = encode_path(canonical)
+        record = records.get(canonical_token)
+        if record is None:
+            if len(records) >= limit:
+                truncated = True
+                continue
+            try:
+                row = entry_row(canonical, 0, {"root": "", "branch": "", "statuses": {}}, set())
+            except QuickfileError:
+                continue
+            row.update({
+                "isKnowledge": True,
+                "scope": candidate["scope"],
+                "scopePath": display_text(candidate["source"]),
+                "displayPath": compact_home_path(candidate["path"], home),
+                "agents": [],
+                "bindings": [],
+                "hasSymlinkBinding": False,
+                "symlinkTargets": [],
+                "tokenEstimate": (int(row["size"]) + 3) // 4 if row["size"] else 0,
+                "tokenApproximate": True,
+                "metadataTokens": [],
+            })
+            records[canonical_token] = row
+            record = row
+        if candidate.get("registered") is True:
+            metadata_token = encode_path(candidate["path"])
+            if metadata_token not in record["metadataTokens"]:
+                record["metadataTokens"].append(metadata_token)
+        binding_path = candidate["path"]
+        is_link = os.path.islink(binding_path)
+        binding_agent = candidate["agent"] or "registry"
+        binding = {
+            "agent": binding_agent,
+            "path": display_text(binding_path),
+            "displayPath": compact_home_path(binding_path, home),
+            "isSymlink": is_link,
+            "target": display_text(canonical) if is_link else "",
+        }
+        if not any(
+            current["agent"] == binding["agent"] and current["path"] == binding["path"]
+            for current in record["bindings"]
+        ):
+            record["bindings"].append(binding)
+        if candidate["agent"] and candidate["agent"] not in record["agents"]:
+            record["agents"].append(candidate["agent"])
+        if candidate["scope"] == "PROJECT":
+            record["scope"] = "PROJECT"
+            record["scopePath"] = display_text(candidate["source"])
+            record["displayPath"] = compact_home_path(binding_path, home)
+        if is_link:
+            record["hasSymlinkBinding"] = True
+            target = display_text(canonical)
+            if target not in record["symlinkTargets"]:
+                record["symlinkTargets"].append(target)
+
+    order = {name: index for index, name in enumerate(KNOWLEDGE_AGENT_ORDER)}
+    rows = list(records.values())
+    for row in rows:
+        row["agents"].sort(key=lambda name: (order.get(name, 999), name))
+        row["bindings"].sort(key=lambda item: (order.get(item["agent"], 999), item["path"]))
+        enrich_row(row, metadata)
+        explicit_agents = set(row["knowledgeAgents"])
+        for metadata_token in row.pop("metadataTokens"):
+            manual = item_metadata(metadata, metadata_token)
+            if manual.get("knowledge") is True:
+                row["registeredKnowledge"] = True
+            for agent in manual.get("agents", []):
+                if isinstance(agent, str) and agent in KNOWLEDGE_AGENT_KEYS:
+                    explicit_agents.add(agent)
+        row["knowledgeAgents"] = [
+            agent for agent in KNOWLEDGE_AGENT_ORDER if agent in explicit_agents
+        ]
+    rows.sort(key=lambda row: (
+        {"PROJECT": 0, "USER": 1, "EXTERNAL": 2}.get(row["scope"], 3),
+        str(row["scopePath"]).count(os.sep) * (-1 if row["scope"] == "PROJECT" else 1),
+        str(row["name"]).casefold(),
+    ))
+    total_tokens = sum(int(row["tokenEstimate"]) for row in rows)
+    return {
+        "ok": True,
+        "root": {"path": display_text(root), "token": encode_path(root)},
+        "entries": rows,
+        "count": len(rows),
+        "totalTokens": total_tokens,
+        "maxTokens": max((int(row["tokenEstimate"]) for row in rows), default=0),
+        "truncated": truncated,
+        "approximate": True,
+        "watch": watch.payload(),
+    }
+
+
+def named_path_from_args(args: argparse.Namespace, name: str) -> str:
+    token = getattr(args, f"{name}_token", None)
+    value = getattr(args, name, None)
+    if token:
+        return normalized_path(decode_path(token))
+    if value:
+        return normalized_path(value)
+    raise QuickfileError(f"A {name} path is required", f"missing-{name}")
+
+
+def registered_knowledge_agents(store: dict[str, Any], source: str) -> list[str]:
+    """Return explicit agent mappings for every registry alias of a file."""
+    canonical = normalized_path(os.path.realpath(source))
+    selected: set[str] = set()
+    registered = False
+    for token, raw in store.get("items", {}).items():
+        if not isinstance(raw, dict) or raw.get("knowledge") is not True:
+            continue
+        try:
+            registered_path = normalized_path(decode_path(str(token)))
+        except QuickfileError:
+            continue
+        if normalized_path(os.path.realpath(registered_path)) != canonical:
+            continue
+        registered = True
+        for agent in raw.get("agents", []):
+            if isinstance(agent, str) and agent in KNOWLEDGE_AGENT_KEYS:
+                selected.add(agent)
+    if not registered:
+        raise QuickfileError(
+            "Register this file in Project Knowledge before creating links",
+            "knowledge-not-registered",
+        )
+    return [agent for agent in KNOWLEDGE_AGENT_ORDER if agent in selected]
+
+
+def project_root_for(path: str) -> str:
+    code, output, _ = run_bounded(
+        ["git", "-C", path, "rev-parse", "--show-toplevel"],
+        timeout=2,
+        limit=8192,
+    )
+    if code == 0 and output.strip():
+        candidate = normalized_path(output.splitlines()[0])
+        if os.path.isdir(candidate):
+            return candidate
+    return normalized_path(path)
+
+
+def knowledge_link_slug(source: str) -> str:
+    stem = os.path.splitext(os.path.basename(source))[0]
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", display_text(stem)).strip("-.").lower()
+    if not safe:
+        safe = "knowledge"
+    digest = hashlib.sha256(os.fsencode(normalized_path(source))).hexdigest()[:8]
+    return f"quickfile-{safe[:40]}-{digest}"
+
+
+def native_knowledge_path(agent: str, source: str, project_root: str) -> bool:
+    source = normalized_path(source)
+    root = normalized_path(project_root)
+    basename = os.path.basename(source)
+    if os.path.dirname(source) == root:
+        if agent == "codex" and basename == "AGENTS.override.md":
+            return True
+        if (
+            agent == "codex"
+            and basename == "AGENTS.md"
+            and not os.path.lexists(os.path.join(root, "AGENTS.override.md"))
+        ):
+            return True
+        if agent == "claude" and basename in {"CLAUDE.md", "CLAUDE.local.md"}:
+            return True
+        if agent == "gemini" and basename == "GEMINI.md":
+            return True
+        if agent == "cursor" and basename in {".cursorrules", "AGENTS.md", "CLAUDE.md"}:
+            return True
+        if agent == "copilot" and basename in {"AGENTS.md", "CLAUDE.md", "GEMINI.md"}:
+            return True
+        if agent == "windsurf" and basename in {"AGENTS.md", ".windsurfrules"}:
+            return True
+    if agent == "claude" and source == os.path.join(root, ".claude", "CLAUDE.md"):
+        return True
+    native_directories = {
+        "claude": (os.path.join(root, ".claude", "rules"), (".md",)),
+        "cursor": (os.path.join(root, ".cursor", "rules"), (".mdc",)),
+        "copilot": (os.path.join(root, ".github", "instructions"), (".instructions.md",)),
+        "windsurf": (os.path.join(root, ".windsurf", "rules"), (".md",)),
+    }
+    if agent == "windsurf" and path_within(source, os.path.join(root, ".devin", "rules")):
+        return source.lower().endswith(".md")
+    native = native_directories.get(agent)
+    return bool(
+        native
+        and path_within(source, native[0])
+        and source.lower().endswith(native[1])
+    )
+
+
+def knowledge_link_target(agent: str, source: str, project_root: str) -> str:
+    root = normalized_path(project_root)
+    slug = knowledge_link_slug(source)
+    if agent == "codex":
+        override = os.path.join(root, "AGENTS.override.md")
+        return override if os.path.lexists(override) else os.path.join(root, "AGENTS.md")
+    if agent == "claude":
+        return os.path.join(root, ".claude", "rules", slug + ".md")
+    if agent == "gemini":
+        return os.path.join(root, "GEMINI.md")
+    if agent == "cursor":
+        return os.path.join(root, ".cursor", "rules", slug + ".mdc")
+    if agent == "copilot":
+        return os.path.join(root, ".github", "copilot-instructions.md")
+    if agent == "windsurf":
+        return os.path.join(root, ".windsurf", "rules", slug + ".md")
+    raise QuickfileError("Unsupported knowledge agent", "metadata-invalid-agents")
+
+
+def safe_link_parent_reason(project_root: str, target: str) -> str:
+    root = normalized_path(project_root)
+    parent = os.path.dirname(normalized_path(target))
+    if not path_within(parent, root):
+        return "Target is outside the project root"
+    relative = os.path.relpath(parent, root)
+    current = root
+    if relative == ".":
+        return ""
+    for component in relative.split(os.sep):
+        current = os.path.join(current, component)
+        if not os.path.lexists(current):
+            continue
+        if os.path.islink(current):
+            return f"Parent is a symbolic link: {display_text(current)}"
+        if not os.path.isdir(current):
+            return f"Parent is not a directory: {display_text(current)}"
+    return ""
+
+
+def knowledge_links_plan(source: str, root: str) -> dict[str, Any]:
+    if not os.path.isfile(source):
+        raise QuickfileError("Knowledge source must be an existing file", "knowledge-file-required")
+    if not os.path.isdir(root):
+        raise QuickfileError(f"Not a directory: {display_text(root)}", "not-a-directory")
+    source = normalized_path(os.path.realpath(source))
+    project_root = project_root_for(root)
+    agents = registered_knowledge_agents(load_metadata_store(), source)
+    entries: list[dict[str, Any]] = []
+    for agent in agents:
+        if native_knowledge_path(agent, source, project_root):
+            target = source
+            status = "connected"
+            reason = "Already stored in a native agent location"
+        else:
+            target = knowledge_link_target(agent, source, project_root)
+            parent_reason = safe_link_parent_reason(project_root, target)
+            if parent_reason:
+                status = "conflict"
+                reason = parent_reason
+            elif not os.path.lexists(target):
+                status = "create"
+                reason = "A new symbolic link will be created"
+            else:
+                try:
+                    same_file = os.path.samefile(source, target)
+                except OSError:
+                    same_file = False
+                if same_file:
+                    status = "connected"
+                    reason = "Already connected to this file"
+                else:
+                    status = "conflict"
+                    reason = "Target already exists and will not be replaced"
+        link_value = (
+            os.path.relpath(source, os.path.dirname(target))
+            if path_within(source, project_root) and target != source
+            else source
+        )
+        warning = ""
+        if agent == "cursor" and not source.lower().endswith(".mdc"):
+            warning = "Cursor will expose this Markdown file as an MDC rule"
+        entries.append({
+            "agent": agent,
+            "source": display_text(source),
+            "sourceToken": encode_path(source),
+            "target": display_text(target),
+            "targetToken": encode_path(target),
+            "relativeTarget": display_text(os.path.relpath(target, project_root)),
+            "linkValue": display_text(link_value),
+            "status": status,
+            "reason": reason,
+            "warning": warning,
+        })
+    counts = {
+        status: sum(1 for entry in entries if entry["status"] == status)
+        for status in ("create", "connected", "conflict")
+    }
+    return {
+        "ok": True,
+        "action": "knowledge-links-preview",
+        "message": "Link preview ready" if entries else "No agents selected for this file",
+        "source": display_text(source),
+        "sourceToken": encode_path(source),
+        "projectRoot": display_text(project_root),
+        "projectRootToken": encode_path(project_root),
+        "entries": entries,
+        "createCount": counts["create"],
+        "connectedCount": counts["connected"],
+        "conflictCount": counts["conflict"],
+    }
+
+
+def create_safe_link_parent(project_root: str, target: str) -> None:
+    reason = safe_link_parent_reason(project_root, target)
+    if reason:
+        raise QuickfileError(reason, "knowledge-link-unsafe-parent")
+    root = normalized_path(project_root)
+    relative = os.path.relpath(os.path.dirname(target), root)
+    current = root
+    if relative == ".":
+        return
+    for component in relative.split(os.sep):
+        current = os.path.join(current, component)
+        if not os.path.lexists(current):
+            try:
+                os.mkdir(current, mode=0o755)
+            except FileExistsError:
+                pass
+        if os.path.islink(current) or not os.path.isdir(current):
+            raise QuickfileError(
+                f"Unsafe link parent: {display_text(current)}",
+                "knowledge-link-unsafe-parent",
+            )
+
+
+def knowledge_links_command(args: argparse.Namespace) -> dict[str, Any]:
+    source = named_path_from_args(args, "source")
+    root = named_path_from_args(args, "root")
+    plan = knowledge_links_plan(source, root)
+    if not getattr(args, "apply", False):
+        return plan
+
+    errors: list[dict[str, str]] = []
+    created = 0
+    canonical_source = normalized_path(os.path.realpath(source))
+    project_root = project_root_for(root)
+    for entry in plan["entries"]:
+        if entry["status"] != "create":
+            continue
+        target = decode_path(entry["targetToken"])
+        link_value = (
+            os.path.relpath(canonical_source, os.path.dirname(target))
+            if path_within(canonical_source, project_root)
+            else canonical_source
+        )
+        try:
+            create_safe_link_parent(project_root, target)
+            os.symlink(link_value, target)
+            created += 1
+        except (OSError, QuickfileError) as exc:
+            errors.append({"agent": entry["agent"], "error": str(exc)})
+
+    result = knowledge_links_plan(source, root)
+    result["action"] = "knowledge-links-apply"
+    result["createdCount"] = created
+    result["errors"] = errors
+    result["message"] = (
+        f"Created {created} knowledge link" + ("s" if created != 1 else "")
+        + (f"; {len(errors)} skipped" if errors else "")
+    )
+    return result
+
+
+def scandir_sorted(path: str, show_hidden: bool) -> list[os.DirEntry[str]]:
+    try:
+        entries = list(os.scandir(path))
+    except OSError as exc:
+        raise QuickfileError(str(exc), "read-directory-failed") from exc
+    if not show_hidden:
+        entries = [entry for entry in entries if not entry.name.startswith(".")]
+
+    def sort_key(entry: os.DirEntry[str]) -> tuple[int, str]:
+        try:
+            directory = entry.is_dir(follow_symlinks=True)
+        except OSError:
+            directory = False
+        return (0 if directory else 1, display_text(entry.name).casefold())
+
+    entries.sort(key=sort_key)
+    return entries
+
+
+def tree_command(args: argparse.Namespace) -> dict[str, Any]:
+    root = path_from_args(args, required=False)
+    if not os.path.isdir(root):
+        raise QuickfileError(f"Not a directory: {display_text(root)}", "not-a-directory")
+    expanded = set(args.expanded or [])
+    git = git_context(root) if not args.no_git else {"root": "", "branch": "", "statuses": {}}
+    rows: list[dict[str, Any]] = []
+    truncated = False
+    watch = WatchPaths()
+    watch.add_git(git)
+
+    def visit(directory: str, depth: int) -> None:
+        nonlocal truncated
+        watch.add_directory(directory)
+        try:
+            children = scandir_sorted(directory, args.show_hidden)
+        except QuickfileError:
+            return
+        for child in children:
+            if len(rows) >= args.limit:
+                truncated = True
+                return
+            child_path = os.path.join(directory, child.name)
+            try:
+                row = entry_row(child_path, depth, git, expanded)
+            except QuickfileError:
+                continue
+            rows.append(row)
+            if row["isDir"] and row["token"] in expanded and depth < args.max_depth:
+                visit(child_path, depth + 1)
+            if truncated:
+                return
+
+    visit(root, 0)
+    metadata = load_metadata_store()
+    enrich_rows(rows, metadata)
+    root_info = safe_stat(root)
+    parent = os.path.dirname(root.rstrip(os.sep)) or os.sep
+    return {
+        "ok": True,
+        "root": {
+            "name": display_text(os.path.basename(root) or root),
+            "path": display_text(root),
+            "token": encode_path(root),
+            "parentPath": display_text(parent),
+            "parentToken": encode_path(parent),
+            "permissions": stat.filemode(root_info.st_mode),
+        },
+        "entries": rows,
+        "favorites": favorite_rows(metadata),
+        "git": {key: value for key, value in git.items() if key != "statuses"},
+        "truncated": truncated,
+        "limit": args.limit,
+        "watch": watch.payload(),
+    }
+
+
+def fuzzy_score(candidate: str, query: str) -> int | None:
+    folded = candidate.casefold()
+    needle = query.casefold()
+    position = -1
+    score = 0
+    streak = 0
+    for char in needle:
+        found = folded.find(char, position + 1)
+        if found < 0:
+            return None
+        if found == position + 1:
+            streak += 1
+            score += 8 + streak * 2
+        else:
+            streak = 0
+            score -= found - position - 1
+        if found == 0 or candidate[found - 1] in "/_- .":
+            score += 12
+        position = found
+    return score - len(candidate) // 8
+
+
+def matches(candidate: str, query: str, mode: str, case_sensitive: bool) -> tuple[bool, int]:
+    left = candidate if case_sensitive else candidate.casefold()
+    right = query if case_sensitive else query.casefold()
+    if mode == "exact":
+        return left == right, 1000
+    if mode == "prefix":
+        return left.startswith(right), 900
+    if mode == "suffix":
+        return left.endswith(right), 800
+    if mode == "regex":
+        flags = 0 if case_sensitive else re.IGNORECASE
+        try:
+            return re.search(query, candidate, flags) is not None, 700
+        except re.error as exc:
+            raise QuickfileError(f"Invalid regular expression: {exc}", "invalid-regex") from exc
+    if mode == "fuzzy":
+        score = fuzzy_score(candidate, query)
+        return score is not None, score or 0
+    return right in left, 600 - max(0, len(left) - len(right))
+
+
+def content_match(
+    path: str,
+    query: str,
+    mode: str,
+    case_sensitive: bool,
+    byte_limit: int,
+    deadline: float,
+) -> tuple[dict[str, Any] | None, int]:
+    """Return one bounded text match and the number of bytes inspected."""
+    if byte_limit <= 0 or time.monotonic() >= deadline:
+        return None, 0
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return None, 0
+    if not stat.S_ISREG(info.st_mode) or info.st_size > byte_limit:
+        return None, 0
+    try:
+        with open(path, "rb") as stream:
+            raw = stream.read(byte_limit + 1)
+    except OSError:
+        return None, 0
+    if len(raw) > byte_limit or b"\x00" in raw[:8192]:
+        return None, min(len(raw), byte_limit)
+
+    text = raw.decode("utf-8", "replace")
+    content_mode = "contains" if mode == "fuzzy" else mode
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        if time.monotonic() >= deadline:
+            break
+        candidate = line[:CONTENT_LINE_LIMIT]
+        if content_mode in {"exact", "prefix", "suffix"}:
+            candidate = candidate.strip()
+        found, score = matches(candidate, query, content_mode, case_sensitive)
+        if not found:
+            continue
+        snippet = " ".join(line.strip().split())[:CONTENT_SNIPPET_LIMIT]
+        return {
+            "matchKind": "content",
+            "matchLine": line_number,
+            "matchSnippet": display_text(snippet),
+            "matchScore": score,
+        }, len(raw)
+    return None, len(raw)
+
+
+def search_command(args: argparse.Namespace) -> dict[str, Any]:
+    root = path_from_args(args, required=False)
+    query = args.query.strip()
+    if not query:
+        args.expanded = []
+        args.max_depth = 12
+        return tree_command(args)
+    if not os.path.isdir(root):
+        raise QuickfileError(f"Not a directory: {display_text(root)}", "not-a-directory")
+    git = git_context(root) if not args.no_git else {"root": "", "branch": "", "statuses": {}}
+    rows: list[tuple[int, dict[str, Any]]] = []
+    truncated = False
+    scanned = 0
+    content_bytes_scanned = 0
+    content_file_limit = max(
+        0, int(getattr(args, "content_file_limit", DEFAULT_CONTENT_FILE_LIMIT))
+    )
+    content_byte_limit = max(
+        0, int(getattr(args, "content_byte_limit", DEFAULT_CONTENT_BYTE_LIMIT))
+    )
+    deadline = time.monotonic() + max(0.25, float(args.timeout))
+    root_depth = root.rstrip(os.sep).count(os.sep)
+    watch = WatchPaths()
+    watch.add_git(git)
+    for directory, dirnames, filenames in os.walk(root, followlinks=False):
+        watch.add_directory(directory)
+        if not args.show_hidden:
+            dirnames[:] = [name for name in dirnames if not name.startswith(".")]
+            filenames = [name for name in filenames if not name.startswith(".")]
+        if ".git" in dirnames:
+            dirnames.remove(".git")
+        for name in dirnames + filenames:
+            scanned += 1
+            if scanned > args.scan_limit or time.monotonic() >= deadline:
+                truncated = True
+                break
+            path = os.path.join(directory, name)
+            relative = os.path.relpath(path, root)
+            rendered_name = display_text(name)
+            rendered_relative = display_text(relative)
+            is_directory = name in dirnames
+            found, score = matches(rendered_name, query, args.mode, args.case_sensitive)
+            match: dict[str, Any] | None = None
+            if found:
+                match = {
+                    "matchKind": "folder" if is_directory else "name",
+                    "matchLine": 0,
+                    "matchSnippet": "",
+                }
+                score += 2500 if is_directory else 2400
+            elif rendered_relative != rendered_name:
+                found, score = matches(
+                    rendered_relative, query, args.mode, args.case_sensitive
+                )
+                if found:
+                    match = {
+                        "matchKind": "path",
+                        "matchLine": 0,
+                        "matchSnippet": "",
+                    }
+                    score += 1800
+
+            if match is None and not is_directory and content_bytes_scanned < content_byte_limit:
+                remaining = content_byte_limit - content_bytes_scanned
+                per_file_limit = min(content_file_limit, remaining)
+                match, bytes_read = content_match(
+                    path,
+                    query,
+                    args.mode,
+                    args.case_sensitive,
+                    per_file_limit,
+                    deadline,
+                )
+                content_bytes_scanned += bytes_read
+                if match is not None:
+                    score = 1000 + max(-200, int(match.pop("matchScore", 0)))
+            if match is None:
+                continue
+            try:
+                row = entry_row(path, max(0, directory.count(os.sep) - root_depth), git, set())
+            except QuickfileError:
+                continue
+            row["relativePath"] = rendered_relative
+            row.update(match)
+            rows.append((score, row))
+            if len(rows) >= args.limit:
+                truncated = True
+                break
+        if truncated:
+            break
+    rows.sort(key=lambda pair: (-pair[0], pair[1]["relativePath"].casefold()))
+    metadata = load_metadata_store()
+    result_rows = [row for _, row in rows]
+    enrich_rows(result_rows, metadata)
+    return {
+        "ok": True,
+        "root": {"path": display_text(root), "token": encode_path(root)},
+        "entries": result_rows,
+        "favorites": favorite_rows(metadata),
+        "git": {key: value for key, value in git.items() if key != "statuses"},
+        "query": query,
+        "mode": args.mode,
+        "truncated": truncated,
+        "scanned": scanned,
+        "contentBytesScanned": content_bytes_scanned,
+        "limit": args.limit,
+        "watch": watch.payload(),
+    }
+
+
+def uid_name(uid: int) -> str:
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return str(uid)
+
+
+def gid_name(gid: int) -> str:
+    try:
+        return grp.getgrgid(gid).gr_name
+    except KeyError:
+        return str(gid)
+
+
+def mount_for(path: str) -> dict[str, str]:
+    best: dict[str, str] = {}
+    try:
+        with open("/proc/self/mountinfo", "r", encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                fields = line.rstrip("\n").split(" ")
+                if "-" not in fields or len(fields) < 10:
+                    continue
+                separator = fields.index("-")
+                mountpoint = fields[4].replace("\\040", " ").replace("\\011", "\t")
+                candidate = normalized_path(mountpoint)
+                absolute = normalized_path(path)
+                if absolute != candidate and not absolute.startswith(candidate.rstrip(os.sep) + os.sep):
+                    continue
+                if not best or len(candidate) > len(best["mountpoint"]):
+                    best = {
+                        "mountpoint": display_text(candidate),
+                        "filesystem": fields[separator + 1] if separator + 1 < len(fields) else "",
+                        "source": fields[separator + 2] if separator + 2 < len(fields) else "",
+                        "options": fields[5],
+                    }
+    except OSError:
+        pass
+    return best
+
+
+def xattrs_for(path: str) -> list[dict[str, str]]:
+    output: list[dict[str, str]] = []
+    try:
+        names = os.listxattr(path, follow_symlinks=False)
+    except OSError:
+        return output
+    for name in names[:128]:
+        value = b""
+        try:
+            value = os.getxattr(path, name, follow_symlinks=False)[:4096]
+        except OSError:
+            pass
+        try:
+            rendered = value.decode("utf-8")
+            encoding = "utf-8"
+        except UnicodeDecodeError:
+            rendered = base64.b64encode(value).decode("ascii")
+            encoding = "base64"
+        output.append({"name": display_text(name), "value": rendered, "encoding": encoding})
+    return output
+
+
+def parse_gio_attributes(raw: str) -> dict[str, str]:
+    attributes: dict[str, str] = {}
+    in_attributes = False
+    for line in raw.splitlines():
+        if line.strip() == "attributes:":
+            in_attributes = True
+            continue
+        if not in_attributes:
+            continue
+        stripped = line.strip()
+        if not stripped or ": " not in stripped:
+            continue
+        key, _, value = stripped.partition(": ")
+        if "::" in key:
+            attributes[key] = value
+    return attributes
+
+
+def properties_command(args: argparse.Namespace) -> dict[str, Any]:
+    path = path_from_args(args)
+    info = safe_stat(path)
+    mode = info.st_mode
+    symlink_target = ""
+    if stat.S_ISLNK(mode):
+        try:
+            symlink_target = display_text(os.readlink(path))
+        except OSError:
+            pass
+    birth = getattr(info, "st_birthtime", None)
+    mount = mount_for(path)
+    try:
+        usage = shutil.disk_usage(path if os.path.isdir(path) else os.path.dirname(path))
+        filesystem_usage = {
+            "total": usage.total,
+            "used": usage.used,
+            "free": usage.free,
+            "totalText": human_size(usage.total),
+            "freeText": human_size(usage.free),
+        }
+    except OSError:
+        filesystem_usage = {}
+    acl_code, acl, _ = run_bounded(["getfacl", "-cp", "--", path], limit=32768)
+    attr_code, attrs, _ = run_bounded(["lsattr", "-d", "--", path], limit=8192)
+    gio_code, gio, _ = run_bounded(
+        ["gio", "info", "-a", "standard::*,time::*,unix::*,filesystem::*", "--", path],
+        limit=65536,
+    )
+    gio_attributes = parse_gio_attributes(gio) if gio_code == 0 else {}
+    content_type = gio_attributes.get("standard::content-type", "")
+    created_epoch = gio_attributes.get("time::created", "")
+    if birth is None and created_epoch:
+        try:
+            birth = float(created_epoch)
+        except ValueError:
+            pass
+    git = git_context(path)
+    child_count: int | None = None
+    if os.path.isdir(path):
+        try:
+            with os.scandir(path) as iterator:
+                child_count = sum(1 for _ in iterator)
+        except OSError:
+            pass
+    properties = {
+        "name": display_text(os.path.basename(path) or path),
+        "path": display_text(path),
+        "token": encode_path(path),
+        "uri": uri_for(path),
+        "kind": file_kind(mode),
+        "mime": content_type or mime_for(path, mode),
+        "size": info.st_size,
+        "sizeText": human_size(info.st_size),
+        "allocatedSize": getattr(info, "st_blocks", 0) * 512,
+        "allocatedSizeText": human_size(getattr(info, "st_blocks", 0) * 512),
+        "permissions": stat.filemode(mode),
+        "mode": f"{stat.S_IMODE(mode):04o}",
+        "owner": uid_name(info.st_uid),
+        "ownerId": info.st_uid,
+        "group": gid_name(info.st_gid),
+        "groupId": info.st_gid,
+        "inode": info.st_ino,
+        "device": info.st_dev,
+        "hardLinks": info.st_nlink,
+        "accessed": iso_time(info.st_atime),
+        "modified": iso_time(info.st_mtime),
+        "metadataChanged": iso_time(info.st_ctime),
+        "created": iso_time(birth),
+        "isReadable": os.access(path, os.R_OK),
+        "isWritable": os.access(path, os.W_OK),
+        "isExecutable": os.access(path, os.X_OK),
+        "isSymlink": stat.S_ISLNK(mode),
+        "symlinkTarget": symlink_target,
+        "resolvedPath": display_text(os.path.realpath(path)),
+        "children": child_count,
+        "mount": mount,
+        "filesystemUsage": filesystem_usage,
+        "xattrs": xattrs_for(path),
+        "acl": acl if acl_code == 0 else "",
+        "fileAttributes": attrs.strip() if attr_code == 0 else "",
+        "gio": gio if gio_code == 0 else "",
+        "gioAttributes": gio_attributes,
+        "git": {
+            "root": git.get("root", ""),
+            "branch": git.get("branch", ""),
+            "status": status_for(path, git),
+        },
+    }
+    metadata_store = load_metadata_store()
+    metadata = item_metadata(metadata_store, encode_path(path))
+    try:
+        knowledge_agents = registered_knowledge_agents(metadata_store, path)
+        registered_knowledge = True
+    except QuickfileError as exc:
+        if exc.code != "knowledge-not-registered":
+            raise
+        knowledge_agents = []
+        registered_knowledge = False
+    properties.update({
+        "color": str(metadata.get("color", "")),
+        "note": str(metadata.get("note", "")),
+        "starred": metadata.get("starred") is True,
+        "registeredKnowledge": registered_knowledge,
+        "knowledgeAgents": knowledge_agents,
+    })
+    return {"ok": True, "properties": properties}
+
+
+def metadata_command(args: argparse.Namespace) -> dict[str, Any]:
+    path = path_from_args(args)
+    safe_stat(path)
+    color = getattr(args, "color", None)
+    note = getattr(args, "note", None)
+    starred_text = getattr(args, "starred", None)
+    knowledge_text = getattr(args, "knowledge", None)
+    agents_json = getattr(args, "agents_json", None)
+    if (
+        color is None
+        and note is None
+        and starred_text is None
+        and knowledge_text is None
+        and agents_json is None
+    ):
+        raise QuickfileError("No metadata change was requested", "metadata-empty")
+    if (
+        color is not None
+        and color != ""
+        and color not in COLOR_KEYS
+        and not re.fullmatch(r"#[0-9A-Fa-f]{6}", color)
+    ):
+        raise QuickfileError(
+            "Color must be a theme color, empty, or #RRGGBB",
+            "metadata-invalid-color",
+        )
+    if note is not None:
+        if "\x00" in note:
+            raise QuickfileError("A note cannot contain a NUL byte", "metadata-invalid-note")
+        if len(note) > NOTE_LENGTH_LIMIT:
+            raise QuickfileError(
+                f"A note cannot exceed {NOTE_LENGTH_LIMIT} characters",
+                "metadata-note-too-long",
+            )
+    agents: list[str] | None = None
+    if agents_json is not None:
+        try:
+            raw_agents = json.loads(agents_json)
+        except json.JSONDecodeError as exc:
+            raise QuickfileError(
+                "Knowledge agents must be a JSON list",
+                "metadata-invalid-agents",
+            ) from exc
+        if not isinstance(raw_agents, list) or len(raw_agents) > len(KNOWLEDGE_AGENT_ORDER):
+            raise QuickfileError(
+                "Knowledge agents must be a JSON list of supported agents",
+                "metadata-invalid-agents",
+            )
+        selected: set[str] = set()
+        for agent in raw_agents:
+            if not isinstance(agent, str) or agent not in KNOWLEDGE_AGENT_KEYS:
+                raise QuickfileError(
+                    "Unsupported knowledge agent",
+                    "metadata-invalid-agents",
+                )
+            selected.add(agent)
+        agents = [agent for agent in KNOWLEDGE_AGENT_ORDER if agent in selected]
+    if knowledge_text == "true" and not os.path.isfile(path):
+        raise QuickfileError(
+            "Only files can be added to Knowledge",
+            "knowledge-file-required",
+        )
+
+    store = load_metadata_store()
+    items = store["items"]
+    token = encode_path(path)
+    record = dict(item_metadata(store, token))
+    if color is not None:
+        record["color"] = color.lower()
+    if note is not None:
+        record["note"] = note
+    if starred_text is not None:
+        starred = starred_text == "true"
+        if starred and record.get("starred") is not True:
+            record["starredAt"] = iso_time(time.time())
+        record["starred"] = starred
+    if knowledge_text is not None:
+        registered = knowledge_text == "true"
+        record["knowledge"] = registered
+        if not registered:
+            record.pop("agents", None)
+    if agents is not None:
+        if knowledge_text != "false":
+            record["agents"] = agents
+    record["path"] = display_text(path)
+    record["updatedAt"] = iso_time(time.time())
+    if (
+        not record.get("color")
+        and not record.get("note")
+        and record.get("starred") is not True
+        and record.get("knowledge") is not True
+    ):
+        items.pop(token, None)
+        record = {}
+    else:
+        items[token] = record
+    save_metadata_store(store)
+    return {
+        "ok": True,
+        "action": "metadata",
+        "message": "Metadata saved",
+        "metadata": {
+            "color": str(record.get("color", "")),
+            "note": str(record.get("note", "")),
+            "starred": record.get("starred") is True,
+            "registeredKnowledge": record.get("knowledge") is True,
+            "knowledgeAgents": [
+                agent for agent in record.get("agents", [])
+                if isinstance(agent, str) and agent in KNOWLEDGE_AGENT_KEYS
+            ] if isinstance(record.get("agents", []), list) else [],
+        },
+    }
+
+
+def rebase_metadata_records(store: dict[str, Any], source: str, target: str) -> bool:
+    items = store.get("items", {})
+    source = normalized_path(source)
+    target = normalized_path(target)
+    changed = False
+    replacements: list[tuple[str, str, dict[str, Any]]] = []
+    prefix = source.rstrip(os.sep) + os.sep
+    for token, raw in list(items.items()):
+        if not isinstance(raw, dict):
+            continue
+        try:
+            stored_path = normalized_path(decode_path(str(token)))
+        except QuickfileError:
+            continue
+        if stored_path == source:
+            rebased = target
+        elif stored_path.startswith(prefix):
+            rebased = target.rstrip(os.sep) + stored_path[len(source):]
+        else:
+            continue
+        record = dict(raw)
+        record["path"] = display_text(rebased)
+        record["updatedAt"] = iso_time(time.time())
+        replacements.append((str(token), encode_path(rebased), record))
+    for old_token, new_token, record in replacements:
+        items.pop(old_token, None)
+        items[new_token] = record
+        changed = True
+    return changed
+
+
+def require_name(name: str) -> str:
+    if not name or name in {".", ".."} or os.sep in name or "\x00" in name:
+        raise QuickfileError("Invalid filename", "invalid-name")
+    return name
+
+
+def destination_from_args(args: argparse.Namespace) -> str:
+    token = getattr(args, "destination_token", None)
+    value = getattr(args, "destination", None)
+    if token:
+        return normalized_path(decode_path(token))
+    if value:
+        return normalized_path(value)
+    raise QuickfileError("A destination path is required", "missing-destination")
+
+
+def action_paths_from_args(args: argparse.Namespace) -> list[str]:
+    raw = getattr(args, "path_tokens_json", None)
+    if raw is None:
+        return [path_from_args(args)]
+    try:
+        tokens = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise QuickfileError("Invalid selected-path list", "invalid-path-list") from exc
+    if not isinstance(tokens, list) or not tokens or len(tokens) > 500:
+        raise QuickfileError("Select between 1 and 500 items", "invalid-path-list")
+    paths: list[str] = []
+    seen: set[str] = set()
+    for token in tokens:
+        if not isinstance(token, str):
+            raise QuickfileError("Invalid selected-path list", "invalid-path-list")
+        path = normalized_path(decode_path(token))
+        if path not in seen:
+            seen.add(path)
+            paths.append(path)
+    return paths
+
+
+def keep_both_path(path: str, *, directory: bool) -> str:
+    if not os.path.lexists(path):
+        return path
+    parent = os.path.dirname(path)
+    name = os.path.basename(path)
+    if directory:
+        stem, suffix = name, ""
+    else:
+        stem, suffix = os.path.splitext(name)
+    candidate = os.path.join(parent, f"{stem} (copy){suffix}")
+    number = 2
+    while os.path.lexists(candidate):
+        candidate = os.path.join(parent, f"{stem} (copy {number}){suffix}")
+        number += 1
+    return candidate
+
+
+def transfer_path(source: str, destination_dir: str, *, move: bool) -> tuple[str, bool]:
+    if not os.path.isdir(destination_dir):
+        raise QuickfileError("Destination is not a directory", "not-a-directory")
+    source = normalized_path(source)
+    destination_dir = normalized_path(destination_dir)
+    if move and os.path.dirname(source) == destination_dir:
+        return source, False
+
+    source_is_link = os.path.islink(source)
+    source_is_dir = os.path.isdir(source) and not source_is_link
+    if source_is_dir:
+        try:
+            common = os.path.commonpath((os.path.realpath(source), os.path.realpath(destination_dir)))
+        except ValueError:
+            common = ""
+        if common == os.path.realpath(source):
+            raise QuickfileError("A folder cannot be copied or moved into itself", "recursive-transfer")
+
+    target = keep_both_path(
+        os.path.join(destination_dir, os.path.basename(source)),
+        directory=source_is_dir,
+    )
+    if move:
+        shutil.move(source, target)
+    elif source_is_link:
+        os.symlink(os.readlink(source), target)
+        try:
+            shutil.copystat(source, target, follow_symlinks=False)
+        except OSError:
+            pass
+    elif source_is_dir:
+        shutil.copytree(source, target, symlinks=True, copy_function=shutil.copy2)
+    elif os.path.isfile(source):
+        shutil.copy2(source, target, follow_symlinks=False)
+    else:
+        raise QuickfileError("This special file type cannot be copied", "unsupported-file-type")
+    return target, True
+
+
+def action_command(args: argparse.Namespace) -> dict[str, Any]:
+    action = args.action
+    paths = action_paths_from_args(args)
+    path = paths[0]
+    if len(paths) > 1 and action not in {"copy", "move", "trash", "duplicate"}:
+        raise QuickfileError(f"{action} only supports one item", "single-item-action")
+    if action == "open":
+        process = subprocess.Popen(
+            ["gio", "open", path],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return {"ok": True, "action": action, "pid": process.pid}
+    if action == "reveal":
+        target = path if os.path.isdir(path) else os.path.dirname(path)
+        process = subprocess.Popen(
+            ["gio", "open", target],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return {"ok": True, "action": action, "pid": process.pid}
+    if action == "preview":
+        if os.path.isdir(path):
+            raise QuickfileError("Select a file to preview", "preview-directory")
+        if not os.path.exists(path):
+            raise QuickfileError("The selected file no longer exists", "missing-path")
+        executable = shutil.which("sushi")
+        if not executable:
+            raise QuickfileError("GNOME Sushi is not installed", "preview-unavailable")
+        process = subprocess.Popen(
+            [executable, path],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return {
+            "ok": True,
+            "action": action,
+            "message": "QuickView opened",
+            "pid": process.pid,
+        }
+    if action == "copy-path":
+        executable = shutil.which("wl-copy")
+        if not executable:
+            raise QuickfileError("wl-copy is not installed", "clipboard-unavailable")
+        try:
+            result = subprocess.run(
+                [
+                    executable,
+                    "--type",
+                    "text/plain;charset=utf-8",
+                    display_text(path),
+                ],
+                stdout=subprocess.DEVNULL,
+                # wl-copy forks a background clipboard owner. A PIPE here is
+                # inherited by that child, so subprocess.run() waits forever
+                # for EOF even though the launcher has already exited.
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise QuickfileError(str(exc), "clipboard-failed") from exc
+        if result.returncode != 0:
+            raise QuickfileError("Could not copy the path", "clipboard-failed")
+        return {"ok": True, "action": action, "message": "Path copied"}
+    if action == "trash":
+        code, _, error = run_bounded(["gio", "trash", "--", *paths], timeout=30)
+        if code != 0:
+            raise QuickfileError(error.strip() or "Could not move item to Trash", "trash-failed")
+        return {
+            "ok": True,
+            "action": action,
+            "message": "Moved to Trash" if len(paths) == 1 else f"Moved {len(paths)} items to Trash",
+        }
+    if action in {"mkdir", "touch"}:
+        if not os.path.isdir(path):
+            raise QuickfileError("Parent is not a directory", "not-a-directory")
+        target = os.path.join(path, require_name(args.name or ""))
+        if action == "mkdir":
+            os.mkdir(target)
+        else:
+            fd = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            os.close(fd)
+        return {"ok": True, "action": action, "path": display_text(target), "token": encode_path(target)}
+    if action == "rename":
+        target = os.path.join(os.path.dirname(path), require_name(args.name or ""))
+        os.rename(path, target)
+        metadata = load_metadata_store()
+        if rebase_metadata_records(metadata, path, target):
+            save_metadata_store(metadata)
+        return {"ok": True, "action": action, "path": display_text(target), "token": encode_path(target)}
+    if action in {"copy", "move"}:
+        destination = destination_from_args(args)
+        results: list[dict[str, Any]] = []
+        metadata = load_metadata_store() if action == "move" else None
+        for source in paths:
+            target, changed = transfer_path(source, destination, move=action == "move")
+            results.append({
+                "sourceToken": encode_path(source),
+                "path": display_text(target),
+                "token": encode_path(target),
+                "changed": changed,
+            })
+            if changed and metadata is not None and rebase_metadata_records(metadata, source, target):
+                # Persist after every move so an unrelated later failure cannot
+                # orphan notes, colors, or favorites already moved on disk.
+                save_metadata_store(metadata)
+        changed_count = sum(1 for result in results if result["changed"])
+        if changed_count == 0:
+            message = "Already in this folder"
+        elif len(results) == 1:
+            message = "Moved" if action == "move" else "Copied"
+        else:
+            message = f"{'Moved' if action == 'move' else 'Copied'} {changed_count} items"
+        return {
+            "ok": True,
+            "action": action,
+            "changed": changed_count > 0,
+            "message": message,
+            "path": results[0]["path"],
+            "token": results[0]["token"],
+            "results": results,
+        }
+    if action == "duplicate":
+        results = []
+        for source in paths:
+            target, _ = transfer_path(source, os.path.dirname(source), move=False)
+            results.append({"path": display_text(target), "token": encode_path(target)})
+        return {
+            "ok": True,
+            "action": action,
+            "message": "Duplicated" if len(results) == 1 else f"Duplicated {len(results)} items",
+            "path": results[0]["path"],
+            "token": results[0]["token"],
+            "results": results,
+        }
+    raise QuickfileError(f"Unsupported action: {action}", "unsupported-action")
+
+
+def add_path_arguments(parser: argparse.ArgumentParser) -> None:
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--path")
+    group.add_argument("--path-token")
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(prog="quickfile", description=__doc__)
+    root.add_argument("--version", action="version", version=VERSION)
+    subcommands = root.add_subparsers(dest="command", required=True)
+
+    tree = subcommands.add_parser("tree", help="Return a bounded, expanded filesystem tree")
+    add_path_arguments(tree)
+    tree.add_argument("--expanded", action="append", default=[])
+    tree.add_argument("--show-hidden", action="store_true")
+    tree.add_argument("--no-git", action="store_true")
+    tree.add_argument("--max-depth", type=int, default=12)
+    tree.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
+
+    search = subcommands.add_parser("search", help="Recursively search below a root")
+    add_path_arguments(search)
+    search.add_argument("--query", required=True)
+    search.add_argument("--mode", choices=("contains", "exact", "prefix", "suffix", "regex", "fuzzy"), default="fuzzy")
+    search.add_argument("--case-sensitive", action="store_true")
+    search.add_argument("--show-hidden", action="store_true")
+    search.add_argument("--no-git", action="store_true")
+    search.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
+    search.add_argument("--scan-limit", type=int, default=100000)
+    search.add_argument("--timeout", type=float, default=5.0)
+    search.add_argument("--content-file-limit", type=int, default=DEFAULT_CONTENT_FILE_LIMIT)
+    search.add_argument("--content-byte-limit", type=int, default=DEFAULT_CONTENT_BYTE_LIMIT)
+
+    properties = subcommands.add_parser("properties", help="Return filesystem metadata")
+    add_path_arguments(properties)
+
+    subcommands.add_parser(
+        "volumes", help="List external and removable storage volumes"
+    )
+
+    volume_action = subcommands.add_parser(
+        "volume-action", help="Mount or unmount one discovered external volume"
+    )
+    volume_action.add_argument("action", choices=("mount", "unmount"))
+    volume_action.add_argument("--device", required=True)
+
+    knowledge = subcommands.add_parser(
+        "knowledge", help="Index agent instruction files that apply to a directory"
+    )
+    add_path_arguments(knowledge)
+    knowledge.add_argument("--limit", type=int, default=KNOWLEDGE_LIMIT)
+
+    knowledge_links = subcommands.add_parser(
+        "knowledge-links",
+        help="Preview or create non-overwriting agent configuration symlinks",
+    )
+    source_group = knowledge_links.add_mutually_exclusive_group(required=True)
+    source_group.add_argument("--source")
+    source_group.add_argument("--source-token")
+    root_group = knowledge_links.add_mutually_exclusive_group(required=True)
+    root_group.add_argument("--root")
+    root_group.add_argument("--root-token")
+    knowledge_links.add_argument("--apply", action="store_true")
+
+    metadata = subcommands.add_parser(
+        "metadata", help="Save Quickfile color, note, favorite, and Knowledge state"
+    )
+    add_path_arguments(metadata)
+    metadata.add_argument("--color")
+    metadata.add_argument("--note")
+    metadata.add_argument("--starred", choices=("true", "false"))
+    metadata.add_argument("--knowledge", choices=("true", "false"))
+    metadata.add_argument("--agents-json")
+
+    action = subcommands.add_parser("action", help="Perform one explicit filesystem action")
+    action.add_argument("action", choices=(
+        "open", "reveal", "preview", "copy-path", "trash", "mkdir", "touch", "rename",
+        "copy", "move", "duplicate",
+    ))
+    add_path_arguments(action)
+    action.add_argument("--path-tokens-json")
+    action.add_argument("--name")
+    destination = action.add_mutually_exclusive_group()
+    destination.add_argument("--destination")
+    destination.add_argument("--destination-token")
+    return root
+
+
+def main(argv: Iterable[str] | None = None) -> int:
+    args = parser().parse_args(list(argv) if argv is not None else None)
+    try:
+        if args.command == "tree":
+            result = tree_command(args)
+        elif args.command == "search":
+            result = search_command(args)
+        elif args.command == "properties":
+            result = properties_command(args)
+        elif args.command == "volumes":
+            result = volumes_command(args)
+        elif args.command == "volume-action":
+            result = volume_action_command(args)
+        elif args.command == "knowledge":
+            result = knowledge_command(args)
+        elif args.command == "knowledge-links":
+            result = knowledge_links_command(args)
+        elif args.command == "metadata":
+            result = metadata_command(args)
+        else:
+            result = action_command(args)
+        json_print(result)
+        return 0
+    except QuickfileError as exc:
+        json_print({"ok": False, "error": str(exc), "code": exc.code})
+        return 2
+    except FileExistsError as exc:
+        json_print({"ok": False, "error": str(exc), "code": "already-exists"})
+        return 3
+    except PermissionError as exc:
+        json_print({"ok": False, "error": str(exc), "code": "permission-denied"})
+        return 4
+    except OSError as exc:
+        json_print({"ok": False, "error": str(exc), "code": "filesystem-error"})
+        return 5
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

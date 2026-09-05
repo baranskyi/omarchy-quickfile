@@ -1,0 +1,254 @@
+#!/usr/bin/python3
+"""GIO filesystem/volume events for Quickfile; newline JSON in and out.
+
+Configs contain URL-safe base64 path tokens in `directories` and `files`.
+Directory watches are shallow. File watches use their parent so atomic saves
+do not detach them; missing paths watch the nearest existing ancestor. Nothing
+is polled while idle. Closing stdin shuts down every monitor.
+"""
+
+from __future__ import annotations
+
+import base64
+import binascii
+import json
+import os
+import sys
+from urllib.parse import quote_from_bytes, unquote_to_bytes, urlsplit
+
+
+PATH_LIMIT = 4096
+CONFIG_BYTE_LIMIT = 1024 * 1024
+COALESCE_MS = 250
+
+
+def emit(event: str, **details: object) -> None:
+    print(json.dumps({"event": event, **details}, ensure_ascii=True), flush=True)
+
+
+try:
+    import gi
+
+    gi.require_version("Gio", "2.0")
+    from gi.repository import Gio, GLib
+except (ImportError, ValueError):
+    emit("error", error="Filesystem monitoring requires python-gobject (GIO)")
+    sys.exit(1)
+
+
+def decode_token(token: object) -> str:
+    if not isinstance(token, str) or not token or len(token) > 32768:
+        raise ValueError("Invalid watch path token")
+    try:
+        raw = base64.b64decode(token + "=" * (-len(token) % 4), altchars=b"-_", validate=True)
+    except (ValueError, UnicodeError, binascii.Error) as exc:
+        raise ValueError("Invalid watch path token") from exc
+    if b"\0" in raw or not raw.startswith(b"/"):
+        raise ValueError("Watch paths must be absolute and contain no NUL")
+    return os.path.normpath(os.fsdecode(raw))
+
+
+def gio_file(path: str):
+    # URI conversion preserves filenames with non-UTF-8 Linux bytes as well.
+    return Gio.File.new_for_uri("file://" + quote_from_bytes(os.fsencode(path), safe="/"))
+
+
+def event_path(file) -> str:
+    return os.path.normpath(os.fsdecode(unquote_to_bytes(urlsplit(file.get_uri()).path)))
+
+
+def is_ancestor(path: str, descendant: str) -> bool:
+    return descendant.startswith(path.rstrip(os.sep) + os.sep)
+
+
+class Watcher:
+    def __init__(self) -> None:
+        self.loop = GLib.MainLoop()
+        self.paths: dict[str, set[str]] = {"directories": set(), "files": set()}
+        self.monitors: dict[str, tuple[object, tuple[int, int]]] = {}
+        self.rules: dict[str, tuple[bool, set[str]]] = {}
+        self.pending: dict[str, int] = {}
+        self.buffer = b""
+        self.last_error = ""
+        self.volume_monitor = Gio.VolumeMonitor.get()
+        for signal in (
+            "mount-added", "mount-removed", "mount-changed",
+            "volume-added", "volume-removed", "volume-changed",
+            "drive-connected", "drive-disconnected", "drive-changed",
+        ):
+            self.volume_monitor.connect(signal, lambda *_: self.queue("volumes"))
+
+    def error(self, message: str) -> None:
+        message = message[:240]
+        if message != self.last_error:
+            self.last_error = message
+            emit("error", error=message)
+
+    def queue(self, kind: str) -> None:
+        # Fixed windows rather than a trailing debounce: continuous changes
+        # cannot postpone an update forever.
+        if kind not in self.pending:
+            self.pending[kind] = GLib.timeout_add(COALESCE_MS, self.flush, kind)
+
+    def flush(self, kind: str) -> bool:
+        self.pending.pop(kind, None)
+        if kind == "changed":
+            self.reconcile()
+        emit(kind)
+        return GLib.SOURCE_REMOVE
+
+    def changed(self, _monitor, file, other_file, event, monitored: str) -> None:
+        rule = self.rules.get(monitored)
+        if rule is None:
+            return
+        structural = event in (
+            Gio.FileMonitorEvent.CREATED, Gio.FileMonitorEvent.DELETED,
+            Gio.FileMonitorEvent.MOVED, Gio.FileMonitorEvent.RENAMED,
+            Gio.FileMonitorEvent.MOVED_IN, Gio.FileMonitorEvent.MOVED_OUT,
+            Gio.FileMonitorEvent.UNMOUNTED,
+        )
+        if not structural and event not in (
+            Gio.FileMonitorEvent.CHANGED, Gio.FileMonitorEvent.CHANGES_DONE_HINT,
+            Gio.FileMonitorEvent.ATTRIBUTE_CHANGED,
+        ):
+            return
+        broad, interests = rule
+        try:
+            changed_paths = [event_path(item) for item in (file, other_file) if item is not None]
+        except (ValueError, UnicodeError):
+            self.error("Could not decode a filesystem event")
+            return
+        for path in changed_paths:
+            if broad and (path == monitored or os.path.dirname(path) == monitored):
+                self.queue("changed")
+                return
+            if any(path == target or (structural and is_ancestor(path, target)) for target in interests):
+                self.queue("changed")
+                return
+
+    def reconcile(self) -> bool:
+        rules: dict[str, tuple[bool, set[str]]] = {}
+
+        def add(directory: str, target: str, broad: bool = False) -> None:
+            candidate = directory
+            while not os.path.isdir(candidate):
+                parent = os.path.dirname(candidate)
+                if parent == candidate:
+                    raise OSError("No accessible ancestor for a watch path")
+                candidate = parent
+            previous_broad, targets = rules.setdefault(candidate, (False, set()))
+            targets.add(target)
+            rules[candidate] = (previous_broad or (broad and candidate == directory), targets)
+
+        added: dict[str, tuple[object, tuple[int, int]]] = {}
+        try:
+            for directory in self.paths["directories"]:
+                add(directory, directory, broad=True)
+                # Watching the parent also catches renaming/replacing the
+                # watched directory, including recreation at the same path.
+                if directory != os.sep:
+                    add(os.path.dirname(directory), directory)
+            for file in self.paths["files"]:
+                add(os.path.dirname(file), file)
+            if len(rules) > PATH_LIMIT * 2:
+                raise ValueError("Too many filesystem monitors")
+            for path in rules:
+                info = os.stat(path)
+                identity = (info.st_dev, info.st_ino)
+                previous = self.monitors.get(path)
+                if previous is not None and previous[1] == identity and not previous[0].is_cancelled():
+                    continue
+                monitor = gio_file(path).monitor_directory(Gio.FileMonitorFlags.WATCH_MOVES, None)
+                monitor.set_rate_limit(50)
+                monitor.connect("changed", self.changed, path)
+                added[path] = (monitor, identity)
+        except (GLib.Error, OSError, ValueError, UnicodeError) as exc:
+            for monitor, _ in added.values():
+                monitor.cancel()
+            self.error("Could not install filesystem watches: " + str(exc))
+            return False
+        # New monitors exist before old ones are cancelled: unchanged watched
+        # paths have no blind interval during a backend refresh.
+        self.rules = rules
+        for path, (monitor, _) in list(self.monitors.items()):
+            if path not in rules or path in added:
+                monitor.cancel()
+                del self.monitors[path]
+        self.monitors.update(added)
+        return True
+
+    def configure(self, line: bytes) -> None:
+        try:
+            payload = json.loads(line)
+            if not isinstance(payload, dict):
+                raise ValueError("Watch config must be an object")
+            paths: dict[str, set[str]] = {}
+            count = 0
+            for key in ("directories", "files"):
+                tokens = payload.get(key, [])
+                if not isinstance(tokens, list):
+                    raise ValueError("Watch paths must be arrays")
+                count += len(tokens)
+                if count > PATH_LIMIT:
+                    raise ValueError("Too many watch paths (maximum 4096)")
+                paths[key] = {decode_token(token) for token in tokens}
+        except (ValueError, UnicodeError) as exc:
+            self.error("Invalid filesystem watch configuration: " + str(exc))
+            return
+        previous = self.paths
+        self.paths = paths
+        if not self.reconcile():
+            self.paths = previous
+            return
+        if not any(paths.values()) and "changed" in self.pending:
+            GLib.source_remove(self.pending.pop("changed"))
+        self.last_error = ""
+        emit("ready")
+
+    def read_input(self, _channel, condition) -> bool:
+        try:
+            chunk = os.read(sys.stdin.fileno(), 65536)
+        except BlockingIOError:
+            return GLib.SOURCE_CONTINUE
+        except OSError:
+            self.loop.quit()
+            return GLib.SOURCE_REMOVE
+        if not chunk:
+            self.loop.quit()
+            return GLib.SOURCE_REMOVE
+        self.buffer += chunk
+        while b"\n" in self.buffer:
+            line, self.buffer = self.buffer.split(b"\n", 1)
+            if len(line) > CONFIG_BYTE_LIMIT:
+                self.error("Filesystem watch configuration exceeds 1 MiB")
+                self.loop.quit()
+                return GLib.SOURCE_REMOVE
+            if line.strip():
+                self.configure(line)
+        if len(self.buffer) > CONFIG_BYTE_LIMIT:
+            self.error("Filesystem watch configuration exceeds 1 MiB")
+            self.loop.quit()
+            return GLib.SOURCE_REMOVE
+        return GLib.SOURCE_CONTINUE
+
+    def run(self) -> None:
+        os.set_blocking(sys.stdin.fileno(), False)
+        GLib.io_add_watch(
+            sys.stdin.fileno(), GLib.PRIORITY_DEFAULT,
+            GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, self.read_input,
+        )
+        try:
+            self.loop.run()
+        finally:
+            for monitor, _ in self.monitors.values():
+                monitor.cancel()
+
+
+if __name__ == "__main__":
+    try:
+        Watcher().run()
+    except BrokenPipeError:
+        sys.exit(0)
+    except (GLib.Error, OSError, ValueError) as exc:
+        emit("error", error=("Filesystem watcher failed: " + str(exc))[:240])
+        sys.exit(1)

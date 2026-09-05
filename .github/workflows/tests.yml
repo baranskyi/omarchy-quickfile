@@ -1,0 +1,18 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  backend-and-watchers:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native file monitoring dependencies
+        run: sudo apt-get update && sudo apt-get install -y python3-gi gir1.2-glib-2.0 dbus
+      - name: Test backend and real filesystem events
+        run: dbus-run-session -- /usr/bin/python3 -m unittest discover -s tests -v

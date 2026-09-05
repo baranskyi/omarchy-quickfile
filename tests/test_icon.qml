@@ -18,6 +18,8 @@ ShellRoot {
       anchors.centerIn: parent
       iconSize: 32
       color: "#ffb16c"
+      activeBackgroundColor: "#f5ead8"
+      activeForegroundColor: "#081a2c"
     }
   }
 
@@ -36,7 +38,33 @@ ShellRoot {
           Qt.exit(1)
           return
         }
-        console.log("QUICKFILE_TESTS_PASSED icon: circuit-tree rendered at 32 px")
+        if (String(icon.inkColor) !== "#ffb16c") {
+          console.error("QUICKFILE_TESTS_FAILED icon: inactive color lost")
+          Qt.exit(1)
+          return
+        }
+        icon.active = true
+        activeCapture.start()
+      })
+    }
+  }
+
+  Timer {
+    id: activeCapture
+    interval: 220
+    onTriggered: {
+      if (String(icon.inkColor) !== "#081a2c") {
+        console.error("QUICKFILE_TESTS_FAILED icon: active contrast lost")
+        Qt.exit(1)
+        return
+      }
+      icon.grabToImage(function(result) {
+        if (!result || String(result.url).length === 0) {
+          console.error("QUICKFILE_TESTS_FAILED icon: active render failed")
+          Qt.exit(1)
+          return
+        }
+        console.log("QUICKFILE_TESTS_PASSED icon: inactive and active states rendered")
         Qt.quit()
       })
     }

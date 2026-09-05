@@ -31,13 +31,17 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
+    useActiveColor: false
     iconComponent: Component {
       Item {
         QuickFileIcon {
           anchors.centerIn: parent
           iconSize: Math.round(Style.bar.iconFont * 0.82)
-          color: button.active && button.useActiveColor
-            ? button.activeColor : button.foreground
+          color: button.foreground
+          active: button.active
+          activeBackgroundColor: button.foreground
+          activeForegroundColor: root.bar
+            ? root.bar.background : Color.background
         }
       }
     }

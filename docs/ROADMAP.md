@@ -1,4 +1,4 @@
-# Quickfile roadmap
+# QuickFile roadmap
 
 ## 0.1 — filesystem blade (complete)
 

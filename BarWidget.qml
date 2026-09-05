@@ -33,7 +33,7 @@ BarWidget {
     bar: root.bar
     text: "󰉋"
     active: root.opened
-    tooltipText: root.opened ? "Close Quickfile" : "Open Quickfile"
+    tooltipText: root.opened ? "Close QuickFile" : "Open QuickFile"
 
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.MiddleButton && root.quickfile)

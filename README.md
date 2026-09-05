@@ -1,15 +1,15 @@
-# Omarchy Quickfile
+# QuickFile
 
-An IDE-like filesystem blade for the Omarchy desktop. Quickfile lives inside
+An IDE-like filesystem blade for the Omarchy desktop. QuickFile lives inside
 `omarchy-shell`: it opens from the bar or `SUPER+B`, follows the active monitor,
 and uses the current Omarchy theme automatically.
 
 The blade participates in Hyprland's usable workspace instead of covering it:
-opening Quickfile reserves space on the left and smoothly pushes tiled windows
+opening QuickFile reserves space on the left and smoothly pushes tiled windows
 aside. After a short focus handoff it uses on-demand keyboard focus, so the rest
 of the desktop remains interactive.
 
-This repository is an early working implementation inspired by the FileBlade
+QuickFile is an independent open-source project inspired by the FileBlade
 concept. It does not depend on or copy unreleased FileBlade source code.
 
 ## Working now
@@ -82,7 +82,7 @@ concept. It does not depend on or copy unreleased FileBlade source code.
 
 | Input | Action |
 | --- | --- |
-| `SUPER+B` | Toggle Quickfile |
+| `SUPER+B` | Toggle QuickFile |
 | `Esc` | Clear/leave search, then close |
 | `↑` / `↓`, `J` / `K` | Move selection |
 | `Shift+↑` / `Shift+↓` | Extend a contiguous selection |
@@ -97,7 +97,7 @@ concept. It does not depend on or copy unreleased FileBlade source code.
 | `Ctrl+R` | Refresh |
 | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy / cut / paste selected items |
 | `Ctrl+D` | Duplicate selected items |
-| `Ctrl+Z` | Undo the latest reversible Quickfile operation |
+| `Ctrl+Z` | Undo the latest reversible QuickFile operation |
 | `Space` | Preview the hovered item, otherwise the selected item, in the blade |
 | `Shift+Space` | Open the hovered/selected file in Sushi QuickView |
 | `Ctrl+click` | Toggle one item in the selection |
@@ -118,7 +118,7 @@ The palette button in the top-right corner reopens this inspector after it has
 been collapsed. Hover is only a preview highlight; selection remains on the
 item you clicked.
 
-Quickfile watches the displayed directories, search scope, relevant Git files,
+QuickFile watches the displayed directories, search scope, relevant Git files,
 and Knowledge sources through GIO. Changes are grouped into short batches and
 applied to existing rows; unchanged data does not rebuild the view. Background
 updates preserve the viewport, selection and unsaved inspector drafts and do
@@ -128,7 +128,7 @@ its bounded watch limit is exceeded, a silent 30-second fallback keeps data fres
 
 External drives appear automatically in `DEVICES`. Click a mounted drive to
 open it, or click an unmounted drive to mount and open it. The trailing eject
-button safely unmounts it; if the current file view is on that drive, Quickfile
+button safely unmounts it; if the current file view is on that drive, QuickFile
 returns home after the unmount completes.
 
 The short labels in `PROJECT KNOWLEDGE` (`CX`, `CL`, `GM`, `CU`, `CP`, `WS`) describe
@@ -140,7 +140,7 @@ results.
 
 To register an arbitrary file, select or right-click it, choose the agent chips
 in the inspector, then press `Add`. `Save` changes those mappings and `Remove`
-deletes only the Quickfile registry record. An empty agent selection is valid:
+deletes only the QuickFile registry record. An empty agent selection is valid:
 the file remains in `PROJECT KNOWLEDGE` as an unassigned registry item. Conventional
 instruction files are still auto-discovered, so removing their explicit record
 does not suppress the automatic binding.
@@ -153,17 +153,17 @@ shows every planned target as `CREATE`, `CONNECTED`, or `CONFLICT`. Pressing
 `.cursor/rules/*.mdc` for Cursor, `.github/copilot-instructions.md` for Copilot,
 and `.windsurf/rules/*.md` for Windsurf. Existing targets are never changed.
 
-Quickfile-specific metadata is stored privately in
+QuickFile-specific metadata is stored privately in
 `$XDG_DATA_HOME/omarchy/quickfile/metadata.json` (normally
 `~/.local/share/omarchy/quickfile/metadata.json`) with mode `0600`. It is kept
 outside the files themselves, so choosing a color or adding a note does not
 modify their contents or extended attributes. Metadata follows renames and
-moves performed from Quickfile.
+moves performed from QuickFile.
 
 Quick Nav recent locations are stored as private binary path tokens in
 `$XDG_STATE_HOME/omarchy/quickfile/recent-locations.json` (normally
 `~/.local/state/omarchy/quickfile/recent-locations.json`) with mode `0600`.
-Both `rg` and zoxide are optional; Quickfile remains functional without them.
+Both `rg` and zoxide are optional; QuickFile remains functional without them.
 
 The bounded operation journal is stored privately in
 `$XDG_STATE_HOME/omarchy/quickfile/operations.json` (normally
@@ -172,6 +172,56 @@ only the information needed for safe undo, never file contents. The footer shows
 recursive-operation progress and exposes Cancel; when idle it exposes the latest
 available Undo. The Trash button in the top toolbar opens restore and permanent
 delete controls.
+
+## Requirements
+
+QuickFile targets Omarchy 4 (Quattro). The stock Omarchy installation already
+provides its core runtime dependencies:
+
+- Quickshell and the Omarchy shell imports.
+- Python 3, PyGObject/GIO and the `gio` command for filesystem monitoring,
+  opening files and Trash integration.
+- `lsblk` and `udisksctl` for the removable-device module.
+- `wl-copy` for copying a selected path to the Wayland clipboard.
+
+Git, `rg`, zoxide, GNOME Sushi, `getfacl`, and `lsattr` are optional. They add
+Git context, faster content search, frequent locations, external QuickView,
+ACL details, and filesystem attributes respectively. Missing optional tools do
+not block the core file manager.
+
+## Install
+
+Install the public repository with Omarchy's standard plugin command:
+
+```bash
+omarchy plugin add https://github.com/baranskyi/omarchy-quickfile.git --enable
+```
+
+The manifest places the QuickFile button in the left bar section by default.
+The optional `SUPER+B` binding below opens the same panel from the keyboard.
+
+## Remove
+
+Remove the installed plugin with:
+
+```bash
+omarchy plugin remove m0sthatedman.quickfile
+```
+
+Removal does not delete private metadata or operation history. This protects
+notes and recovery information from accidental loss. If they are no longer
+needed, the user-owned data lives under
+`$XDG_DATA_HOME/omarchy/quickfile/` and
+`$XDG_STATE_HOME/omarchy/quickfile/`.
+
+## Security model
+
+QuickFile runs inside the unsandboxed Omarchy shell with the permissions of the
+signed-in user. It makes no network requests and collects no telemetry. It does
+not require elevated privileges or overwrite Omarchy configuration. Filesystem
+paths cross the QML/backend boundary as opaque tokens and fixed argument-array
+values; recursive scans and watches are bounded. Destructive choices require
+confirmation, and ordinary deletion uses the freedesktop Trash.
 
 ## Development install
 
@@ -190,7 +240,7 @@ copy a validated release checkout rather than using the development symlink.
 The hotkey belongs in `~/.config/hypr/bindings.lua`:
 
 ```lua
-o.bind("SUPER + B", "Quickfile sidebar", "omarchy-shell shell toggle m0sthatedman.quickfile")
+o.bind("SUPER + B", "QuickFile sidebar", "omarchy-shell shell toggle m0sthatedman.quickfile")
 ```
 
 After editing Hyprland configuration, validate it:

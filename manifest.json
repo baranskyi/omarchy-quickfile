@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
   "id": "m0sthatedman.quickfile",
-  "name": "Omarchy Quickfile",
-  "version": "0.9.0",
+  "name": "QuickFile",
+  "version": "0.9.1",
   "author": "m0sthatedman",
   "license": "MIT",
-  "description": "An IDE-like file and agent-context sidebar for the Omarchy desktop.",
+  "description": "An IDE-inspired file manager sidebar with previews, safe file operations, Git context, and project knowledge for Omarchy.",
   "kinds": [
     "service",
     "bar-widget",
@@ -18,8 +18,8 @@
     "panel": "Panel.qml"
   },
   "barWidget": {
-    "displayName": "Quickfile",
-    "description": "Open the Quickfile filesystem sidebar.",
+    "displayName": "QuickFile",
+    "description": "Open the QuickFile file manager sidebar.",
     "category": "System",
     "aliases": [
       "files",

@@ -350,7 +350,7 @@ Item {
     } else if (message.event === "error") {
       watcherDegraded = true
       watchError = String(message.error || "Native file monitoring unavailable")
-      console.warn("Quickfile watch:", watchError)
+      console.warn("QuickFile watch:", watchError)
     }
   }
 
@@ -622,7 +622,7 @@ Item {
   function applyListing(raw) {
     var parsed = null
     try { parsed = JSON.parse(String(raw || "")) } catch (error) {
-      errorMessage = "Quickfile returned invalid data"
+      errorMessage = "QuickFile returned invalid data"
       return false
     }
     if (!parsed || parsed.ok !== true) {
@@ -1561,7 +1561,7 @@ Item {
     }
     onExited: function(exitCode) {
       if (!root.applyListing(root.listStdout) && !root.errorMessage)
-        root.errorMessage = root.listStderr.trim() || ("Quickfile exited " + exitCode)
+        root.errorMessage = root.listStderr.trim() || ("QuickFile exited " + exitCode)
       if (root.reloadPending) {
         var foreground = root.reloadPendingForeground
         root.reloadPending = false

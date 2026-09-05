@@ -43,9 +43,10 @@ def prepare_plugin(config: Path, panel_test: bool) -> None:
     end = source.index(end_marker, start)
     wrapper = """    Window {
       id: window
+      objectName: "quickfilePanelWindow"
       required property var modelData
       visible: root.opened || root.revealProgress > 0.001
-      width: Math.max(1, Math.round(root.bladeWidth * root.revealProgress))
+      width: root.bladeWidth
       height: 900
       color: "transparent"
 

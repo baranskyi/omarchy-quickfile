@@ -178,6 +178,12 @@ ShellRoot {
 
   function newFeatureChecks() {
     panel.dismissEditor()
+    var panelWindow = objectFinder.findChild(panel, "quickfilePanelWindow")
+    var bladeSlide = objectFinder.findChild(panel, "quickfileBladeSlide")
+    check(panelWindow !== null && panelWindow.width === panel.bladeWidth,
+      "panel animation resized its native surface instead of keeping stable geometry")
+    check(bladeSlide !== null && Math.abs(bladeSlide.x + panel.bladeWidth) < 0.01,
+      "closed panel blade was not translated fully outside its stable surface")
     var moduleSettings = objectFinder.findChild(panel, "quickfileModuleSettings")
     check(moduleSettings !== null, "module settings popup was not rendered")
     moduleSettings.open()

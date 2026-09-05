@@ -64,6 +64,8 @@ Item {
   readonly property color accent: Color.accent
   readonly property int primaryFontSize: Style.font.subtitle
   readonly property int secondaryFontSize: Style.font.body
+  readonly property int revealDuration: 220
+  readonly property real bladeOffset: -root.bladeWidth * (1 - root.revealProgress)
   readonly property var colorChoices: [
     "red", "yellow", "orange", "green", "cyan", "blue", "magenta", "brown"
   ]
@@ -80,7 +82,7 @@ Item {
 
   Behavior on revealProgress {
     NumberAnimation {
-      duration: 180
+      duration: root.revealDuration
       easing.type: Easing.OutCubic
     }
   }
@@ -1157,12 +1159,17 @@ Item {
 
     PanelWindow {
       id: window
+      objectName: "quickfilePanelWindow"
       required property var modelData
       screen: modelData
       visible: (root.opened || root.revealProgress > 0.001)
         && (root.targetScreenName === ""
           || String(modelData.name || "") === root.targetScreenName)
-      implicitWidth: Math.max(1, Math.round(root.bladeWidth * root.revealProgress))
+      // Keep the layer surface and its exclusive zone stable. Resizing this
+      // surface on every animation frame forces the compositor to configure
+      // and retile every workspace window repeatedly, which produces visible
+      // bands and stutter. The blade itself slides on the scene graph below.
+      implicitWidth: root.bladeWidth
       color: "transparent"
       exclusionMode: visible ? ExclusionMode.Auto : ExclusionMode.Ignore
 
@@ -1192,6 +1199,7 @@ Item {
 
       Rectangle {
         id: blade
+        objectName: "quickfileBlade"
         anchors.top: parent.top
         anchors.bottom: parent.bottom
         anchors.right: parent.right
@@ -1201,6 +1209,10 @@ Item {
         border.width: Math.max(1, Style.normalBorderWidth)
         border.color: root.borderColor
         clip: true
+        transform: Translate {
+          objectName: "quickfileBladeSlide"
+          x: root.bladeOffset
+        }
 
         FocusScope {
           id: keyScope

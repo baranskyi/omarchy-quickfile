@@ -19,7 +19,7 @@ import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_TESTS = ("test_service.qml", "test_panel_state.qml")
+DEFAULT_TESTS = ("test_service.qml", "test_panel_state.qml", "test_icon.qml")
 
 
 def prepare_plugin(config: Path, panel_test: bool) -> None:

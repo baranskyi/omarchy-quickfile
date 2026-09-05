@@ -31,7 +31,16 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: "󰉋"
+    iconComponent: Component {
+      Item {
+        QuickFileIcon {
+          anchors.centerIn: parent
+          iconSize: Math.round(Style.bar.iconFont * 0.82)
+          color: button.active && button.useActiveColor
+            ? button.activeColor : button.foreground
+        }
+      }
+    }
     active: root.opened
     tooltipText: root.opened ? "Close QuickFile" : "Open QuickFile"
 

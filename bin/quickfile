@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-VERSION = "0.9.1"
+VERSION = "0.10.0"
 DEFAULT_LIMIT = 2000
 COMMAND_TIMEOUT = 3
 DEFAULT_CONTENT_FILE_LIMIT = 1024 * 1024
@@ -57,6 +57,7 @@ COPY_CHUNK_SIZE = 1024 * 1024
 QUICK_NAV_LIMIT = 200
 QUICK_NAV_SIZE_LIMIT = 256 * 1024
 QUICK_NAV_COMMAND_LIMIT = 512 * 1024
+SETTINGS_SIZE_LIMIT = 64 * 1024
 PREVIEW_READ_LIMIT = 256 * 1024
 PREVIEW_TEXT_LIMIT = 65536
 PREVIEW_DIRECTORY_LIMIT = 64
@@ -66,6 +67,20 @@ KNOWLEDGE_AGENT_ORDER = (
     "codex", "claude", "gemini", "cursor", "copilot", "windsurf",
 )
 KNOWLEDGE_AGENT_KEYS = set(KNOWLEDGE_AGENT_ORDER)
+MODULE_ORDER = ("sessions", "devices", "favorites", "knowledge")
+MODULE_KEYS = set(MODULE_ORDER)
+ACTIVE_SESSION_PROCESS_LIMIT = 4096
+ACTIVE_SESSION_LIMIT = 64
+ACTIVE_SESSION_AGENTS = {
+    "codex": ("codex", "Codex"),
+    "claude": ("claude", "Claude"),
+    "gemini": ("gemini", "Gemini"),
+    "copilot": ("copilot", "GitHub Copilot"),
+    "github-copilot": ("copilot", "GitHub Copilot"),
+    "github-copilot-cli": ("copilot", "GitHub Copilot"),
+    "cursor-agent": ("cursor", "Cursor Agent"),
+    "windsurf-agent": ("windsurf", "Windsurf Agent"),
+}
 
 
 class QuickfileError(Exception):
@@ -131,6 +146,15 @@ def metadata_file() -> Path:
     data_home = os.environ.get("XDG_DATA_HOME", "").strip()
     base = Path(data_home).expanduser() if data_home else Path.home() / ".local" / "share"
     return base / "omarchy" / "quickfile" / "metadata.json"
+
+
+def settings_file() -> Path:
+    override = os.environ.get("QUICKFILE_SETTINGS_FILE", "").strip()
+    if override:
+        return Path(override).expanduser()
+    config_home = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    base = Path(config_home).expanduser() if config_home else Path.home() / ".config"
+    return base / "omarchy" / "quickfile" / "settings.json"
 
 
 def quickfile_home() -> str:
@@ -446,6 +470,121 @@ def save_metadata_store(store: dict[str, Any]) -> None:
             os.unlink(temporary)
         except FileNotFoundError:
             pass
+
+
+def default_module_layout() -> list[dict[str, Any]]:
+    return [
+        {
+            "id": module_id,
+            "pinned": module_id in {"sessions", "knowledge"},
+            "collapsed": False,
+        }
+        for module_id in MODULE_ORDER
+    ]
+
+
+def normalize_module_layout(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        raise QuickfileError("Module layout must be a list", "settings-invalid-layout")
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in value:
+        if not isinstance(raw, dict):
+            raise QuickfileError("Module layout entries must be objects", "settings-invalid-layout")
+        module_id = raw.get("id")
+        if not isinstance(module_id, str) or module_id not in MODULE_KEYS:
+            raise QuickfileError("Module layout contains an unknown module", "settings-invalid-layout")
+        if module_id in seen:
+            raise QuickfileError("Module layout contains a duplicate module", "settings-invalid-layout")
+        pinned = raw.get("pinned", False)
+        collapsed = raw.get("collapsed", False)
+        if not isinstance(pinned, bool) or not isinstance(collapsed, bool):
+            raise QuickfileError("Module flags must be true or false", "settings-invalid-layout")
+        rows.append({"id": module_id, "pinned": pinned, "collapsed": collapsed})
+        seen.add(module_id)
+    defaults = {row["id"]: row for row in default_module_layout()}
+    rows.extend(defaults[module_id] for module_id in MODULE_ORDER if module_id not in seen)
+    return rows
+
+
+def default_settings_store() -> dict[str, Any]:
+    return {
+        "version": 1,
+        "activeSessionsEnabled": False,
+        "modules": default_module_layout(),
+    }
+
+
+def load_settings_store() -> dict[str, Any]:
+    path = settings_file()
+    try:
+        if not path.exists():
+            return default_settings_store()
+        if path.stat().st_size > SETTINGS_SIZE_LIMIT:
+            raise QuickfileError("QuickFile settings are too large", "settings-too-large")
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except QuickfileError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise QuickfileError(f"Could not read QuickFile settings: {exc}", "settings-read-failed") from exc
+    if not isinstance(parsed, dict):
+        raise QuickfileError("QuickFile settings have an invalid format", "settings-invalid")
+    active_sessions = parsed.get("activeSessionsEnabled", False)
+    if not isinstance(active_sessions, bool):
+        raise QuickfileError("Active-session preference must be true or false", "settings-invalid")
+    return {
+        "version": 1,
+        "activeSessionsEnabled": active_sessions,
+        "modules": normalize_module_layout(parsed.get("modules", default_module_layout())),
+    }
+
+
+def save_settings_store(store: dict[str, Any]) -> None:
+    path = settings_file()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    payload = json.dumps(store, ensure_ascii=True, separators=(",", ":")) + "\n"
+    if len(payload.encode("utf-8")) > SETTINGS_SIZE_LIMIT:
+        raise QuickfileError("QuickFile settings are too large", "settings-too-large")
+    descriptor, temporary = tempfile.mkstemp(prefix=".settings.", dir=path.parent)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            descriptor = -1
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except OSError as exc:
+        raise QuickfileError(f"Could not save QuickFile settings: {exc}", "settings-write-failed") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def settings_command(args: argparse.Namespace) -> dict[str, Any]:
+    store = load_settings_store()
+    changed = False
+    active_sessions = getattr(args, "active_sessions", None)
+    if active_sessions is not None:
+        enabled = active_sessions == "true"
+        changed = changed or store["activeSessionsEnabled"] != enabled
+        store["activeSessionsEnabled"] = enabled
+    module_layout_json = getattr(args, "module_layout_json", None)
+    if module_layout_json is not None:
+        try:
+            raw_layout = json.loads(module_layout_json)
+        except json.JSONDecodeError as exc:
+            raise QuickfileError("Module layout is not valid JSON", "settings-invalid-layout") from exc
+        layout = normalize_module_layout(raw_layout)
+        changed = changed or store["modules"] != layout
+        store["modules"] = layout
+    if changed:
+        save_settings_store(store)
+    return {"ok": True, "settings": store, "changed": changed}
 
 
 def item_metadata(store: dict[str, Any], token: str) -> dict[str, Any]:
@@ -1836,6 +1975,128 @@ def parse_gio_attributes(raw: str) -> dict[str, str]:
         if "::" in key:
             attributes[key] = value
     return attributes
+
+
+def read_proc_text(path: Path, limit: int = 4096) -> str:
+    try:
+        with path.open("rb") as stream:
+            raw = stream.read(limit + 1)
+    except OSError:
+        return ""
+    if len(raw) > limit:
+        return ""
+    return raw.decode("utf-8", "replace").strip()
+
+
+def proc_elapsed_seconds(process_dir: Path, proc_root: Path) -> int | None:
+    raw_stat = read_proc_text(process_dir / "stat")
+    raw_uptime = read_proc_text(proc_root / "uptime", 256)
+    closing = raw_stat.rfind(")")
+    if closing < 0 or not raw_uptime:
+        return None
+    fields = raw_stat[closing + 1:].strip().split()
+    try:
+        start_ticks = int(fields[19])
+        uptime = float(raw_uptime.split()[0])
+        ticks = int(os.sysconf("SC_CLK_TCK"))
+    except (IndexError, ValueError, OSError):
+        return None
+    if ticks <= 0:
+        return None
+    return max(0, int(uptime - start_ticks / ticks))
+
+
+def path_relation(scope: str, cwd: str) -> str:
+    try:
+        common = os.path.commonpath((scope, cwd))
+    except ValueError:
+        return ""
+    if scope == cwd:
+        return "this folder"
+    if common == scope:
+        relative = os.path.relpath(cwd, scope)
+        return display_text(relative) if relative != "." else "this folder"
+    if common == cwd:
+        return "parent workspace"
+    return ""
+
+
+def active_session_rows(
+    scope: str,
+    *,
+    proc_root: Path = Path("/proc"),
+    limit: int = ACTIVE_SESSION_LIMIT,
+) -> list[dict[str, Any]]:
+    """Return bounded, terminal-backed agent processes related to *scope*.
+
+    Detection is deliberately conservative: only an allowlisted executable
+    name attached to a terminal counts. Knowledge files and command contents
+    are never used as evidence that a session is running.
+    """
+    scope_path = os.path.realpath(normalized_path(scope))
+    bounded_limit = max(0, min(limit, ACTIVE_SESSION_LIMIT))
+    if bounded_limit == 0:
+        return []
+    try:
+        process_dirs = []
+        with os.scandir(proc_root) as entries:
+            for entry in entries:
+                if entry.name.isdigit():
+                    process_dirs.append(Path(entry.path))
+                    if len(process_dirs) >= ACTIVE_SESSION_PROCESS_LIMIT:
+                        break
+        process_dirs.sort(key=lambda entry: int(entry.name))
+    except OSError:
+        return []
+    rows: list[dict[str, Any]] = []
+    for process_dir in process_dirs:
+        comm = read_proc_text(process_dir / "comm", 256)
+        adapter = ACTIVE_SESSION_AGENTS.get(comm.casefold())
+        if adapter is None:
+            continue
+        try:
+            stdin_target = os.readlink(process_dir / "fd" / "0")
+        except OSError:
+            continue
+        if not (stdin_target.startswith("/dev/pts/") or stdin_target.startswith("/dev/tty")):
+            continue
+        try:
+            cwd = os.path.realpath(os.readlink(process_dir / "cwd"))
+        except OSError:
+            continue
+        relation = path_relation(scope_path, cwd)
+        if not relation:
+            continue
+        agent, label = adapter
+        age = proc_elapsed_seconds(process_dir, proc_root)
+        rows.append({
+            "sessionKey": f"{agent}:{process_dir.name}",
+            "agent": agent,
+            "label": label,
+            "pid": int(process_dir.name),
+            "cwd": display_text(cwd),
+            "cwdToken": encode_path(cwd),
+            "location": relation,
+            "ageSeconds": age if age is not None else -1,
+            "terminal": display_text(stdin_target),
+        })
+        if len(rows) >= bounded_limit:
+            break
+    rows.sort(key=lambda row: (row["agent"], row["pid"]))
+    return rows
+
+
+def sessions_command(args: argparse.Namespace) -> dict[str, Any]:
+    root = path_from_args(args, required=False)
+    limit = max(1, min(int(getattr(args, "limit", ACTIVE_SESSION_LIMIT)), ACTIVE_SESSION_LIMIT))
+    rows = active_session_rows(root, limit=limit)
+    return {
+        "ok": True,
+        "root": {"path": display_text(root), "token": encode_path(root)},
+        "sessions": rows,
+        "truncated": len(rows) >= limit,
+        "detection": "terminal-processes",
+    }
 
 
 def properties_command(args: argparse.Namespace) -> dict[str, Any]:
@@ -3663,6 +3924,18 @@ def parser() -> argparse.ArgumentParser:
     add_path_arguments(knowledge)
     knowledge.add_argument("--limit", type=int, default=KNOWLEDGE_LIMIT)
 
+    sessions = subcommands.add_parser(
+        "sessions", help="List active terminal-backed AI sessions for a directory"
+    )
+    add_path_arguments(sessions)
+    sessions.add_argument("--limit", type=int, default=ACTIVE_SESSION_LIMIT)
+
+    settings = subcommands.add_parser(
+        "settings", help="Read or update private QuickFile preferences"
+    )
+    settings.add_argument("--active-sessions", choices=("true", "false"))
+    settings.add_argument("--module-layout-json")
+
     knowledge_links = subcommands.add_parser(
         "knowledge-links",
         help="Preview or create non-overwriting agent configuration symlinks",
@@ -3742,6 +4015,10 @@ def main(argv: Iterable[str] | None = None) -> int:
             result = volume_action_command(args)
         elif args.command == "knowledge":
             result = knowledge_command(args)
+        elif args.command == "sessions":
+            result = sessions_command(args)
+        elif args.command == "settings":
+            result = settings_command(args)
         elif args.command == "knowledge-links":
             result = knowledge_links_command(args)
         elif args.command == "metadata":

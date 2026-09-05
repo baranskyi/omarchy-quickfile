@@ -69,6 +69,15 @@ concept. It does not depend on or copy unreleased FileBlade source code.
 - Safe configuration-link workflow with a complete preview. It creates only
   missing symlinks, reports existing/native connections and conflicts, and
   never replaces an existing file or foreign symlink.
+- Opt-in, read-only `AI SESSIONS` module for real terminal-backed Codex,
+  Claude, Gemini, Cursor Agent, GitHub Copilot CLI and Windsurf Agent processes
+  related to the displayed workspace. Detection uses only bounded local process
+  metadata; it never treats an instruction file as a running session and never
+  exposes command-line contents.
+- Configurable module stack. Open the modules control in the title bar to move,
+  collapse, expand or pin Sessions, Devices, Favorites and Project Knowledge.
+  The order and state persist without rebuilding the live file list, changing
+  selection, moving the viewport or discarding an unsaved note.
 - Right-click properties expose the full path with a one-click copy button.
 - Delayed hover tooltips explain every icon-only toolbar/navigation action.
 - Properties inspector with POSIX metadata, owner/group, timestamps, MIME,
@@ -138,6 +147,15 @@ the row shows every binding path and its resolved target. Token counts are
 explicit estimates (`≈`, based on file bytes), not model-specific tokenizer
 results.
 
+`AI SESSIONS` is disabled until explicitly enabled either from its header or
+the modules control. While the blade is visible, the adapter checks at an
+eight-second interval for allowlisted agent executables attached to a terminal
+whose working directory is the displayed folder, a child folder, or its parent
+workspace. It reads process name, PID, terminal, working directory and elapsed
+time from `/proc`; it does not read command arguments, prompts, transcripts or
+file contents. Clicking a session navigates to its working directory. Disabling
+the module immediately clears its in-memory rows and stops polling.
+
 To register an arbitrary file, select or right-click it, choose the agent chips
 in the inspector, then press `Add`. `Save` changes those mappings and `Remove`
 deletes only the QuickFile registry record. An empty agent selection is valid:
@@ -164,6 +182,12 @@ Quick Nav recent locations are stored as private binary path tokens in
 `$XDG_STATE_HOME/omarchy/quickfile/recent-locations.json` (normally
 `~/.local/state/omarchy/quickfile/recent-locations.json`) with mode `0600`.
 Both `rg` and zoxide are optional; QuickFile remains functional without them.
+
+Module layout and the active-session opt-in are stored privately in
+`$XDG_CONFIG_HOME/omarchy/quickfile/settings.json` (normally
+`~/.config/omarchy/quickfile/settings.json`) with mode `0600`. Only a strict
+built-in module allowlist is accepted; this setting is not an extension or an
+arbitrary-QML loading mechanism.
 
 The bounded operation journal is stored privately in
 `$XDG_STATE_HOME/omarchy/quickfile/operations.json` (normally
@@ -221,7 +245,9 @@ signed-in user. It makes no network requests and collects no telemetry. It does
 not require elevated privileges or overwrite Omarchy configuration. Filesystem
 paths cross the QML/backend boundary as opaque tokens and fixed argument-array
 values; recursive scans and watches are bounded. Destructive choices require
-confirmation, and ordinary deletion uses the freedesktop Trash.
+confirmation, and ordinary deletion uses the freedesktop Trash. The optional
+session adapter performs a bounded `/proc` scan only while the blade is visible;
+it neither controls agent processes nor reads their command lines.
 
 ## Development install
 
@@ -293,9 +319,8 @@ models reconcile changed rows by path token instead of replacing the model.
 
 ## Next milestones
 
-- Optional explicit conflict-resolution workflow for agent configuration links.
-- Optional read-only activity adapter for genuinely running agent sessions.
-- Resizable/reorderable left and right blades.
+- Independent resizable left and right blades.
+- Dedicated Files, Properties, Git, Notes, Memory and Skills module surfaces.
 - Declarative extension modules plus an explicitly trusted QML extension tier
   remain deferred while everyday file-management workflows are completed.
 

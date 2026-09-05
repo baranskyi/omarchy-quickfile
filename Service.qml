@@ -24,6 +24,8 @@ Item {
   property bool busy: listingProcess.running
   readonly property bool foregroundBusy: busy && !listInFlightBackground
   property bool knowledgeBusy: knowledgeProcess.running
+  property bool sessionsBusy: sessionsProcess.running
+  property bool settingsBusy: settingsLoadProcess.running || settingsSaveProcess.running
   property bool volumesBusy: volumesProcess.running || volumeActionProcess.running
   property bool operationBusy: operationProcess.running
   property bool actionBusy: actionProcess.running || operationBusy || knowledgeLinksProcess.running
@@ -93,6 +95,22 @@ Item {
   property var knowledgeLinkPlan: null
   property string knowledgeLinkError: ""
   property bool knowledgeLinkApplying: false
+  readonly property var moduleIds: ["sessions", "devices", "favorites", "knowledge"]
+  property var moduleLayout: defaultModuleLayout()
+  property bool settingsLoaded: false
+  property string settingsError: ""
+  property bool settingsSaveQueued: false
+  property bool activeSessionsEnabled: false
+  property var activeSessions: []
+  property bool sessionsCollapsed: false
+  property bool sessionsReloadPending: false
+  property string sessionsError: ""
+  property string sessionsStdout: ""
+  property string sessionsStderr: ""
+  property string sessionsInFlightRootToken: ""
+  property string sessionsInFlightRootPath: ""
+  property string settingsStdout: ""
+  property string settingsStderr: ""
   property var selectedEntry: null
   property var selectedProperties: null
   property string selectedToken: ""
@@ -116,11 +134,13 @@ Item {
   property alias entriesModel: fileRows
   property alias favoritesModel: favoriteRows
   property alias knowledgeModel: knowledgeRows
+  property alias sessionsModel: sessionRows
   property alias volumesModel: volumeRows
   property alias quickNavModel: quickNavRows
   ListModel { id: fileRows; dynamicRoles: true }
   ListModel { id: favoriteRows; dynamicRoles: true }
   ListModel { id: knowledgeRows; dynamicRoles: true }
+  ListModel { id: sessionRows; dynamicRoles: true }
   ListModel { id: volumeRows; dynamicRoles: true }
   ListModel { id: quickNavRows; dynamicRoles: true }
 
@@ -200,6 +220,7 @@ Item {
   }
 
   function ensureLoaded() {
+    if (!settingsLoaded && !settingsLoadProcess.running) reloadSettings()
     if (!initialized) {
       initialized = true
       recordNavigationOnListing = true
@@ -215,14 +236,100 @@ Item {
       reloadHistory()
       reloadQuickNav()
     }
+    if (settingsLoaded && activeSessionsEnabled) reloadSessions()
   }
 
   function sameData(left, right) {
     return JSON.stringify(left) === JSON.stringify(right)
   }
 
+  function defaultModuleLayout() {
+    return [
+      { id: "sessions", pinned: true, collapsed: false },
+      { id: "devices", pinned: false, collapsed: false },
+      { id: "favorites", pinned: false, collapsed: false },
+      { id: "knowledge", pinned: true, collapsed: false }
+    ]
+  }
+
+  function normalizedModuleLayout(value) {
+    var source = Array.isArray(value) ? value : []
+    var result = []
+    var seen = ({})
+    for (var i = 0; i < source.length; i++) {
+      var row = source[i] || ({})
+      var id = String(row.id || "")
+      if (moduleIds.indexOf(id) < 0 || seen[id]) continue
+      result.push({ id: id, pinned: row.pinned === true, collapsed: row.collapsed === true })
+      seen[id] = true
+    }
+    var defaults = defaultModuleLayout()
+    for (var j = 0; j < defaults.length; j++)
+      if (!seen[defaults[j].id]) result.push(defaults[j])
+    return result
+  }
+
+  function moduleState(moduleId) {
+    var id = String(moduleId || "")
+    for (var i = 0; i < moduleLayout.length; i++)
+      if (String(moduleLayout[i].id || "") === id) return moduleLayout[i]
+    return { id: id, pinned: false, collapsed: false }
+  }
+
+  function moduleIndex(moduleId) {
+    var id = String(moduleId || "")
+    for (var i = 0; i < moduleLayout.length; i++)
+      if (String(moduleLayout[i].id || "") === id) return i
+    return -1
+  }
+
+  function applyModuleCollapseFlags() {
+    sessionsCollapsed = moduleState("sessions").collapsed === true
+    volumesCollapsed = moduleState("devices").collapsed === true
+    favoritesCollapsed = moduleState("favorites").collapsed === true
+    knowledgeCollapsed = moduleState("knowledge").collapsed === true
+  }
+
+  function updateModule(moduleId, changes) {
+    var index = moduleIndex(moduleId)
+    if (index < 0 || !settingsLoaded) return false
+    var next = moduleLayout.slice()
+    next[index] = Object.assign({}, next[index], changes || ({}))
+    moduleLayout = normalizedModuleLayout(next)
+    applyModuleCollapseFlags()
+    persistSettings()
+    return true
+  }
+
+  function setModuleCollapsed(moduleId, collapsed) {
+    return updateModule(moduleId, { collapsed: collapsed === true })
+  }
+
+  function toggleModuleCollapsed(moduleId) {
+    var state = moduleState(moduleId)
+    return setModuleCollapsed(moduleId, state.collapsed !== true)
+  }
+
+  function setModulePinned(moduleId, pinned) {
+    return updateModule(moduleId, { pinned: pinned === true })
+  }
+
+  function moveModule(moduleId, offset) {
+    var index = moduleIndex(moduleId)
+    var target = index + Number(offset || 0)
+    if (index < 0 || target < 0 || target >= moduleLayout.length || !settingsLoaded)
+      return false
+    var next = moduleLayout.slice()
+    var moving = next.splice(index, 1)[0]
+    next.splice(target, 0, moving)
+    moduleLayout = normalizedModuleLayout(next)
+    applyModuleCollapseFlags()
+    persistSettings()
+    return true
+  }
+
   function rowKey(row) {
-    return String(row.token || row.device || "")
+    return String(row.token || row.device || row.sessionKey || "")
   }
 
   function reconcileRows(model, previous, next) {
@@ -501,6 +608,119 @@ Item {
     return navigate(String(entry.path || ""), String(entry.token || ""), true)
   }
 
+  function reloadSettings() {
+    if (settingsLoadProcess.running) return false
+    settingsStdout = ""
+    settingsStderr = ""
+    settingsError = ""
+    settingsLoadProcess.command = ["/usr/bin/env", "python3", cliPath, "settings"]
+    settingsLoadProcess.running = true
+    return true
+  }
+
+  function applySettings(raw) {
+    var parsed = null
+    try { parsed = JSON.parse(String(raw || "")) } catch (error) {
+      settingsError = "Settings returned invalid data"
+      return false
+    }
+    if (!parsed || parsed.ok !== true || !parsed.settings) {
+      settingsError = parsed && parsed.error ? String(parsed.error) : "Could not load settings"
+      return false
+    }
+    moduleLayout = normalizedModuleLayout(parsed.settings.modules)
+    activeSessionsEnabled = parsed.settings.activeSessionsEnabled === true
+    applyModuleCollapseFlags()
+    settingsLoaded = true
+    settingsError = ""
+    if (panelVisible && activeSessionsEnabled) Qt.callLater(reloadSessions)
+    return true
+  }
+
+  function persistSettings() {
+    if (!settingsLoaded) return false
+    if (settingsSaveProcess.running) {
+      settingsSaveQueued = true
+      return false
+    }
+    settingsSaveQueued = false
+    settingsStdout = ""
+    settingsStderr = ""
+    settingsError = ""
+    settingsSaveProcess.command = ["/usr/bin/env", "python3", cliPath, "settings",
+      "--active-sessions", activeSessionsEnabled ? "true" : "false",
+      "--module-layout-json", JSON.stringify(moduleLayout)]
+    settingsSaveProcess.running = true
+    return true
+  }
+
+  function setActiveSessionsEnabled(enabled) {
+    var value = enabled === true
+    if (!settingsLoaded || activeSessionsEnabled === value) return false
+    activeSessionsEnabled = value
+    if (!value) {
+      reconcileRows(sessionRows, activeSessions, [])
+      activeSessions = []
+      sessionsError = ""
+      sessionsReloadPending = false
+    } else if (panelVisible) {
+      Qt.callLater(reloadSessions)
+    }
+    persistSettings()
+    return true
+  }
+
+  function reloadSessions() {
+    if (!activeSessionsEnabled || !panelVisible) return false
+    if (sessionsProcess.running) {
+      sessionsReloadPending = true
+      return false
+    }
+    sessionsStdout = ""
+    sessionsStderr = ""
+    sessionsError = ""
+    sessionsInFlightRootToken = rootToken
+    sessionsInFlightRootPath = rootPath
+    var command = ["/usr/bin/env", "python3", cliPath, "sessions"]
+    rootArgument(command)
+    sessionsProcess.command = command
+    sessionsProcess.running = true
+    return true
+  }
+
+  function applySessions(raw) {
+    var parsed = null
+    try { parsed = JSON.parse(String(raw || "")) } catch (error) {
+      sessionsError = "AI session scan returned invalid data"
+      return false
+    }
+    if (!parsed || parsed.ok !== true) {
+      sessionsError = parsed && parsed.error
+        ? String(parsed.error) : "Could not inspect active AI sessions"
+      return false
+    }
+    var parsedToken = parsed.root ? String(parsed.root.token || "") : ""
+    var stale = (sessionsInFlightRootToken !== rootToken)
+      || (sessionsInFlightRootToken === "" && sessionsInFlightRootPath !== rootPath)
+      || (rootToken !== "" && parsedToken !== "" && parsedToken !== rootToken)
+    if (stale) {
+      sessionsReloadPending = true
+      return true
+    }
+    var next = Array.isArray(parsed.sessions) ? parsed.sessions : []
+    if (!sameData(activeSessions, next)) {
+      reconcileRows(sessionRows, activeSessions, next)
+      activeSessions = next
+    }
+    sessionsError = ""
+    return true
+  }
+
+  function navigateSession(session) {
+    if (!session) return false
+    return navigate(String(session.cwd || ""), String(session.cwdToken || ""), true)
+  }
+
   function applyVolumes(raw) {
     var parsed = null
     try { parsed = JSON.parse(String(raw || "")) } catch (error) {
@@ -745,8 +965,10 @@ Item {
     listingAboutToChange()
     fileRows.clear()
     knowledgeRows.clear()
+    sessionRows.clear()
     entries = []
     knowledgeFiles = []
+    activeSessions = []
     knowledgeTotalTokens = 0
     knowledgeMaxTokens = 0
     knowledgeRootToken = ""
@@ -762,10 +984,13 @@ Item {
     selectedProperties = null
     knowledgeLinkPlan = null
     knowledgeLinkError = ""
+    sessionsError = ""
     errorMessage = ""
     truncated = false
     modelChanged()
-    return reload()
+    var started = reload()
+    if (activeSessionsEnabled && panelVisible) Qt.callLater(reloadSessions)
+    return started
   }
 
   function goHome() {
@@ -1511,6 +1736,14 @@ Item {
     onTriggered: root.refreshAll(true)
   }
 
+  Timer {
+    interval: 8000
+    repeat: true
+    running: root.panelVisible && root.initialized && root.settingsLoaded
+      && root.activeSessionsEnabled
+    onTriggered: root.reloadSessions()
+  }
+
   Process {
     id: watchProcess
     command: ["/usr/bin/python3", root.pluginDir + "/bin/quickfile-watch"]
@@ -1544,8 +1777,75 @@ Item {
         fallback: root.watcherDegraded || root.watcherFailed || root.watchTruncated,
         watchError: root.watchError, busy: root.busy,
         foregroundBusy: root.foregroundBusy, entries: root.entries.length,
-        listingRequests: root.listingRequests, listingChanges: root.listingChanges
+        listingRequests: root.listingRequests, listingChanges: root.listingChanges,
+        activeSessionsEnabled: root.activeSessionsEnabled,
+        activeSessions: root.activeSessions.length,
+        moduleLayout: root.moduleLayout
       })
+    }
+  }
+
+  Process {
+    id: settingsLoadProcess
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.settingsStdout = text
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.settingsStderr = text.slice(-2000)
+    }
+    onExited: function(exitCode) {
+      if (!root.applySettings(root.settingsStdout)) {
+        root.moduleLayout = root.defaultModuleLayout()
+        root.activeSessionsEnabled = false
+        root.applyModuleCollapseFlags()
+        root.settingsLoaded = true
+        if (!root.settingsError)
+          root.settingsError = root.settingsStderr.trim() || ("Settings exited " + exitCode)
+      }
+    }
+  }
+
+  Process {
+    id: settingsSaveProcess
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.settingsStdout = text
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.settingsStderr = text.slice(-2000)
+    }
+    onExited: function(exitCode) {
+      var parsed = null
+      try { parsed = JSON.parse(root.settingsStdout) } catch (error) {}
+      if (exitCode !== 0 || !parsed || parsed.ok !== true)
+        root.settingsError = parsed && parsed.error ? String(parsed.error)
+          : (root.settingsStderr.trim() || "Could not save QuickFile settings")
+      if (root.settingsSaveQueued) Qt.callLater(root.persistSettings)
+    }
+  }
+
+  Process {
+    id: sessionsProcess
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.sessionsStdout = text
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.sessionsStderr = text.slice(-2000)
+    }
+    onExited: function(exitCode) {
+      if (root.activeSessionsEnabled && root.panelVisible
+          && !root.applySessions(root.sessionsStdout) && !root.sessionsError)
+        root.sessionsError = root.sessionsStderr.trim()
+          || ("AI session scan exited " + exitCode)
+      if (root.sessionsReloadPending && root.activeSessionsEnabled && root.panelVisible) {
+        root.sessionsReloadPending = false
+        Qt.callLater(root.reloadSessions)
+      }
     }
   }
 

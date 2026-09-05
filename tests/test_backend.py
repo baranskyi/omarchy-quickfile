@@ -31,6 +31,7 @@ class BackendTests(unittest.TestCase):
                 "QUICKFILE_METADATA_FILE": str(self.root / "quickfile-metadata.json"),
                 "QUICKFILE_STATE_FILE": str(self.root / "quickfile-operations.json"),
                 "QUICKFILE_NAV_FILE": str(self.root / "quickfile-recent.json"),
+                "QUICKFILE_SETTINGS_FILE": str(self.root / "quickfile-settings.json"),
                 "QUICKFILE_HOME": str(self.root),
                 "XDG_CONFIG_HOME": str(self.root / "xdg-config"),
                 "XDG_DATA_HOME": str(self.root / "xdg-data"),
@@ -65,6 +66,87 @@ class BackendTests(unittest.TestCase):
     def test_path_tokens_round_trip(self) -> None:
         path = str(self.root / "Привет.md")
         self.assertEqual(quickfile.decode_path(quickfile.encode_path(path)), path)
+
+    def test_settings_persist_private_normalized_module_layout(self) -> None:
+        saved = quickfile.settings_command(argparse.Namespace(
+            active_sessions="true",
+            module_layout_json=json.dumps([
+                {"id": "knowledge", "pinned": True, "collapsed": True},
+                {"id": "sessions", "pinned": False, "collapsed": False},
+            ]),
+        ))
+        self.assertTrue(saved["settings"]["activeSessionsEnabled"])
+        self.assertEqual(
+            [row["id"] for row in saved["settings"]["modules"]],
+            ["knowledge", "sessions", "devices", "favorites"],
+        )
+        self.assertTrue(saved["settings"]["modules"][0]["collapsed"])
+        settings_path = Path(os.environ["QUICKFILE_SETTINGS_FILE"])
+        self.assertEqual(settings_path.stat().st_mode & 0o777, 0o600)
+        loaded = quickfile.settings_command(argparse.Namespace(
+            active_sessions=None, module_layout_json=None,
+        ))
+        self.assertEqual(loaded["settings"], saved["settings"])
+
+    def test_settings_reject_unknown_or_duplicate_modules(self) -> None:
+        invalid_layouts = [
+            [{"id": "network", "pinned": False, "collapsed": False}],
+            [
+                {"id": "sessions", "pinned": False, "collapsed": False},
+                {"id": "sessions", "pinned": True, "collapsed": False},
+            ],
+        ]
+        for layout in invalid_layouts:
+            with self.subTest(layout=layout), self.assertRaises(quickfile.QuickfileError) as raised:
+                quickfile.settings_command(argparse.Namespace(
+                    active_sessions=None, module_layout_json=json.dumps(layout),
+                ))
+            self.assertEqual(raised.exception.code, "settings-invalid-layout")
+
+    def test_active_sessions_require_allowlisted_terminal_processes_in_scope(self) -> None:
+        proc_root = self.root / "proc"
+        proc_root.mkdir()
+        (proc_root / "uptime").write_text("1000.00 0.00\n", encoding="utf-8")
+
+        def process(pid: int, comm: str, cwd: Path, stdin: str) -> None:
+            directory = proc_root / str(pid)
+            (directory / "fd").mkdir(parents=True)
+            (directory / "comm").write_text(comm + "\n", encoding="utf-8")
+            # After the parenthesized comm, index 19 is Linux stat field 22.
+            fields = ["S"] + ["0"] * 18 + ["50000"]
+            (directory / "stat").write_text(
+                f"{pid} ({comm}) " + " ".join(fields) + "\n", encoding="utf-8"
+            )
+            (directory / "cwd").symlink_to(cwd)
+            (directory / "fd" / "0").symlink_to(stdin)
+
+        project = self.root / "project"
+        project.mkdir()
+        child = project / "src"
+        child.mkdir()
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        process(101, "codex", child, "/dev/pts/7")
+        process(102, "claude", project, "pipe:[123]")
+        process(103, "python3", project, "/dev/pts/8")
+        process(104, "gemini", elsewhere, "/dev/pts/9")
+
+        rows = quickfile.active_session_rows(str(project), proc_root=proc_root)
+        self.assertEqual([(row["agent"], row["pid"]) for row in rows], [("codex", 101)])
+        self.assertEqual(rows[0]["location"], "src")
+        self.assertEqual(rows[0]["cwdToken"], quickfile.encode_path(str(child)))
+        self.assertGreaterEqual(rows[0]["ageSeconds"], 0)
+
+    def test_active_sessions_do_not_infer_activity_from_instruction_files(self) -> None:
+        project = self.root / "agent-project"
+        project.mkdir()
+        (project / "AGENTS.md").write_text("instructions", encoding="utf-8")
+        proc_root = self.root / "empty-proc"
+        proc_root.mkdir()
+        (proc_root / "uptime").write_text("1000.00 0.00\n", encoding="utf-8")
+        self.assertEqual(
+            quickfile.active_session_rows(str(project), proc_root=proc_root), []
+        )
 
     def test_external_command_capture_is_memory_bounded(self) -> None:
         code, output, error = quickfile.run_bounded([

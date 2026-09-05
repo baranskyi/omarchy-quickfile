@@ -13,6 +13,8 @@ ShellRoot {
   property int conflictSignals: 0
   property int createdDelegates: 0
   property int destroyedDelegates: 0
+  property int createdSessionDelegates: 0
+  property int destroyedSessionDelegates: 0
   property bool finished: false
   property bool expectSilent: false
   property string phase: "startup"
@@ -60,6 +62,18 @@ ShellRoot {
         required property var rowData
         Component.onCompleted: suite.createdDelegates++
         Component.onDestruction: suite.destroyedDelegates++
+      }
+    }
+  }
+
+  Item {
+    Repeater {
+      id: sessionRows
+      model: synthetic.sessionsModel
+      delegate: Item {
+        required property var rowData
+        Component.onCompleted: suite.createdSessionDelegates++
+        Component.onDestruction: suite.destroyedSessionDelegates++
       }
     }
   }
@@ -220,6 +234,52 @@ ShellRoot {
     check(recordCommand[3] === "quick-nav" && recordCommand.indexOf("--record") >= 0
       && recordCommand[recordCommand.indexOf("--path-token") + 1] === "recent-token",
       "Recent-location recording does not use a fixed token argument")
+
+    var selectionBeforeSessions = synthetic.selectedToken
+    var propertiesBeforeSessions = synthetic.selectedProperties
+    check(synthetic.applySettings(JSON.stringify({ ok: true, settings: {
+      activeSessionsEnabled: true,
+      modules: [
+        { id: "knowledge", pinned: true, collapsed: true },
+        { id: "sessions", pinned: true, collapsed: false },
+        { id: "favorites", pinned: false, collapsed: false },
+        { id: "devices", pinned: false, collapsed: false }
+      ]
+    } })), "Settings response was rejected")
+    check(synthetic.settingsLoaded && synthetic.activeSessionsEnabled
+      && synthetic.moduleLayout[0].id === "knowledge" && synthetic.knowledgeCollapsed,
+      "Persisted module order or collapse state was not applied")
+    synthetic.sessionsInFlightRootToken = synthetic.rootToken
+    synthetic.sessionsInFlightRootPath = synthetic.rootPath
+    check(synthetic.applySessions(JSON.stringify({ ok: true,
+      root: { token: synthetic.rootToken }, sessions: [
+        { sessionKey: "codex:42", agent: "codex", label: "Codex", pid: 42,
+          cwd: synthetic.rootPath, cwdToken: synthetic.rootToken,
+          location: "this folder", ageSeconds: 90 }
+      ] })), "Active-session response was rejected")
+    check(synthetic.activeSessions.length === 1 && synthetic.sessionsModel.count === 1,
+      "Active sessions were not published through a stable model")
+    var sessionDelegate = sessionRows.itemAt(0)
+    var sessionCreated = createdSessionDelegates
+    var sessionDestroyed = destroyedSessionDelegates
+    synthetic.sessionsInFlightRootToken = synthetic.rootToken
+    synthetic.sessionsInFlightRootPath = synthetic.rootPath
+    check(synthetic.applySessions(JSON.stringify({ ok: true,
+      root: { token: synthetic.rootToken }, sessions: synthetic.activeSessions })),
+      "Unchanged active sessions were rejected")
+    check(sessionRows.itemAt(0) === sessionDelegate
+        && createdSessionDelegates === sessionCreated
+        && destroyedSessionDelegates === sessionDestroyed,
+      "Unchanged session polling rebuilt its delegates")
+    check(synthetic.selectedToken === selectionBeforeSessions
+      && synthetic.selectedProperties === propertiesBeforeSessions,
+      "Active-session refresh changed file selection or inspector state")
+    check(synthetic.moveModule("sessions", 1)
+      && synthetic.moduleLayout[2].id === "sessions",
+      "Module reordering did not update the live layout")
+    check(synthetic.setModulePinned("favorites", true)
+      && synthetic.moduleState("favorites").pinned,
+      "Module pinning did not update the live layout")
 
     prepareRequest()
     var accelerated = JSON.parse(response(synthetic.entries))

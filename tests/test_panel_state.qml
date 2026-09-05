@@ -178,6 +178,11 @@ ShellRoot {
 
   function newFeatureChecks() {
     panel.dismissEditor()
+    var moduleSettings = objectFinder.findChild(panel, "quickfileModuleSettings")
+    check(moduleSettings !== null, "module settings popup was not rendered")
+    moduleSettings.open()
+    check(moduleSettings.visible, "module settings popup did not open")
+    moduleSettings.close()
     select(entry("navigation-draft", "stored"))
     panel.noteDraft = "keep my unsaved note"
     fixture.quickNavEntries = [
@@ -355,6 +360,29 @@ ShellRoot {
     check(noteEditor.activeFocus && noteEditor.cursorPosition === cursorBefore
         && noteEditor.selectionStart === 6 && noteEditor.selectionEnd === 10,
       "background update reset note focus, text selection, or cursor")
+
+    fixture.settingsLoaded = true
+    fixture.moduleLayout = fixture.defaultModuleLayout()
+    fixture.applyModuleCollapseFlags()
+    var sessionsModule = objectFinder.findChild(panel, "quickfileSessionsModule")
+    var knowledgeModule = objectFinder.findChild(panel, "quickfileKnowledgeModule")
+    var fileDelegateBeforeModules = fileView.itemAtIndex(panel.keyboardIndex)
+    var expandedSessionsHeight = sessionsModule ? sessionsModule.height : 0
+    check(sessionsModule !== null && knowledgeModule !== null
+      && sessionsModule.y < knowledgeModule.y,
+      "default module order was not rendered")
+    check(fixture.moveModule("sessions", 1)
+        && fixture.moveModule("sessions", 1)
+        && fixture.moveModule("sessions", 1)
+        && knowledgeModule.y < sessionsModule.y,
+      "reordering modules did not move the existing section")
+    check(fixture.setModuleCollapsed("sessions", true)
+        && sessionsModule.height > 0 && sessionsModule.height < expandedSessionsHeight,
+      "collapsed module did not retain only its live header")
+    check(fileView.itemAtIndex(panel.keyboardIndex) === fileDelegateBeforeModules
+        && noteEditor.text === textBefore && noteEditor.activeFocus
+        && noteEditor.selectionStart === 6 && noteEditor.selectionEnd === 10,
+      "module changes rebuilt file delegates or discarded the editor draft")
 
     check(panel.showInlinePreview(fixture.selectedEntry), "inline preview did not start")
     var preview = objectFinder.findChild(panel, "quickfileInlinePreview")

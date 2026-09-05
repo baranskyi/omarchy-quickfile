@@ -54,13 +54,14 @@ identity, navigation/search, metadata, and a small set of recoverable actions.
   Windsurf.
 - [x] Preview-and-confirm creation of actual agent configuration symlinks with
   native/connected/conflict states and a strict no-overwrite policy.
-- Opt-in read-only adapters for active agent sessions; never infer a running
+- [x] Opt-in read-only adapters for active agent sessions; never infer a running
   session merely from a rule file on disk.
 
 ## 0.6 — blades and modules
 
 - Independent left/right sidebars with resizable vertical blades.
-- Reorder, collapse, pin and persist module layout.
+- [x] Reorder, collapse, pin and persist the Sessions, Devices, Favorites and
+  Project Knowledge module layout without rebuilding file delegates.
 - Built-ins: Files, Properties, Git, Notes, Memory and Skills.
 - Small declarative extension API for data/action modules.
 - Trusted-QML extension tier with an explicit unsandboxed-code warning.

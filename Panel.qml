@@ -125,6 +125,88 @@ Item {
     return fallback[name] || root.foreground
   }
 
+  function moduleLayoutSnapshot() {
+    if (service && Array.isArray(service.moduleLayout) && service.moduleLayout.length > 0)
+      return service.moduleLayout
+    return [
+      { id: "sessions", pinned: true, collapsed: false },
+      { id: "devices", pinned: false, collapsed: false },
+      { id: "favorites", pinned: false, collapsed: false },
+      { id: "knowledge", pinned: true, collapsed: false }
+    ]
+  }
+
+  function moduleState(moduleId) {
+    var layout = moduleLayoutSnapshot()
+    for (var i = 0; i < layout.length; i++)
+      if (String(layout[i].id || "") === moduleId) return layout[i]
+    return { id: moduleId, pinned: false, collapsed: false }
+  }
+
+  function moduleVisible(moduleId) {
+    if (!service) return false
+    var pinned = moduleState(moduleId).pinned === true
+    if (moduleId === "sessions")
+      return pinned || (service.activeSessionsEnabled === true
+        && (service.activeSessions.length > 0 || String(service.sessionsError || "") !== ""))
+    if (moduleId === "devices")
+      return pinned || service.volumes.length > 0 || String(service.volumesError || "") !== ""
+    if (moduleId === "favorites") return pinned || service.favorites.length > 0
+    if (moduleId === "knowledge")
+      return pinned || service.knowledgeFiles.length > 0 || String(service.knowledgeError || "") !== ""
+    return false
+  }
+
+  function moduleStackOffset(moduleId, heights) {
+    var position = 0
+    var layout = moduleLayoutSnapshot()
+    for (var i = 0; i < layout.length; i++) {
+      var id = String(layout[i].id || "")
+      if (id === moduleId) return position
+      var height = Number(heights[id] || 0)
+      if (height > 0) position += height + Style.space(4)
+    }
+    return position
+  }
+
+  function moduleStackHeight(heights) {
+    var position = 0
+    var layout = moduleLayoutSnapshot()
+    for (var i = 0; i < layout.length; i++) {
+      var height = Number(heights[String(layout[i].id || "")] || 0)
+      if (height > 0) position += height + Style.space(4)
+    }
+    return position
+  }
+
+  function moduleLabel(moduleId) {
+    return ({ sessions: "AI Sessions", devices: "Devices", favorites: "Favorites",
+      knowledge: "Project Knowledge" })[moduleId] || moduleId
+  }
+
+  function moduleGlyph(moduleId) {
+    return ({ sessions: "󰚩", devices: "󰋊", favorites: "★",
+      knowledge: "󰧑" })[moduleId] || "󰘦"
+  }
+
+  function toggleModuleCollapsed(moduleId) {
+    if (service && typeof service.toggleModuleCollapsed === "function")
+      return service.toggleModuleCollapsed(moduleId)
+    var property = ({ sessions: "sessionsCollapsed", devices: "volumesCollapsed",
+      favorites: "favoritesCollapsed", knowledge: "knowledgeCollapsed" })[moduleId]
+    if (service && property) service[property] = !service[property]
+    return true
+  }
+
+  function sessionAge(seconds) {
+    var value = Number(seconds || -1)
+    if (value < 0) return "active"
+    if (value < 60) return "now"
+    if (value < 3600) return Math.floor(value / 60) + "m"
+    if (value < 86400) return Math.floor(value / 3600) + "h"
+    return Math.floor(value / 86400) + "d"
+  }
+
   function focusedScreenName() {
     var monitor = Hyprland.focusedMonitor
     if (monitor && monitor.name) return String(monitor.name)
@@ -859,7 +941,7 @@ Item {
     function rowKey(index) {
       if (!model || index < 0 || index >= count) return ""
       var row = model.get(index).rowData
-      return row ? String(row.token || row.device || "") : ""
+      return row ? String(row.token || row.device || row.sessionKey || "") : ""
     }
 
     function rememberViewport() {
@@ -1018,6 +1100,12 @@ Item {
           id: keyScope
           anchors.fill: parent
           focus: true
+          readonly property var moduleHeights: ({
+            sessions: sessionsModule.height,
+            devices: devicesModule.height,
+            favorites: favoritesModule.height,
+            knowledge: knowledgeModule.height
+          })
           Keys.priority: Keys.BeforeItem
           Keys.onPressed: function(event) {
             if (root.editorMode !== "") return
@@ -1174,9 +1262,189 @@ Item {
                 onClicked: root.inspectorOpen = !root.inspectorOpen
               }
               Components.IconButton {
+                glyph: "󰒓"
+                tooltip: "Arrange modules"
+                active: moduleSettingsPopup.visible
+                onClicked: moduleSettingsPopup.visible
+                  ? moduleSettingsPopup.close() : moduleSettingsPopup.open()
+              }
+              Components.IconButton {
                 glyph: "󰅖"
                 tooltip: "Close"
                 onClicked: root.requestClose()
+              }
+            }
+          }
+
+          Popup {
+            id: moduleSettingsPopup
+            objectName: "quickfileModuleSettings"
+            parent: keyScope
+            x: blade.width - width - Style.space(8)
+            y: header.height + Style.space(5)
+            width: Style.space(302)
+            height: Style.space(258)
+            padding: Style.space(8)
+            modal: false
+            focus: true
+            closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+            background: Rectangle {
+              color: root.background
+              radius: Style.cornerRadius
+              border.width: Math.max(1, Style.normalBorderWidth)
+              border.color: root.borderColor
+            }
+            contentItem: Column {
+              spacing: Style.space(4)
+              Text {
+                width: parent.width
+                height: Style.space(25)
+                text: "MODULES"
+                color: root.foreground
+                font.family: Style.font.family
+                font.pixelSize: Style.font.bodySmall
+                font.bold: true
+                font.letterSpacing: 1
+                verticalAlignment: Text.AlignVCenter
+              }
+              Rectangle {
+                width: parent.width
+                height: Style.space(43)
+                radius: Style.cornerRadius > 0 ? Style.space(5) : 0
+                color: Qt.alpha(root.accent, 0.07)
+                border.width: Style.normalBorderWidth
+                border.color: Style.normalBorderColor
+                Column {
+                  anchors.left: parent.left
+                  anchors.leftMargin: Style.space(9)
+                  anchors.right: sessionOptIn.left
+                  anchors.rightMargin: Style.space(8)
+                  anchors.verticalCenter: parent.verticalCenter
+                  Text {
+                    text: "Active AI sessions"
+                    color: root.foreground
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.bodySmall
+                    font.bold: true
+                  }
+                  Text {
+                    text: "Opt-in · local process metadata only"
+                    color: root.muted
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.caption
+                  }
+                }
+                Rectangle {
+                  id: sessionOptIn
+                  anchors.right: parent.right
+                  anchors.rightMargin: Style.space(8)
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: Style.space(48)
+                  height: Style.space(24)
+                  radius: height / 2
+                  color: root.service && root.service.activeSessionsEnabled
+                    ? Qt.alpha(root.accent, 0.32) : Qt.alpha(root.muted, 0.15)
+                  border.width: 1
+                  border.color: root.service && root.service.activeSessionsEnabled
+                    ? root.accent : root.muted
+                  Rectangle {
+                    width: Style.space(18)
+                    height: width
+                    radius: width / 2
+                    anchors.verticalCenter: parent.verticalCenter
+                    x: root.service && root.service.activeSessionsEnabled
+                      ? parent.width - width - Style.space(3) : Style.space(3)
+                    color: root.service && root.service.activeSessionsEnabled
+                      ? root.accent : root.muted
+                    Behavior on x { NumberAnimation { duration: 120 } }
+                  }
+                  MouseArea {
+                    anchors.fill: parent
+                    enabled: root.service && root.service.settingsLoaded
+                    cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+                    onClicked: root.service.setActiveSessionsEnabled(
+                      !root.service.activeSessionsEnabled)
+                  }
+                }
+              }
+              Repeater {
+                model: root.moduleLayoutSnapshot()
+                delegate: Rectangle {
+                  required property int index
+                  required property var modelData
+                  width: parent.width
+                  height: Style.space(38)
+                  radius: Style.cornerRadius > 0 ? Style.space(4) : 0
+                  color: moduleRowMouse.containsMouse ? Style.hoverFill : "transparent"
+                  Text {
+                    anchors.left: parent.left
+                    anchors.leftMargin: Style.space(7)
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: parent.width - Style.space(128)
+                    text: root.moduleGlyph(String(parent.modelData.id)) + "  "
+                      + root.moduleLabel(String(parent.modelData.id))
+                    color: root.foreground
+                    elide: Text.ElideRight
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.bodySmall
+                  }
+                  MouseArea {
+                    id: moduleRowMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    acceptedButtons: Qt.NoButton
+                  }
+                  Row {
+                    z: 2
+                    anchors.right: parent.right
+                    anchors.rightMargin: Style.space(2)
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: 0
+                    Components.IconButton {
+                      glyph: "󰁝"
+                      tooltip: "Move up"
+                      buttonSize: Style.space(27)
+                      available: root.service && root.service.settingsLoaded && index > 0
+                      onClicked: root.service.moveModule(String(modelData.id), -1)
+                    }
+                    Components.IconButton {
+                      glyph: "󰁅"
+                      tooltip: "Move down"
+                      buttonSize: Style.space(27)
+                      available: root.service && root.service.settingsLoaded
+                        && index < root.moduleLayoutSnapshot().length - 1
+                      onClicked: root.service.moveModule(String(modelData.id), 1)
+                    }
+                    Components.IconButton {
+                      glyph: modelData.pinned === true ? "󰐃" : "󰐂"
+                      tooltip: modelData.pinned === true
+                        ? "Unpin when empty" : "Keep visible when empty"
+                      active: modelData.pinned === true
+                      buttonSize: Style.space(27)
+                      available: root.service && root.service.settingsLoaded
+                      onClicked: root.service.setModulePinned(String(modelData.id),
+                        modelData.pinned !== true)
+                    }
+                    Components.IconButton {
+                      glyph: modelData.collapsed === true ? "󰅂" : "󰅀"
+                      tooltip: modelData.collapsed === true ? "Expand" : "Collapse"
+                      active: modelData.collapsed === true
+                      buttonSize: Style.space(27)
+                      available: root.service && root.service.settingsLoaded
+                      onClicked: root.service.setModuleCollapsed(String(modelData.id),
+                        modelData.collapsed !== true)
+                    }
+                  }
+                }
+              }
+              Text {
+                visible: root.service && String(root.service.settingsError || "") !== ""
+                width: parent.width
+                text: root.service ? String(root.service.settingsError || "") : ""
+                color: Color.urgent
+                elide: Text.ElideRight
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
               }
             }
           }
@@ -1349,17 +1617,206 @@ Item {
             }
           }
 
-          Rectangle {
-            id: devicesHeader
-            anchors.top: searchSurface.bottom
-            anchors.topMargin: visible ? Style.space(6) : 0
+          Item {
+            id: sessionsModule
+            objectName: "quickfileSessionsModule"
             anchors.left: parent.left
             anchors.right: parent.right
-            height: visible ? Style.space(27) : 0
-            // A background scan is transient and must not change layout. Keep
-            // this section stable unless a drive or durable error exists.
-            visible: root.service && (root.service.volumes.length > 0
-              || root.service.volumesError !== "")
+            y: searchSurface.y + searchSurface.height + Style.space(6)
+              + root.moduleStackOffset("sessions", keyScope.moduleHeights)
+            visible: root.moduleVisible("sessions")
+            height: visible ? sessionsHeader.height + sessionsBody.height : 0
+
+            Rectangle {
+              id: sessionsHeader
+              anchors.top: parent.top
+              anchors.left: parent.left
+              anchors.right: parent.right
+              height: Style.space(27)
+              color: "transparent"
+              Text {
+                anchors.left: parent.left
+                anchors.leftMargin: Style.space(12)
+                anchors.verticalCenter: parent.verticalCenter
+                text: (root.service && root.service.sessionsCollapsed ? "󰅂" : "󰅀")
+                  + "  󰚩  AI SESSIONS"
+                color: root.service && root.service.activeSessions.length > 0
+                  ? root.accent : root.muted
+                font.family: Style.font.family
+                font.pixelSize: Style.font.bodySmall
+                font.bold: true
+                renderType: Text.NativeRendering
+              }
+              Text {
+                id: sessionsToggle
+                z: 2
+                anchors.right: parent.right
+                anchors.rightMargin: Style.space(12)
+                anchors.verticalCenter: parent.verticalCenter
+                text: !root.service || !root.service.settingsLoaded ? "…"
+                  : root.service.activeSessionsEnabled
+                    ? (root.service.sessionsBusy ? "CHECKING…"
+                      : root.service.activeSessions.length + " ACTIVE")
+                    : "ENABLE"
+                color: root.service && root.service.activeSessionsEnabled
+                  ? root.accent : root.muted
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                renderType: Text.NativeRendering
+                MouseArea {
+                  anchors.fill: parent
+                  anchors.margins: -Style.space(7)
+                  enabled: root.service && root.service.settingsLoaded
+                  hoverEnabled: true
+                  cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+                  onClicked: root.service.setActiveSessionsEnabled(
+                    !root.service.activeSessionsEnabled)
+                  ToolTip.visible: containsMouse
+                  ToolTip.delay: 500
+                  ToolTip.text: root.service && root.service.activeSessionsEnabled
+                    ? "Disable read-only process detection"
+                    : "Opt in to local, read-only terminal session detection"
+                }
+              }
+              MouseArea {
+                anchors.left: parent.left
+                anchors.right: sessionsToggle.left
+                anchors.top: parent.top
+                anchors.bottom: parent.bottom
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.toggleModuleCollapsed("sessions")
+              }
+            }
+
+            Item {
+              id: sessionsBody
+              anchors.top: sessionsHeader.bottom
+              anchors.left: parent.left
+              anchors.right: parent.right
+              height: root.service && !root.service.sessionsCollapsed
+                ? (root.service.activeSessionsEnabled && root.service.activeSessions.length > 0
+                  ? Math.min(sessionsList.contentHeight, Style.space(126)) : Style.space(42)) : 0
+              clip: true
+
+              StableListView {
+                id: sessionsList
+                objectName: "quickfileSessionsList"
+                anchors.fill: parent
+                visible: root.service && root.service.activeSessionsEnabled
+                  && root.service.activeSessions.length > 0
+                boundsBehavior: Flickable.StopAtBounds
+                model: root.service ? root.service.sessionsModel : null
+                delegate: Rectangle {
+                  id: sessionRow
+                  required property var rowData
+                  readonly property var modelData: rowData
+                  width: sessionsList.width
+                  height: Style.space(42)
+                  color: sessionMouse.containsMouse ? Style.hoverFill : "transparent"
+                  Rectangle {
+                    anchors.left: parent.left
+                    anchors.leftMargin: Style.space(45)
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: Style.space(28)
+                    height: Style.space(22)
+                    radius: Style.cornerRadius > 0 ? Style.space(4) : 0
+                    color: Qt.alpha(root.accent, 0.12)
+                    border.width: 1
+                    border.color: Qt.alpha(root.accent, 0.5)
+                    Text {
+                      anchors.centerIn: parent
+                      text: root.agentBadges([sessionRow.modelData.agent])
+                      color: root.accent
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                    }
+                  }
+                  Column {
+                    anchors.left: parent.left
+                    anchors.leftMargin: Style.space(80)
+                    anchors.right: sessionAgeLabel.left
+                    anchors.rightMargin: Style.space(7)
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: 0
+                    Text {
+                      width: parent.width
+                      text: String(sessionRow.modelData.label || "AI agent")
+                      color: root.foreground
+                      elide: Text.ElideRight
+                      font.family: Style.font.family
+                      font.pixelSize: root.primaryFontSize
+                    }
+                    Text {
+                      width: parent.width
+                      text: String(sessionRow.modelData.location || "")
+                      color: root.muted
+                      elide: Text.ElideMiddle
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.caption
+                    }
+                  }
+                  Text {
+                    id: sessionAgeLabel
+                    anchors.right: parent.right
+                    anchors.rightMargin: Style.space(12)
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: root.sessionAge(sessionRow.modelData.ageSeconds)
+                    color: root.muted
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.caption
+                  }
+                  MouseArea {
+                    id: sessionMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.service.navigateSession(sessionRow.modelData)
+                    ToolTip.visible: containsMouse
+                    ToolTip.delay: 650
+                    ToolTip.text: String(sessionRow.modelData.cwd || "")
+                  }
+                }
+                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+              }
+              Text {
+                anchors.left: parent.left
+                anchors.leftMargin: Style.space(48)
+                anchors.right: parent.right
+                anchors.rightMargin: Style.space(12)
+                anchors.verticalCenter: parent.verticalCenter
+                visible: !sessionsList.visible
+                text: !root.service ? ""
+                  : !root.service.activeSessionsEnabled
+                    ? "Read-only and off until you opt in"
+                    : root.service.sessionsError !== ""
+                      ? root.service.sessionsError : "No active terminal sessions here"
+                color: root.service && root.service.sessionsError !== ""
+                  ? Color.urgent : root.muted
+                elide: Text.ElideRight
+                font.family: Style.font.family
+                font.pixelSize: Style.font.bodySmall
+              }
+            }
+          }
+
+          Item {
+            id: devicesModule
+            objectName: "quickfileDevicesModule"
+            anchors.left: parent.left
+            anchors.right: parent.right
+            y: searchSurface.y + searchSurface.height + Style.space(6)
+              + root.moduleStackOffset("devices", keyScope.moduleHeights)
+            visible: root.moduleVisible("devices")
+            height: visible ? devicesHeader.height + devicesList.height : 0
+
+          Rectangle {
+            id: devicesHeader
+            anchors.top: parent.top
+            anchors.left: parent.left
+            anchors.right: parent.right
+            height: Style.space(27)
             color: "transparent"
 
             Text {
@@ -1395,8 +1852,7 @@ Item {
               anchors.fill: parent
               hoverEnabled: true
               cursorShape: Qt.PointingHandCursor
-              onClicked: if (root.service)
-                root.service.volumesCollapsed = !root.service.volumesCollapsed
+              onClicked: root.toggleModuleCollapsed("devices")
               ToolTip.visible: containsMouse && root.service
                 && root.service.volumesError !== ""
               ToolTip.delay: 600
@@ -1506,15 +1962,24 @@ Item {
 
             ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
           }
+          }
+
+          Item {
+            id: favoritesModule
+            objectName: "quickfileFavoritesModule"
+            anchors.left: parent.left
+            anchors.right: parent.right
+            y: searchSurface.y + searchSurface.height + Style.space(6)
+              + root.moduleStackOffset("favorites", keyScope.moduleHeights)
+            visible: root.moduleVisible("favorites")
+            height: visible ? favoritesHeader.height + favoritesList.height : 0
 
           Rectangle {
             id: favoritesHeader
-            anchors.top: devicesList.bottom
-            anchors.topMargin: visible ? Style.space(4) : 0
+            anchors.top: parent.top
             anchors.left: parent.left
             anchors.right: parent.right
-            height: visible ? Style.space(25) : 0
-            visible: root.service && root.service.favorites.length > 0
+            height: Style.space(25)
             color: "transparent"
 
             Text {
@@ -1542,8 +2007,7 @@ Item {
             MouseArea {
               anchors.fill: parent
               cursorShape: Qt.PointingHandCursor
-              onClicked: if (root.service)
-                root.service.favoritesCollapsed = !root.service.favoritesCollapsed
+              onClicked: root.toggleModuleCollapsed("favorites")
             }
           }
 
@@ -1675,11 +2139,21 @@ Item {
 
             ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
           }
+          }
+
+          Item {
+            id: knowledgeModule
+            objectName: "quickfileKnowledgeModule"
+            anchors.left: parent.left
+            anchors.right: parent.right
+            y: searchSurface.y + searchSurface.height + Style.space(6)
+              + root.moduleStackOffset("knowledge", keyScope.moduleHeights)
+            visible: root.moduleVisible("knowledge")
+            height: visible ? knowledgeHeader.height + knowledgeList.height : 0
 
           Rectangle {
             id: knowledgeHeader
-            anchors.top: favoritesList.bottom
-            anchors.topMargin: Style.space(4)
+            anchors.top: parent.top
             anchors.left: parent.left
             anchors.right: parent.right
             height: Style.space(27)
@@ -1718,8 +2192,7 @@ Item {
             MouseArea {
               anchors.fill: parent
               cursorShape: Qt.PointingHandCursor
-              onClicked: if (root.service)
-                root.service.knowledgeCollapsed = !root.service.knowledgeCollapsed
+              onClicked: root.toggleModuleCollapsed("knowledge")
             }
           }
 
@@ -1895,11 +2368,12 @@ Item {
 
             ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
           }
+          }
 
           Rectangle {
             id: contextStrip
-            anchors.top: knowledgeList.bottom
-            anchors.topMargin: Style.space(4)
+            y: searchSurface.y + searchSurface.height + Style.space(2)
+              + root.moduleStackHeight(keyScope.moduleHeights)
             anchors.left: parent.left
             anchors.right: parent.right
             height: Style.space(25)

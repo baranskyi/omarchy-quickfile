@@ -10,3 +10,5 @@ dist/
 !.env.example
 .codex/
 .agents/
+# Local development instructions must not ship in the installable plugin tree.
+AGENTS.md

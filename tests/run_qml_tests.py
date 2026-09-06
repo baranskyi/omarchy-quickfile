@@ -49,6 +49,12 @@ def prepare_plugin(config: Path, panel_test: bool) -> None:
       width: root.bladeWidth
       height: 900
       color: "transparent"
+      readonly property bool keyboardCaptureActive: root.opened
+
+      function claimKeyboardFocus() {
+        if (!root.opened || !visible) return
+        Qt.callLater(function() { keyScope.forceActiveFocus() })
+      }
 
 """
     adapted = source[:start] + wrapper + source[end:]

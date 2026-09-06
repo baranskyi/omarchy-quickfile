@@ -302,12 +302,25 @@ ShellRoot {
       fixture.entriesModel.append({ rowData: rows[index], scope: "" })
     select(rows[40])
     panel.open("{}")
-    panel.keyboardIndex = 40
   }
 
   function viewportChecks() {
     fileView = objectFinder.findChild(panel, "quickfileFileList")
     check(fileView !== null, "could not find the rendered file list")
+    var panelWindow = objectFinder.findChild(panel, "quickfilePanelWindow")
+    var keyScope = objectFinder.findChild(panel, "quickfileKeyScope")
+    check(panelWindow !== null && panelWindow.keyboardCaptureActive,
+      "open panel did not keep exclusive keyboard focus")
+    check(keyScope !== null && keyScope.activeFocus,
+      "open panel did not activate its keyboard event scope")
+    check(panel.keyboardIndex === 40,
+      "opening the panel did not retain the selected file as the keyboard cursor")
+    check(panel.handleVerticalNavigationKey(Qt.Key_Down, Qt.NoModifier)
+        && panel.keyboardIndex === 41 && fixture.selectedToken === "row-41",
+      "Down did not move selection to the next file")
+    check(panel.handleVerticalNavigationKey(Qt.Key_Up, Qt.NoModifier)
+        && panel.keyboardIndex === 40 && fixture.selectedToken === "row-40",
+      "Up did not move selection to the previous file")
     fileView.forceLayout()
     fileView.positionViewAtIndex(35, ListView.Beginning)
     fileView.forceLayout()

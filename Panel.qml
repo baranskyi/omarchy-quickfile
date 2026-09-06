@@ -16,7 +16,6 @@ Item {
   property var manifest: null
   property var service: null
   property bool opened: false
-  property bool focusPrimed: false
   property string targetScreenName: ""
   property int keyboardIndex: -1
   // Selection alone must not resize the file list. The inspector opens only
@@ -87,12 +86,6 @@ Item {
       duration: root.revealDuration
       easing.type: Easing.OutCubic
     }
-  }
-
-  Timer {
-    id: focusPrimeTimer
-    interval: 90
-    onTriggered: root.focusPrimed = true
   }
 
   FileView {
@@ -222,10 +215,8 @@ Item {
     var payload = ({})
     try { payload = JSON.parse(String(payloadJson || "{}")) || ({}) } catch (error) {}
     targetScreenName = focusedScreenName()
-    focusPrimed = false
     opened = true
-    focusPrimeTimer.restart()
-    keyboardIndex = -1
+    keyboardIndex = selectedEntryIndex()
     if (service) {
       service.setPanelVisible(true)
       if (payload.path) service.navigate(String(payload.path), "", true)
@@ -235,8 +226,6 @@ Item {
   function close() {
     dismissEditor()
     hoveredToken = ""
-    focusPrimeTimer.stop()
-    focusPrimed = false
     opened = false
     if (service) service.setPanelVisible(false)
   }
@@ -769,6 +758,27 @@ Item {
     keyboardNavigationRequested(keyboardIndex)
   }
 
+  function selectedEntryIndex() {
+    if (!service) return -1
+    var selected = String(service.selectedToken || "")
+    if (selected === "") return -1
+    for (var i = 0; i < service.entries.length; i++)
+      if (String(service.entries[i].token || "") === selected) return i
+    return -1
+  }
+
+  function handleVerticalNavigationKey(key, modifiers) {
+    if (key === Qt.Key_Up || key === Qt.Key_K) {
+      moveSelection(-1, modifiers)
+      return true
+    }
+    if (key === Qt.Key_Down || key === Qt.Key_J) {
+      moveSelection(1, modifiers)
+      return true
+    }
+    return false
+  }
+
   function rememberKeyboardCursor() {
     keyboardSnapshot = service && keyboardIndex >= 0
       && keyboardIndex < service.entries.length
@@ -1208,12 +1218,26 @@ Item {
       WlrLayershell.namespace: "omarchy-quickfile"
       WlrLayershell.layer: WlrLayer.Top
       WlrLayershell.keyboardFocus: root.opened
-        ? (root.focusPrimed ? WlrKeyboardFocus.OnDemand
-          : WlrKeyboardFocus.Exclusive)
+        ? WlrKeyboardFocus.Exclusive
         : WlrKeyboardFocus.None
 
+      readonly property bool keyboardCaptureActive: root.opened
+        && WlrLayershell.keyboardFocus === WlrKeyboardFocus.Exclusive
+
+      function claimKeyboardFocus() {
+        if (!root.opened || !visible) return
+        Qt.callLater(function() { keyScope.forceActiveFocus() })
+      }
+
       onVisibleChanged: {
-        if (visible) Qt.callLater(function() { keyScope.forceActiveFocus() })
+        if (visible) claimKeyboardFocus()
+      }
+
+      Connections {
+        target: root
+        function onOpenedChanged() {
+          if (root.opened) window.claimKeyboardFocus()
+        }
       }
 
       Rectangle {
@@ -1235,6 +1259,7 @@ Item {
 
         FocusScope {
           id: keyScope
+          objectName: "quickfileKeyScope"
           anchors.fill: parent
           focus: true
           readonly property var moduleHeights: ({
@@ -1256,6 +1281,9 @@ Item {
               if (event.key === Qt.Key_Escape) {
                 if (searchField.text !== "") searchField.clear()
                 else keyScope.forceActiveFocus()
+                event.accepted = true
+              } else if ((event.key === Qt.Key_Up || event.key === Qt.Key_Down)
+                  && root.handleVerticalNavigationKey(event.key, event.modifiers)) {
                 event.accepted = true
               }
               return
@@ -1298,11 +1326,7 @@ Item {
             } else if (event.key === Qt.Key_Space) {
               root.previewHoveredOrSelected((event.modifiers & Qt.ShiftModifier) !== 0)
               event.accepted = true
-            } else if (event.key === Qt.Key_Up || event.key === Qt.Key_K) {
-              root.moveSelection(-1, event.modifiers)
-              event.accepted = true
-            } else if (event.key === Qt.Key_Down || event.key === Qt.Key_J) {
-              root.moveSelection(1, event.modifiers)
+            } else if (root.handleVerticalNavigationKey(event.key, event.modifiers)) {
               event.accepted = true
             } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
               if (root.keyboardIndex >= 0) root.service.activateIndex(root.keyboardIndex)

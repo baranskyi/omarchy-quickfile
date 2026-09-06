@@ -792,6 +792,15 @@ Item {
     return false
   }
 
+  function handleTrashShortcut(key) {
+    if (key !== Qt.Key_Delete && key !== Qt.Key_Backspace) return false
+    if (service && service.selectedToken !== "" && !service.actionBusy)
+      beginEditor("trash")
+    // Consume both deletion keys even without a selection. Backspace used to
+    // navigate to the parent, which made an empty delete attempt surprising.
+    return true
+  }
+
   function rememberKeyboardCursor() {
     keyboardSnapshot = service && keyboardIndex >= 0
       && keyboardIndex < service.entries.length
@@ -1361,8 +1370,9 @@ Item {
             } else if (event.key === Qt.Key_Right || event.key === Qt.Key_L) {
               if (root.keyboardIndex >= 0) root.service.enterIndex(root.keyboardIndex)
               event.accepted = true
-            } else if (event.key === Qt.Key_Left || event.key === Qt.Key_H
-                || event.key === Qt.Key_Backspace) {
+            } else if (root.handleTrashShortcut(event.key)) {
+              event.accepted = true
+            } else if (event.key === Qt.Key_Left || event.key === Qt.Key_H) {
               root.service.goParent()
               event.accepted = true
             } else if (event.key === Qt.Key_Slash
@@ -2813,7 +2823,7 @@ Item {
                 }
                 Components.IconButton {
                   glyph: "󰩺"
-                  tooltip: "Move to Trash"
+                  tooltip: "Move to Trash  ·  Delete / Backspace"
                   framed: true
                   buttonSize: Style.space(27)
                   available: root.service && root.service.selectedToken !== ""

@@ -108,7 +108,8 @@ concept. It does not depend on or copy unreleased FileBlade source code.
 | `Ctrl+A` | Select all currently visible file rows |
 | `Enter` | Expand a directory or open a file |
 | `→` / `L` | Enter a directory or open a file |
-| `←` / `H`, `Backspace` | Parent directory |
+| `←` / `H` | Parent directory |
+| `Delete` / `Backspace` | Move selected files and folders to Trash |
 | `/`, `Ctrl+F` | Focus search |
 | `Ctrl+P` | Open Quick Nav |
 | `.` | Toggle hidden files |

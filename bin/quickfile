@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-VERSION = "0.11.4"
+VERSION = "0.11.5"
 DEFAULT_LIMIT = 2000
 COMMAND_TIMEOUT = 3
 DEFAULT_CONTENT_FILE_LIMIT = 1024 * 1024

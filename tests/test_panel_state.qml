@@ -19,6 +19,7 @@ ShellRoot {
     property var lastDrop: null
     property string lastConflictPolicy: ""
     property string externalPreviewToken: ""
+    property var lastTrashedTokens: []
     initialized: true
     rootPath: "/quickfile-test"
     rootToken: "test-root"
@@ -28,6 +29,10 @@ ShellRoot {
     function saveSelectedMetadata(color, note, starred) { return !rejectSave }
     function saveSelectedKnowledge(registered, agents) { return !rejectSave }
     function renameSelected(name) { return true }
+    function trashSelected() {
+      lastTrashedTokens = effectiveSelectionTokens()
+      return true
+    }
     function reloadTrash() { return true }
     function permanentlyDeleteTrash(uri) { return true }
     function reloadQuickNav() { return true }
@@ -157,6 +162,24 @@ ShellRoot {
       "Rename conflict was not left visible in the dialog")
     fixture.actionFinished("rename", true, "Renamed")
     check(panel.editorMode === "", "Successful rename did not close its dialog")
+
+    select(entry("single-delete", ""))
+    check(panel.handleTrashShortcut(Qt.Key_Delete) && panel.editorMode === "trash",
+      "Delete did not request Trash confirmation for one selected item")
+    panel.commitEditor()
+    check(panel.editorMode === "" && fixture.lastTrashedTokens.length === 1
+        && fixture.lastTrashedTokens[0] === "single-delete",
+      "Delete confirmation did not send the selected item to Trash")
+    fixture.selectedTokens = ["single-delete", "second-delete"]
+    check(panel.handleTrashShortcut(Qt.Key_Backspace) && panel.editorMode === "trash"
+        && fixture.selectedTokens.length === 2,
+      "Backspace did not preserve a multi-selection for Trash confirmation")
+    panel.commitEditor()
+    check(panel.editorMode === "" && fixture.lastTrashedTokens.length === 2,
+      "Backspace confirmation did not send the full selection to Trash")
+    fixture.clearSelection()
+    check(panel.handleTrashShortcut(Qt.Key_Delete) && panel.editorMode === "",
+      "Delete without a selection opened a destructive action")
 
     fixture.trashEntries = [{ uri: "trash:///old.txt", name: "old.txt",
       originalPath: "/quickfile-test/old.txt" }]

@@ -16,6 +16,7 @@ Item {
   property var manifest: null
   property var service: null
   property bool opened: false
+  property bool focusPrimed: false
   property string targetScreenName: ""
   property int keyboardIndex: -1
   // Selection alone must not resize the file list. The inspector opens only
@@ -86,6 +87,15 @@ Item {
       duration: root.revealDuration
       easing.type: Easing.OutCubic
     }
+  }
+
+  Timer {
+    id: focusPrimeTimer
+    // Start this only after the Wayland surface is mapped. The short
+    // Exclusive phase gives a keyboard-summoned panel initial focus; settling
+    // on OnDemand then returns normal pointer and keyboard focus to apps.
+    interval: 75
+    onTriggered: if (root.opened) root.focusPrimed = true
   }
 
   FileView {
@@ -215,6 +225,7 @@ Item {
     var payload = ({})
     try { payload = JSON.parse(String(payloadJson || "{}")) || ({}) } catch (error) {}
     targetScreenName = focusedScreenName()
+    focusPrimed = false
     opened = true
     keyboardIndex = selectedEntryIndex()
     if (service) {
@@ -226,6 +237,8 @@ Item {
   function close() {
     dismissEditor()
     hoveredToken = ""
+    focusPrimeTimer.stop()
+    focusPrimed = false
     opened = false
     if (service) service.setPanelVisible(false)
   }
@@ -1218,25 +1231,39 @@ Item {
       WlrLayershell.namespace: "omarchy-quickfile"
       WlrLayershell.layer: WlrLayer.Top
       WlrLayershell.keyboardFocus: root.opened
-        ? WlrKeyboardFocus.Exclusive
+        ? (root.focusPrimed ? WlrKeyboardFocus.OnDemand
+          : WlrKeyboardFocus.Exclusive)
         : WlrKeyboardFocus.None
 
-      readonly property bool keyboardCaptureActive: root.opened
-        && WlrLayershell.keyboardFocus === WlrKeyboardFocus.Exclusive
+      readonly property bool keyboardFocusOnDemand: root.opened
+        && WlrLayershell.keyboardFocus === WlrKeyboardFocus.OnDemand
 
       function claimKeyboardFocus() {
         if (!root.opened || !visible) return
         Qt.callLater(function() { keyScope.forceActiveFocus() })
       }
 
-      onVisibleChanged: {
-        if (visible) claimKeyboardFocus()
+      function beginFocusPrime() {
+        if (!root.opened || !backingWindowVisible) return
+        root.focusPrimed = false
+        focusPrimeTimer.restart()
       }
+
+      onVisibleChanged: {
+        if (visible) {
+          claimKeyboardFocus()
+          beginFocusPrime()
+        }
+      }
+      onBackingWindowVisibleChanged: beginFocusPrime()
 
       Connections {
         target: root
         function onOpenedChanged() {
-          if (root.opened) window.claimKeyboardFocus()
+          if (root.opened) {
+            window.claimKeyboardFocus()
+            window.beginFocusPrime()
+          }
         }
       }
 

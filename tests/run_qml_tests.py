@@ -49,15 +49,24 @@ def prepare_plugin(config: Path, panel_test: bool) -> None:
       width: root.bladeWidth
       height: 900
       color: "transparent"
-      readonly property bool keyboardCaptureActive: root.opened
+      readonly property bool keyboardFocusOnDemand: root.opened && root.focusPrimed
 
       function claimKeyboardFocus() {
         if (!root.opened || !visible) return
         Qt.callLater(function() { keyScope.forceActiveFocus() })
       }
 
+      function beginFocusPrime() {
+        if (!root.opened || !visible) return
+        root.focusPrimed = false
+        focusPrimeTimer.restart()
+      }
+
 """
     adapted = source[:start] + wrapper + source[end:]
+    adapted = adapted.replace(
+        "      onBackingWindowVisibleChanged: beginFocusPrime()\n", "", 1
+    )
     adapted = adapted.replace("import QtQuick\n", "import QtQuick\nimport QtQuick.Window\n", 1)
     (plugin / "Panel.qml").write_text(adapted, encoding="utf-8")
 

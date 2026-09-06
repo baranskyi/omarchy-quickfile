@@ -309,8 +309,8 @@ ShellRoot {
     check(fileView !== null, "could not find the rendered file list")
     var panelWindow = objectFinder.findChild(panel, "quickfilePanelWindow")
     var keyScope = objectFinder.findChild(panel, "quickfileKeyScope")
-    check(panelWindow !== null && panelWindow.keyboardCaptureActive,
-      "open panel did not keep exclusive keyboard focus")
+    check(panelWindow !== null && panelWindow.keyboardFocusOnDemand,
+      "open panel did not settle on non-modal keyboard focus")
     check(keyScope !== null && keyScope.activeFocus,
       "open panel did not activate its keyboard event scope")
     check(panel.keyboardIndex === 40,

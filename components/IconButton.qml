@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import qs.Commons
+import "plaintext.js" as PlainText
 
 Rectangle {
   id: root
@@ -24,6 +25,7 @@ Rectangle {
   opacity: available ? 1 : 0.35
 
   Text {
+    textFormat: Text.PlainText
     anchors.centerIn: parent
     text: root.glyph
     color: root.active ? Color.accent : Color.popups.text
@@ -44,6 +46,6 @@ Rectangle {
     ToolTip.visible: containsMouse && root.tooltip !== ""
     ToolTip.delay: 650
     ToolTip.timeout: 5000
-    ToolTip.text: root.tooltip
+    ToolTip.text: PlainText.tooltip(root.tooltip)
   }
 }

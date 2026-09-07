@@ -8,6 +8,7 @@ import Quickshell.Hyprland
 import Quickshell.Io
 import qs.Commons
 import "components" as Components
+import "components/plaintext.js" as PlainText
 
 Item {
   id: root
@@ -1014,6 +1015,7 @@ Item {
       border.color: root.accent
       radius: Style.space(3)
       Text {
+        textFormat: Text.PlainText
         anchors.centerIn: parent
         text: "Drop here · choose Copy or Move"
         color: root.foreground
@@ -1223,6 +1225,7 @@ Item {
       anchors.centerIn: parent
       spacing: Style.space(5)
       Text {
+        textFormat: Text.PlainText
         text: actionButton.glyph
         color: root.foreground
         font.family: Style.font.family
@@ -1230,6 +1233,7 @@ Item {
         renderType: Text.NativeRendering
       }
       Text {
+        textFormat: Text.PlainText
         text: actionButton.label
         color: root.foreground
         font.family: Style.font.family
@@ -1246,7 +1250,7 @@ Item {
       onClicked: actionButton.clicked()
       ToolTip.visible: containsMouse && actionButton.tooltip !== ""
       ToolTip.delay: 500
-      ToolTip.text: actionButton.tooltip
+      ToolTip.text: PlainText.tooltip(actionButton.tooltip)
     }
   }
 
@@ -1441,6 +1445,7 @@ Item {
           color: Qt.alpha(root.foreground, 0.025)
 
           Text {
+            textFormat: Text.PlainText
             anchors.left: parent.left
             anchors.leftMargin: Style.space(14)
             anchors.verticalCenter: parent.verticalCenter
@@ -1524,6 +1529,7 @@ Item {
             id: moduleSettingsContent
             spacing: Style.space(4)
             Text {
+              textFormat: Text.PlainText
               width: parent.width
               height: Style.space(25)
               text: "MODULES"
@@ -1550,6 +1556,7 @@ Item {
                 radius: Style.cornerRadius > 0 ? Style.space(4) : 0
                 color: moduleRowMouse.containsMouse ? Style.hoverFill : "transparent"
                 Text {
+                  textFormat: Text.PlainText
                   anchors.left: parent.left
                   anchors.leftMargin: Style.space(7)
                   y: (Style.space(38) - height) / 2
@@ -1619,6 +1626,7 @@ Item {
                   height: Style.space(24)
 
                   Text {
+                    textFormat: Text.PlainText
                     anchors.left: parent.left
                     anchors.right: sessionOptIn.left
                     anchors.rightMargin: Style.space(8)
@@ -1665,6 +1673,7 @@ Item {
               }
             }
             Text {
+              textFormat: Text.PlainText
               visible: root.service && String(root.service.settingsError || "") !== ""
               width: parent.width
               text: root.service ? String(root.service.settingsError || "") : ""
@@ -1732,6 +1741,7 @@ Item {
           }
 
           Text {
+            textFormat: Text.PlainText
             anchors.left: navButtons.right
             anchors.leftMargin: Style.space(8)
             anchors.right: parent.right
@@ -1775,6 +1785,7 @@ Item {
           }
 
           Text {
+            textFormat: Text.PlainText
             anchors.left: parent.left
             anchors.leftMargin: Style.space(9)
             anchors.verticalCenter: parent.verticalCenter
@@ -1813,6 +1824,7 @@ Item {
             radius: Style.cornerRadius > 0 ? Style.space(4) : 0
             color: modeMouse.containsMouse ? Style.hoverFill : "transparent"
             Text {
+              textFormat: Text.PlainText
               id: modeText
               anchors.centerIn: parent
               text: root.service ? String(root.service.searchMode).toUpperCase() : "FUZZY"
@@ -1862,6 +1874,7 @@ Item {
             height: Style.space(27)
             color: "transparent"
             Text {
+              textFormat: Text.PlainText
               anchors.left: parent.left
               anchors.leftMargin: Style.space(12)
               anchors.verticalCenter: parent.verticalCenter
@@ -1875,6 +1888,7 @@ Item {
               renderType: Text.NativeRendering
             }
             Text {
+              textFormat: Text.PlainText
               id: sessionsToggle
               z: 2
               anchors.right: parent.right
@@ -1901,9 +1915,9 @@ Item {
                   !root.service.activeSessionsEnabled)
                 ToolTip.visible: containsMouse
                 ToolTip.delay: 500
-                ToolTip.text: root.service && root.service.activeSessionsEnabled
+                ToolTip.text: PlainText.tooltip(root.service && root.service.activeSessionsEnabled
                   ? "Disable read-only process detection"
-                  : "Opt in to local, read-only terminal session detection"
+                  : "Opt in to local, read-only terminal session detection")
               }
             }
             MouseArea {
@@ -1952,6 +1966,7 @@ Item {
                   border.width: 1
                   border.color: Qt.alpha(root.accent, 0.5)
                   Text {
+                    textFormat: Text.PlainText
                     anchors.centerIn: parent
                     text: root.agentBadges([sessionRow.modelData.agent])
                     color: root.accent
@@ -1968,6 +1983,7 @@ Item {
                   anchors.verticalCenter: parent.verticalCenter
                   spacing: 0
                   Text {
+                    textFormat: Text.PlainText
                     width: parent.width
                     text: String(sessionRow.modelData.label || "AI agent")
                     color: root.foreground
@@ -1976,6 +1992,7 @@ Item {
                     font.pixelSize: root.primaryFontSize
                   }
                   Text {
+                    textFormat: Text.PlainText
                     width: parent.width
                     text: String(sessionRow.modelData.location || "")
                     color: root.muted
@@ -1985,6 +2002,7 @@ Item {
                   }
                 }
                 Text {
+                  textFormat: Text.PlainText
                   id: sessionAgeLabel
                   anchors.right: parent.right
                   anchors.rightMargin: Style.space(12)
@@ -2002,12 +2020,13 @@ Item {
                   onClicked: root.service.navigateSession(sessionRow.modelData)
                   ToolTip.visible: containsMouse
                   ToolTip.delay: 650
-                  ToolTip.text: String(sessionRow.modelData.cwd || "")
+                  ToolTip.text: PlainText.tooltip(sessionRow.modelData.cwd)
                 }
               }
               ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
             }
             Text {
+              textFormat: Text.PlainText
               anchors.left: parent.left
               anchors.leftMargin: Style.space(48)
               anchors.right: parent.right
@@ -2047,6 +2066,7 @@ Item {
           color: "transparent"
 
           Text {
+            textFormat: Text.PlainText
             anchors.left: parent.left
             anchors.leftMargin: Style.space(12)
             anchors.verticalCenter: parent.verticalCenter
@@ -2060,6 +2080,7 @@ Item {
             renderType: Text.NativeRendering
           }
           Text {
+            textFormat: Text.PlainText
             anchors.right: parent.right
             anchors.rightMargin: Style.space(12)
             anchors.verticalCenter: parent.verticalCenter
@@ -2083,7 +2104,7 @@ Item {
             ToolTip.visible: containsMouse && root.service
               && root.service.volumesError !== ""
             ToolTip.delay: 600
-            ToolTip.text: root.service ? root.service.volumesError : ""
+            ToolTip.text: PlainText.tooltip(root.service ? root.service.volumesError : "")
           }
         }
 
@@ -2116,6 +2137,7 @@ Item {
             }
 
             Text {
+              textFormat: Text.PlainText
               id: deviceIcon
               anchors.left: parent.left
               anchors.leftMargin: Style.space(48)
@@ -2135,6 +2157,7 @@ Item {
               anchors.verticalCenter: parent.verticalCenter
               spacing: 0
               Text {
+                textFormat: Text.PlainText
                 width: parent.width
                 text: String(deviceRow.modelData.name || deviceRow.modelData.device || "Drive")
                 color: deviceRow.current ? root.accent : root.foreground
@@ -2144,6 +2167,7 @@ Item {
                 renderType: Text.NativeRendering
               }
               Text {
+                textFormat: Text.PlainText
                 width: parent.width
                 text: root.volumeDetail(deviceRow.modelData)
                 color: root.muted
@@ -2210,6 +2234,7 @@ Item {
           color: "transparent"
 
           Text {
+            textFormat: Text.PlainText
             anchors.left: parent.left
             anchors.leftMargin: Style.space(12)
             anchors.verticalCenter: parent.verticalCenter
@@ -2222,6 +2247,7 @@ Item {
             renderType: Text.NativeRendering
           }
           Text {
+            textFormat: Text.PlainText
             anchors.right: parent.right
             anchors.rightMargin: Style.space(12)
             anchors.verticalCenter: parent.verticalCenter
@@ -2267,6 +2293,7 @@ Item {
             DirectoryDropTarget { destinationEntry: favoriteRow.modelData }
 
             Text {
+              textFormat: Text.PlainText
               id: favoriteIcon
               anchors.left: parent.left
               // Align children beneath the FAVORITES label instead of the
@@ -2287,6 +2314,7 @@ Item {
               anchors.verticalCenter: parent.verticalCenter
               spacing: 0
               Text {
+                textFormat: Text.PlainText
                 width: parent.width
                 text: favoriteRow.modelData.name
                 color: root.entryColor(favoriteRow.modelData)
@@ -2296,6 +2324,7 @@ Item {
                 renderType: Text.NativeRendering
               }
               Text {
+                textFormat: Text.PlainText
                 width: parent.width
                 text: favoriteRow.modelData.parentPath || ""
                 color: root.muted
@@ -2306,6 +2335,7 @@ Item {
               }
             }
             Text {
+              textFormat: Text.PlainText
               id: unstarButton
               z: 3
               anchors.right: parent.right
@@ -2387,6 +2417,7 @@ Item {
           color: "transparent"
 
           Text {
+            textFormat: Text.PlainText
             anchors.left: parent.left
             anchors.leftMargin: Style.space(12)
             anchors.verticalCenter: parent.verticalCenter
@@ -2400,6 +2431,7 @@ Item {
             renderType: Text.NativeRendering
           }
           Text {
+            textFormat: Text.PlainText
             anchors.right: parent.right
             anchors.rightMargin: Style.space(12)
             anchors.verticalCenter: parent.verticalCenter
@@ -2443,6 +2475,7 @@ Item {
             height: Style.space(21)
             color: Qt.alpha(root.foreground, 0.018)
             Text {
+              textFormat: Text.PlainText
               anchors.left: parent.left
               anchors.leftMargin: Style.space(48)
               anchors.verticalCenter: parent.verticalCenter
@@ -2470,6 +2503,7 @@ Item {
                 : (knowledgeMouse.containsMouse ? Style.hoverFill : "transparent")
 
             Text {
+              textFormat: Text.PlainText
               id: knowledgeIcon
               anchors.left: parent.left
               // Keep Knowledge children aligned with Favorite children.
@@ -2490,6 +2524,7 @@ Item {
               anchors.verticalCenter: parent.verticalCenter
               spacing: Style.space(1)
               Text {
+                textFormat: Text.PlainText
                 width: parent.width
                 text: (knowledgeRow.modelData.starred === true ? "★  " : "")
                   + String(knowledgeRow.modelData.name || "")
@@ -2501,6 +2536,7 @@ Item {
                 renderType: Text.NativeRendering
               }
               Text {
+                textFormat: Text.PlainText
                 width: parent.width
                 text: String(knowledgeRow.modelData.displayPath || "")
                 color: root.muted
@@ -2518,6 +2554,7 @@ Item {
               width: Style.space(126)
               spacing: Style.space(2)
               Text {
+                textFormat: Text.PlainText
                 width: parent.width
                 horizontalAlignment: Text.AlignRight
                 text: root.agentBadges(knowledgeRow.modelData.agents)
@@ -2545,6 +2582,7 @@ Item {
                   }
                 }
                 Text {
+                  textFormat: Text.PlainText
                   width: Style.space(45)
                   text: "≈" + root.compactTokens(knowledgeRow.modelData.tokenEstimate)
                   horizontalAlignment: Text.AlignRight
@@ -2575,7 +2613,7 @@ Item {
               onDoubleClicked: root.service.enterEntry(knowledgeRow.modelData)
               ToolTip.visible: containsMouse && root.knowledgeTooltip(knowledgeRow.modelData) !== ""
               ToolTip.delay: 700
-              ToolTip.text: root.knowledgeTooltip(knowledgeRow.modelData)
+              ToolTip.text: PlainText.tooltip(root.knowledgeTooltip(knowledgeRow.modelData))
             }
             DragHandler {
               id: knowledgeDrag
@@ -2607,6 +2645,7 @@ Item {
           color: "transparent"
 
           Text {
+            textFormat: Text.PlainText
             anchors.left: parent.left
             anchors.leftMargin: Style.space(12)
             anchors.verticalCenter: parent.verticalCenter
@@ -2620,6 +2659,7 @@ Item {
             renderType: Text.NativeRendering
           }
           Text {
+            textFormat: Text.PlainText
             anchors.right: parent.right
             anchors.rightMargin: Style.space(12)
             anchors.verticalCenter: parent.verticalCenter
@@ -2681,6 +2721,7 @@ Item {
           }
 
           Text {
+            textFormat: Text.PlainText
             anchors.left: footerActions.right
             anchors.right: parent.right
             anchors.leftMargin: Style.space(5)
@@ -2736,6 +2777,8 @@ Item {
             height: Style.space(70)
             color: "transparent"
             Text {
+              objectName: "quickfileInspectorName"
+              textFormat: Text.PlainText
               anchors.left: parent.left
               anchors.leftMargin: Style.space(12)
               anchors.top: parent.top
@@ -2901,6 +2944,7 @@ Item {
                     anchors.centerIn: parent
                     spacing: Style.space(5)
                     Text {
+                      textFormat: Text.PlainText
                       text: String(inspectorTabButton.modelData.glyph)
                       color: inspectorTabButton.selected ? root.accent : root.muted
                       font.family: Style.font.family
@@ -2908,6 +2952,7 @@ Item {
                       renderType: Text.NativeRendering
                     }
                     Text {
+                      textFormat: Text.PlainText
                       text: String(inspectorTabButton.modelData.label)
                       color: inspectorTabButton.selected ? root.foreground : root.muted
                       font.family: Style.font.family
@@ -2949,6 +2994,7 @@ Item {
             color: "transparent"
 
             Text {
+              textFormat: Text.PlainText
               id: pathLabel
               anchors.left: parent.left
               anchors.verticalCenter: parent.verticalCenter
@@ -3013,6 +3059,7 @@ Item {
             color: "transparent"
 
             Text {
+              textFormat: Text.PlainText
               anchors.left: parent.left
               anchors.verticalCenter: parent.verticalCenter
               width: Style.space(48)
@@ -3036,6 +3083,7 @@ Item {
                 border.width: root.colorDraft === "" ? 2 : 1
                 border.color: root.colorDraft === "" ? root.accent : root.muted
                 Text {
+                  textFormat: Text.PlainText
                   anchors.centerIn: parent
                   text: "×"
                   color: root.muted
@@ -3088,6 +3136,7 @@ Item {
             color: "transparent"
 
             Text {
+              textFormat: Text.PlainText
               id: noteLabel
               anchors.left: parent.left
               anchors.top: parent.top
@@ -3164,6 +3213,7 @@ Item {
             color: "transparent"
 
             Text {
+              textFormat: Text.PlainText
               id: knowledgeRegistryLabel
               anchors.left: parent.left
               anchors.top: parent.top
@@ -3176,6 +3226,7 @@ Item {
             }
 
             Text {
+              textFormat: Text.PlainText
               anchors.left: knowledgeRegistryLabel.right
               anchors.leftMargin: Style.space(8)
               anchors.verticalCenter: knowledgeRegistryLabel.verticalCenter
@@ -3216,6 +3267,7 @@ Item {
             }
 
             Text {
+              textFormat: Text.PlainText
               id: knowledgeAgentsLabel
               visible: root.inspectorDetailsVisible
               anchors.left: parent.left
@@ -3255,6 +3307,7 @@ Item {
                   border.color: chosen ? root.accent : Style.normalBorderColor
 
                   Text {
+                    textFormat: Text.PlainText
                     anchors.centerIn: parent
                     text: String(knowledgeAgentChip.modelData.label)
                     color: knowledgeAgentChip.chosen ? root.accent : root.foreground
@@ -3272,7 +3325,7 @@ Item {
                       String(knowledgeAgentChip.modelData.key))
                     ToolTip.visible: containsMouse
                     ToolTip.delay: 500
-                    ToolTip.text: String(knowledgeAgentChip.modelData.name)
+                    ToolTip.text: PlainText.tooltip(knowledgeAgentChip.modelData.name)
                   }
                 }
               }
@@ -3309,6 +3362,7 @@ Item {
               width: ListView.view.width
               spacing: Style.space(8)
               Text {
+                textFormat: Text.PlainText
                 width: Style.space(86)
                 text: parent.modelData.label
                 color: root.muted
@@ -3318,6 +3372,7 @@ Item {
                 renderType: Text.NativeRendering
               }
               Text {
+                textFormat: Text.PlainText
                 width: parent.width - Style.space(94)
                 text: parent.modelData.value
                 color: root.foreground
@@ -3341,6 +3396,7 @@ Item {
             color: "transparent"
 
             Text {
+              textFormat: Text.PlainText
               anchors.centerIn: parent
               width: parent.width - Style.space(40)
               visible: root.gitRows().length === 0
@@ -3368,6 +3424,7 @@ Item {
                 width: ListView.view.width
                 spacing: Style.space(8)
                 Text {
+                  textFormat: Text.PlainText
                   width: Style.space(86)
                   text: parent.modelData.label
                   color: root.muted
@@ -3377,6 +3434,7 @@ Item {
                   renderType: Text.NativeRendering
                 }
                 Text {
+                  textFormat: Text.PlainText
                   width: parent.width - Style.space(94)
                   text: parent.modelData.value
                   color: parent.modelData.label === "Status"
@@ -3449,6 +3507,7 @@ Item {
             onClicked: root.closeInlinePreview()
           }
           Text {
+            textFormat: Text.PlainText
             id: previewSummaryText
             anchors.left: parent.left
             anchors.right: parent.right
@@ -3581,6 +3640,7 @@ Item {
             }
 
             Text {
+              textFormat: Text.PlainText
               id: chevron
               anchors.left: parent.left
               anchors.leftMargin: Style.space(9 + fileRow.modelData.depth * 15)
@@ -3595,6 +3655,7 @@ Item {
             }
 
             Text {
+              textFormat: Text.PlainText
               id: fileIcon
               anchors.left: chevron.right
               anchors.leftMargin: Style.space(3)
@@ -3652,6 +3713,7 @@ Item {
               anchors.verticalCenter: parent.verticalCenter
               spacing: Style.space(6)
               Text {
+                textFormat: Text.PlainText
                 visible: String(fileRow.modelData.note || "") !== ""
                 text: "󰍩"
                 color: root.muted
@@ -3660,6 +3722,7 @@ Item {
                 renderType: Text.NativeRendering
               }
               Text {
+                textFormat: Text.PlainText
                 id: rowStar
                 visible: fileRow.modelData.starred === true || rowMouse.containsMouse
                 text: fileRow.modelData.starred === true ? "★" : "☆"
@@ -3685,6 +3748,7 @@ Item {
                 radius: Style.cornerRadius > 0 ? Style.space(3) : 0
                 color: Qt.alpha(root.accent, 0.11)
                 Text {
+                  textFormat: Text.PlainText
                   id: matchBadgeText
                   anchors.centerIn: parent
                   text: root.matchLabel(fileRow.modelData.matchKind)
@@ -3696,6 +3760,7 @@ Item {
                 }
               }
               Text {
+                textFormat: Text.PlainText
                 text: root.gitLabel(fileRow.modelData.git)
                 color: text === "D" ? Color.urgent : root.accent
                 visible: text !== ""
@@ -3705,6 +3770,7 @@ Item {
                 renderType: Text.NativeRendering
               }
               Text {
+                textFormat: Text.PlainText
                 visible: !root.service || root.service.query === ""
                 text: root.shortTime(fileRow.modelData.modified)
                 color: root.muted
@@ -3783,6 +3849,7 @@ Item {
           visible: root.service && !root.service.foregroundBusy
             && root.service.entries.length === 0
           Text {
+            textFormat: Text.PlainText
             anchors.horizontalCenter: parent.horizontalCenter
             text: root.service && root.service.errorMessage ? "󰅚" : "󰉖"
             color: root.service && root.service.errorMessage ? Color.urgent : root.muted
@@ -3791,6 +3858,7 @@ Item {
             renderType: Text.NativeRendering
           }
           Text {
+            textFormat: Text.PlainText
             width: parent.width
             horizontalAlignment: Text.AlignHCenter
             wrapMode: Text.Wrap
@@ -3849,6 +3917,7 @@ Item {
               spacing: Style.space(12)
 
               Text {
+                textFormat: Text.PlainText
                 text: root.editorMode === "new-file" ? "Create file"
                   : root.editorMode === "new-folder" ? "Create folder"
                   : root.editorMode === "rename" ? "Rename item"
@@ -3929,6 +3998,7 @@ Item {
                   color: index === root.quickNavIndex ? Style.focusFillColor
                     : locationMouse.containsMouse ? Style.hoverFill : "transparent"
                   Text {
+                    textFormat: Text.PlainText
                     id: locationSource
                     anchors.top: parent.top
                     anchors.right: parent.right
@@ -3975,7 +4045,7 @@ Item {
                     }
                     ToolTip.visible: containsMouse
                     ToolTip.delay: 650
-                    ToolTip.text: String(locationRow.modelData.path || "")
+                    ToolTip.text: PlainText.tooltip(locationRow.modelData.path)
                   }
                 }
                 ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
@@ -4028,6 +4098,7 @@ Item {
               }
 
               Text {
+                textFormat: Text.PlainText
                 visible: root.editorMode === "conflict" || root.editorMode === "conflict-replace"
                 width: parent.width
                 text: root.editorMode === "conflict-replace"
@@ -4094,13 +4165,15 @@ Item {
                     acceptedButtons: Qt.NoButton
                     ToolTip.visible: containsMouse
                     ToolTip.delay: 600
-                    ToolTip.text: String(conflictRow.modelData.sourcePath || "") + "\n→ "
-                      + String(conflictRow.modelData.targetPath || "")
+                    ToolTip.text: PlainText.tooltip(
+                      String(conflictRow.modelData.sourcePath || "") + "\n→ "
+                        + String(conflictRow.modelData.targetPath || ""))
                   }
                 }
                 ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
               }
               Text {
+                textFormat: Text.PlainText
                 visible: root.editorMode === "conflict" || root.editorMode === "conflict-replace"
                 width: parent.width
                 text: root.conflictRows.length > 1
@@ -4147,6 +4220,7 @@ Item {
               }
 
               Text {
+                textFormat: Text.PlainText
                 visible: root.editorMode === "trash" || root.editorMode === "trash-delete"
                 width: parent.width
                 wrapMode: Text.Wrap
@@ -4194,6 +4268,7 @@ Item {
                     anchors.verticalCenter: parent.verticalCenter
                     spacing: Style.space(2)
                     Text {
+                      textFormat: Text.PlainText
                       width: parent.width
                       text: String(trashRow.modelData.name || "")
                       color: root.foreground
@@ -4203,6 +4278,7 @@ Item {
                       renderType: Text.NativeRendering
                     }
                     Text {
+                      textFormat: Text.PlainText
                       width: parent.width
                       text: String(trashRow.modelData.originalPath || "")
                       color: root.muted
@@ -4240,6 +4316,7 @@ Item {
               }
 
               Text {
+                textFormat: Text.PlainText
                 visible: root.editorMode === "trash-browser"
                   && root.service && (root.service.trashBusy
                     || root.service.trashEntries.length === 0
@@ -4258,6 +4335,7 @@ Item {
               }
 
               Text {
+                textFormat: Text.PlainText
                 visible: root.editorMode === "knowledge-links"
                 width: parent.width
                 wrapMode: Text.Wrap
@@ -4297,6 +4375,7 @@ Item {
                     root.knowledgeLinkStatusColor(modelData.status), 0.45)
 
                   Text {
+                    textFormat: Text.PlainText
                     id: knowledgeLinkAgent
                     anchors.left: parent.left
                     anchors.leftMargin: Style.space(8)
@@ -4318,6 +4397,7 @@ Item {
                     anchors.verticalCenter: parent.verticalCenter
                     spacing: Style.space(2)
                     Text {
+                      textFormat: Text.PlainText
                       width: parent.width
                       text: String(knowledgeLinkRow.modelData.relativeTarget || "")
                       color: root.foreground
@@ -4327,6 +4407,7 @@ Item {
                       renderType: Text.NativeRendering
                     }
                     Text {
+                      textFormat: Text.PlainText
                       width: parent.width
                       text: String(knowledgeLinkRow.modelData.reason || "")
                         + (knowledgeLinkRow.modelData.warning
@@ -4340,6 +4421,7 @@ Item {
                   }
 
                   Text {
+                    textFormat: Text.PlainText
                     id: knowledgeLinkState
                     anchors.right: parent.right
                     anchors.rightMargin: Style.space(8)
@@ -4359,6 +4441,7 @@ Item {
               }
 
               Text {
+                textFormat: Text.PlainText
                 visible: root.editorMode === "knowledge-links"
                   && root.service && root.service.knowledgeLinkPlan
                 width: parent.width
@@ -4411,6 +4494,7 @@ Item {
               }
 
               Text {
+                textFormat: Text.PlainText
                 visible: root.editorError !== ""
                 width: parent.width
                 wrapMode: Text.Wrap

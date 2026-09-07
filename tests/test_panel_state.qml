@@ -2,6 +2,7 @@ import QtQuick
 import QtTest
 import Quickshell
 import "plugin" as Quickfile
+import "plugin/components/plaintext.js" as PlainText
 
 // Run with tests/run_qml_tests.py. The real Panel renders offscreen against a
 // Service with process-starting methods stubbed; no user files are touched.
@@ -196,6 +197,32 @@ ShellRoot {
   function dropEvent(formats, values) {
     return { formats: formats, supportedActions: Qt.CopyAction | Qt.MoveAction,
       getDataAsString: function(format) { return values[format] || "" } }
+  }
+
+  // A filename is untrusted input. Rendered as rich text, a name like
+  // `<img src="https://…">` would make the panel fetch a remote resource the
+  // moment the file is selected or hovered, so every sink that shows a name,
+  // path or backend string has to render it literally.
+  function untrustedTextChecks() {
+    var hostile = '<img src="https://attacker.invalid/pixel.png">'
+    select(entry(hostile, ""))
+    var inspectorName = objectFinder.findChild(panel, "quickfileInspectorName")
+    check(inspectorName !== null, "could not find the inspector name sink")
+    check(inspectorName.textFormat === Text.PlainText,
+      "the inspector name sink was not pinned to plain text")
+    check(inspectorName.text === hostile,
+      "a markup-like filename was not rendered literally")
+
+    var escaped = PlainText.tooltip(hostile)
+    check(escaped.indexOf("<img") === -1,
+      "a markup-like value reached a tooltip with its tag intact")
+    check(escaped.indexOf("&lt;img") !== -1,
+      "tooltip escaping dropped the literal text instead of escaping it")
+    check(PlainText.tooltip("") === "", "an empty tooltip gained markup")
+    check(PlainText.tooltip("a & b").indexOf("a &amp; b") !== -1,
+      "an ampersand in a name was not escaped")
+
+    select(entry("plain-name", ""))
   }
 
   function newFeatureChecks() {
@@ -598,6 +625,7 @@ ShellRoot {
     try {
       metadataChecks()
       operationChecks()
+      untrustedTextChecks()
       newFeatureChecks()
       prepareViewport()
       viewportTimer.start()

@@ -261,6 +261,12 @@ needed, the user-owned data lives under
 
 ## Security model
 
+Filenames are untrusted input. Every text sink in the plugin — names, paths,
+backend messages and tooltips — renders literally: each `Text` is pinned to
+`Text.PlainText`, and tooltip values are escaped before they reach Qt Quick
+Controls' shared tooltip, which renders with `Text.AutoText`. A file called
+`<img src="…">` is shown as that text and loads nothing.
+
 QuickFile runs inside the unsandboxed Omarchy shell with the permissions of the
 signed-in user. It makes no network requests and collects no telemetry. It does
 not require elevated privileges or overwrite Omarchy configuration. Filesystem

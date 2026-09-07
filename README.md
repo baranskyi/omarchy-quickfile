@@ -7,9 +7,14 @@ theme automatically.
 QuickFile opens as an ordinary application window. Summoning it focuses it
 immediately, so the first keystroke lands in the file list; `Alt+Tab` reaches it
 like any other application, and it can stay open beside the editor it was opened
-from for as long as it is useful. Placement belongs to the compositor — see
+from for as long as it is useful. It follows you to the workspace you are on.
+
+Opening QuickFile moves the workspace aside rather than covering it: while the
+window is open the same strip is reserved on the monitor, so tiled windows
+retile next to it and a window you were working in never ends up underneath.
+Closing gives the strip straight back. See
 [Window placement](#window-placement) for the rules that dock it to the left
-edge, and note that QuickFile opens as a normal window without them.
+edge; QuickFile still opens and works without them.
 
 QuickFile is an independent open-source project inspired by the FileBlade
 concept. It does not depend on or copy unreleased FileBlade source code.
@@ -18,7 +23,8 @@ concept. It does not depend on or copy unreleased FileBlade source code.
 
 - Native Omarchy manifest with `service`, `bar-widget`, and `panel` entry points.
 - Application window: focused on summon, reachable with `Alt+Tab`, closable
-  from the compositor like any other window.
+  from the compositor like any other window, and docked without covering the
+  windows it opens beside.
 - Expandable directory tree, directory navigation, back/forward/up/home.
 - Git branch and per-path working-tree status.
 - Fuzzy, contains, exact, prefix, suffix, and regular-expression search across
@@ -116,7 +122,8 @@ concept. It does not depend on or copy unreleased FileBlade source code.
 | `/`, `Ctrl+F` | Focus search |
 | `Ctrl+P` | Open Quick Nav |
 | `.` | Toggle hidden files |
-| `Ctrl+R` | Refresh |
+| `Ctrl+R` | Refresh (listings also refresh themselves on filesystem events) |
+| `Ctrl+Shift+T` | Open the Trash browser to restore or permanently delete |
 | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy / cut / paste selected items |
 | `Ctrl+D` | Duplicate selected items |
 | `Ctrl+Z` | Undo the latest reversible QuickFile operation |
@@ -207,8 +214,8 @@ The bounded operation journal is stored privately in
 `~/.local/state/omarchy/quickfile/operations.json`) with mode `0600`. It stores
 only the information needed for safe undo, never file contents. The footer shows
 recursive-operation progress and exposes Cancel; when idle it exposes the latest
-available Undo. The Trash button in the top toolbar opens restore and permanent
-delete controls.
+available Undo. `Ctrl+Shift+T` opens the Trash browser with restore and
+permanent-delete controls.
 
 ## Requirements
 
@@ -287,7 +294,8 @@ o.bind("SUPER + B", "QuickFile sidebar", "omarchy-shell shell toggle m0sthatedma
 QuickFile is a real window, so Hyprland tiles it by default. To dock it to the
 left edge instead, add a window rule to `~/.config/hypr/hyprland.lua`. The
 values below assume a 30px top bar and the default 10px outer gap; adjust them
-to taste:
+to taste. QuickFile reserves a matching strip on the monitor while it is open,
+measured from the width the rule actually gives the window:
 
 ```lua
 o.window({ class = "^org.quickshell$", title = "^QuickFile$" }, {

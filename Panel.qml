@@ -86,7 +86,10 @@ Item {
   // to click elsewhere deliberately, and stealing focus back would be wrong.
   Timer {
     id: activationTimer
-    interval: 90
+    // Long enough to outlast a slow map (the compositor may take a few hundred
+    // milliseconds to know the toplevel exists), short enough that a deliberate
+    // click elsewhere afterwards is never taken back.
+    interval: 120
     repeat: true
     triggeredOnStart: true
     property int attempts: 0
@@ -96,9 +99,25 @@ Item {
         stop()
         return
       }
-      root.raiseWindow()
       attempts++
-      if (attempts >= 4) stop()
+      // Reserving the strip retiles the workspace, and a retile under the
+      // pointer hands focus to whatever lands there. So claim the space first
+      // and only ask for focus once the layout has settled — otherwise the
+      // compositor takes back the focus we just asked for.
+      if (attempts <= 3) {
+        root.moveWindowToCurrentWorkspace()
+        // Re-stated while the window rule settles: the strip follows the width
+        // the compositor actually gave the window.
+        root.reserveDockSpace()
+        return
+      }
+      // Keep asking until the budget runs out rather than stopping at the first
+      // success: reserving the strip retiles the workspace, and a retile under
+      // the pointer can hand focus straight back to the window below. Asking
+      // again is a no-op while we already hold focus.
+      var handle = keyScope.Window.window
+      if (!handle || !handle.active) root.raiseWindow()
+      if (attempts >= 12) stop()
     }
   }
 
@@ -233,8 +252,66 @@ Item {
     dismissEditor()
     hoveredToken = ""
     opened = false
+    releaseDockSpace()
     if (service) service.setPanelVisible(false)
   }
+
+  // Opening QuickFile must move the workspace aside, not cover it: a window the
+  // user was working in should never end up underneath. The window itself is
+  // floating so its geometry stays exact, and the same strip is reserved on the
+  // monitor for as long as QuickFile is open, which makes the compositor retile
+  // everything else out from under it. Closing gives the strip straight back.
+  //
+  // The reservation is absolute, not incremental, so a missed release or a
+  // second call can never accumulate: every write states the final value.
+  property string reservedMonitor: ""
+
+  function monitorForDock() {
+    var monitor = Hyprland.focusedMonitor
+    return monitor && monitor.name ? String(monitor.name) : ""
+  }
+
+  function writeDockReservation(monitorName, pixels) {
+    if (monitorName === "") return
+    Quickshell.execDetached(["hyprctl", "eval",
+      'hl.monitor({ output = "' + monitorName + '", reserved = { left = '
+        + Math.max(0, Math.round(pixels)) + ' } })'])
+  }
+
+  // The plugin host keeps this window alive between summons, so the compositor
+  // re-maps the same toplevel on the workspace it was created on — not the one
+  // the user is looking at now. Bring it along on every open.
+  function moveWindowToCurrentWorkspace() {
+    try {
+      Hyprland.dispatch('hl.dsp.window.move({ workspace = "e+0", window = "title:^'
+        + windowTitle + '$" })')
+    } catch (error) {
+      // Not Hyprland: the window opens wherever the compositor decides.
+    }
+  }
+
+  function reserveDockSpace() {
+    var monitorName = monitorForDock()
+    if (monitorName === "") return
+    // Reserve what the window actually occupies — the compositor's window rule,
+    // not the plugin's preferred width, decides that — plus the gap on either
+    // side of it. A window surface has no position of its own to read here, so
+    // the strip is measured from its width alone.
+    var strip = window.width + Style.space(20)
+    if (!isFinite(strip) || strip <= 0) return
+    if (reservedMonitor !== "" && reservedMonitor !== monitorName)
+      writeDockReservation(reservedMonitor, 0)
+    reservedMonitor = monitorName
+    writeDockReservation(monitorName, strip)
+  }
+
+  function releaseDockSpace() {
+    if (reservedMonitor === "") return
+    writeDockReservation(reservedMonitor, 0)
+    reservedMonitor = ""
+  }
+
+  Component.onDestruction: releaseDockSpace()
 
   // Summoning from a keybinding must land the caret in QuickFile, not merely
   // put a window on screen. A newly mapped toplevel is usually focused by the
@@ -1387,6 +1464,14 @@ Item {
           } else if (event.key === Qt.Key_R && event.modifiers & Qt.ControlModifier) {
             root.service.refreshAll()
             event.accepted = true
+          } else if (event.key === Qt.Key_T
+              && (event.modifiers & Qt.ControlModifier)
+              && (event.modifiers & Qt.ShiftModifier)) {
+            // Restoring from Trash lost its toolbar button when deletion moved
+            // to Delete/Backspace; the browser itself is still the only way back
+            // from a mistaken delete, so it keeps a key of its own.
+            root.openTrashBrowser()
+            event.accepted = true
           }
         }
 
@@ -1417,29 +1502,18 @@ Item {
             anchors.verticalCenter: parent.verticalCenter
             spacing: Style.space(2)
             Components.IconButton {
-              glyph: "󰉖"
+              glyph: "󰝒"
               tooltip: "New file"
               onClicked: root.beginEditor("new-file")
             }
             Components.IconButton {
-              glyph: "󰉓"
+              glyph: "󰉗"
               tooltip: "New folder"
               onClicked: root.beginEditor("new-folder")
             }
             Components.IconButton {
-              glyph: "󰩺"
-              tooltip: "Trash"
-              onClicked: root.openTrashBrowser()
-            }
-            Components.IconButton {
-              glyph: "󰑐"
-              tooltip: "Refresh"
-              active: root.service ? root.service.foregroundBusy : false
-              onClicked: if (root.service) root.service.refreshAll()
-            }
-            Components.IconButton {
-              glyph: "󰈉"
-              tooltip: "Show hidden files"
+              glyph: "󱞊"
+              tooltip: "Show hidden files  ·  ."
               active: root.service ? root.service.showHidden : false
               onClicked: if (root.service) root.service.setShowHidden(!root.service.showHidden)
             }
@@ -1452,13 +1526,6 @@ Item {
                 if (root.inlinePreviewOpen) root.closeInlinePreview()
                 else root.showInlinePreview(root.service.selectedEntry)
               }
-            }
-            Components.IconButton {
-              glyph: "󰏘"
-              tooltip: "Color, note, and properties"
-              active: root.inspectorOpen
-              available: root.service && root.service.selectedEntry !== null
-              onClicked: root.inspectorOpen = !root.inspectorOpen
             }
             Components.IconButton {
               glyph: "󰒓"
@@ -1482,7 +1549,10 @@ Item {
           x: blade.width - width - Style.space(8)
           y: header.height + Style.space(5)
           width: Style.space(302)
-          height: Style.space(258)
+          // Sized by its content: the module list grows with the AI Sessions
+          // opt-in and shrinks again when the settings error clears.
+          height: Math.min(moduleSettingsContent.implicitHeight + padding * 2,
+            blade.height - header.height - Style.space(24))
           padding: Style.space(8)
           modal: false
           focus: true
@@ -1494,6 +1564,7 @@ Item {
             border.color: root.borderColor
           }
           contentItem: Column {
+            id: moduleSettingsContent
             spacing: Style.space(4)
             Text {
               width: parent.width
@@ -1506,79 +1577,25 @@ Item {
               font.letterSpacing: 1
               verticalAlignment: Text.AlignVCenter
             }
-            Rectangle {
-              width: parent.width
-              height: Style.space(43)
-              radius: Style.cornerRadius > 0 ? Style.space(5) : 0
-              color: Qt.alpha(root.accent, 0.07)
-              border.width: Style.normalBorderWidth
-              border.color: Style.normalBorderColor
-              Column {
-                anchors.left: parent.left
-                anchors.leftMargin: Style.space(9)
-                anchors.right: sessionOptIn.left
-                anchors.rightMargin: Style.space(8)
-                anchors.verticalCenter: parent.verticalCenter
-                Text {
-                  text: "Active AI sessions"
-                  color: root.foreground
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.bodySmall
-                  font.bold: true
-                }
-                Text {
-                  text: "Opt-in · local process metadata only"
-                  color: root.muted
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.caption
-                }
-              }
-              Rectangle {
-                id: sessionOptIn
-                anchors.right: parent.right
-                anchors.rightMargin: Style.space(8)
-                anchors.verticalCenter: parent.verticalCenter
-                width: Style.space(48)
-                height: Style.space(24)
-                radius: height / 2
-                color: root.service && root.service.activeSessionsEnabled
-                  ? Qt.alpha(root.accent, 0.32) : Qt.alpha(root.muted, 0.15)
-                border.width: 1
-                border.color: root.service && root.service.activeSessionsEnabled
-                  ? root.accent : root.muted
-                Rectangle {
-                  width: Style.space(18)
-                  height: width
-                  radius: width / 2
-                  anchors.verticalCenter: parent.verticalCenter
-                  x: root.service && root.service.activeSessionsEnabled
-                    ? parent.width - width - Style.space(3) : Style.space(3)
-                  color: root.service && root.service.activeSessionsEnabled
-                    ? root.accent : root.muted
-                  Behavior on x { NumberAnimation { duration: 120 } }
-                }
-                MouseArea {
-                  anchors.fill: parent
-                  enabled: root.service && root.service.settingsLoaded
-                  cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
-                  onClicked: root.service.setActiveSessionsEnabled(
-                    !root.service.activeSessionsEnabled)
-                }
-              }
-            }
             Repeater {
               model: root.moduleLayoutSnapshot()
               delegate: Rectangle {
+                id: moduleRow
                 required property int index
                 required property var modelData
+                // The AI Sessions module owns the opt-in for reading local
+                // process metadata. It used to sit in a card of its own above
+                // this list, which read as an unrelated setting; it belongs to
+                // the module it switches on.
+                readonly property bool ownsSessionOptIn: String(modelData.id) === "sessions"
                 width: parent.width
-                height: Style.space(38)
+                height: Style.space(38) + (ownsSessionOptIn ? Style.space(26) : 0)
                 radius: Style.cornerRadius > 0 ? Style.space(4) : 0
                 color: moduleRowMouse.containsMouse ? Style.hoverFill : "transparent"
                 Text {
                   anchors.left: parent.left
                   anchors.leftMargin: Style.space(7)
-                  anchors.verticalCenter: parent.verticalCenter
+                  y: (Style.space(38) - height) / 2
                   width: parent.width - Style.space(128)
                   text: root.moduleGlyph(String(parent.modelData.id)) + "  "
                     + root.moduleLabel(String(parent.modelData.id))
@@ -1597,7 +1614,7 @@ Item {
                   z: 2
                   anchors.right: parent.right
                   anchors.rightMargin: Style.space(2)
-                  anchors.verticalCenter: parent.verticalCenter
+                  y: (Style.space(38) - height) / 2
                   spacing: 0
                   Components.IconButton {
                     glyph: "󰁝"
@@ -1632,6 +1649,60 @@ Item {
                     available: root.service && root.service.settingsLoaded
                     onClicked: root.service.setModuleCollapsed(String(modelData.id),
                       modelData.collapsed !== true)
+                  }
+                }
+
+                Item {
+                  visible: moduleRow.ownsSessionOptIn
+                  anchors.left: parent.left
+                  anchors.leftMargin: Style.space(7)
+                  anchors.right: parent.right
+                  anchors.rightMargin: Style.space(8)
+                  y: Style.space(38) - Style.space(6)
+                  height: Style.space(24)
+
+                  Text {
+                    anchors.left: parent.left
+                    anchors.right: sessionOptIn.left
+                    anchors.rightMargin: Style.space(8)
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "Read active sessions · local process metadata only"
+                    color: root.muted
+                    elide: Text.ElideRight
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  Rectangle {
+                    id: sessionOptIn
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: Style.space(40)
+                    height: Style.space(20)
+                    radius: height / 2
+                    color: root.service && root.service.activeSessionsEnabled
+                      ? Qt.alpha(root.accent, 0.32) : Qt.alpha(root.muted, 0.15)
+                    border.width: 1
+                    border.color: root.service && root.service.activeSessionsEnabled
+                      ? root.accent : root.muted
+                    Rectangle {
+                      width: Style.space(14)
+                      height: width
+                      radius: width / 2
+                      anchors.verticalCenter: parent.verticalCenter
+                      x: root.service && root.service.activeSessionsEnabled
+                        ? parent.width - width - Style.space(3) : Style.space(3)
+                      color: root.service && root.service.activeSessionsEnabled
+                        ? root.accent : root.muted
+                      Behavior on x { NumberAnimation { duration: 120 } }
+                    }
+                    MouseArea {
+                      anchors.fill: parent
+                      enabled: root.service && root.service.settingsLoaded
+                      cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+                      onClicked: root.service.setActiveSessionsEnabled(
+                        !root.service.activeSessionsEnabled)
+                    }
                   }
                 }
               }

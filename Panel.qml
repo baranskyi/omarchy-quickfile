@@ -100,17 +100,10 @@ Item {
         return
       }
       attempts++
-      // Reserving the strip retiles the workspace, and a retile under the
-      // pointer hands focus to whatever lands there. So claim the space first
-      // and only ask for focus once the layout has settled — otherwise the
-      // compositor takes back the focus we just asked for.
-      if (attempts <= 3) {
-        root.moveWindowToCurrentWorkspace()
-        // Re-stated while the window rule settles: the strip follows the width
-        // the compositor actually gave the window.
-        root.reserveDockSpace()
-        return
-      }
+      // Claiming the strip retiles the workspace, and a retile under the
+      // pointer hands focus to whatever lands there. Let the layout settle
+      // before asking for focus, or the compositor takes back what we asked for.
+      if (attempts <= 2) return
       // Keep asking until the budget runs out rather than stopping at the first
       // success: reserving the strip retiles the workspace, and a retile under
       // the pointer can hand focus straight back to the window below. Asking
@@ -252,66 +245,16 @@ Item {
     dismissEditor()
     hoveredToken = ""
     opened = false
-    releaseDockSpace()
     if (service) service.setPanelVisible(false)
   }
 
   // Opening QuickFile must move the workspace aside, not cover it: a window the
-  // user was working in should never end up underneath. The window itself is
-  // floating so its geometry stays exact, and the same strip is reserved on the
-  // monitor for as long as QuickFile is open, which makes the compositor retile
-  // everything else out from under it. Closing gives the strip straight back.
-  //
-  // The reservation is absolute, not incremental, so a missed release or a
-  // second call can never accumulate: every write states the final value.
-  property string reservedMonitor: ""
-
-  function monitorForDock() {
-    var monitor = Hyprland.focusedMonitor
-    return monitor && monitor.name ? String(monitor.name) : ""
-  }
-
-  function writeDockReservation(monitorName, pixels) {
-    if (monitorName === "") return
-    Quickshell.execDetached(["hyprctl", "eval",
-      'hl.monitor({ output = "' + monitorName + '", reserved = { left = '
-        + Math.max(0, Math.round(pixels)) + ' } })'])
-  }
-
-  // The plugin host keeps this window alive between summons, so the compositor
-  // re-maps the same toplevel on the workspace it was created on — not the one
-  // the user is looking at now. Bring it along on every open.
-  function moveWindowToCurrentWorkspace() {
-    try {
-      Hyprland.dispatch('hl.dsp.window.move({ workspace = "e+0", window = "title:^'
-        + windowTitle + '$" })')
-    } catch (error) {
-      // Not Hyprland: the window opens wherever the compositor decides.
-    }
-  }
-
-  function reserveDockSpace() {
-    var monitorName = monitorForDock()
-    if (monitorName === "") return
-    // Reserve what the window actually occupies — the compositor's window rule,
-    // not the plugin's preferred width, decides that — plus the gap on either
-    // side of it. A window surface has no position of its own to read here, so
-    // the strip is measured from its width alone.
-    var strip = window.width + Style.space(20)
-    if (!isFinite(strip) || strip <= 0) return
-    if (reservedMonitor !== "" && reservedMonitor !== monitorName)
-      writeDockReservation(reservedMonitor, 0)
-    reservedMonitor = monitorName
-    writeDockReservation(monitorName, strip)
-  }
-
-  function releaseDockSpace() {
-    if (reservedMonitor === "") return
-    writeDockReservation(reservedMonitor, 0)
-    reservedMonitor = ""
-  }
-
-  Component.onDestruction: releaseDockSpace()
+  // user was working in should never end up underneath. That reservation is a
+  // layer-shell exclusive zone (see the surface at the end of this file), not a
+  // change to the monitor's reserved area — reserving on the monitor also
+  // shrinks the bar, which squeezed and split the bar's own widgets for as long
+  // as QuickFile was open.
+  readonly property int dockStripWidth: bladeWidth + Style.space(20)
 
   // Summoning from a keybinding must land the caret in QuickFile, not merely
   // put a window on screen. A newly mapped toplevel is usually focused by the
@@ -1304,6 +1247,20 @@ Item {
       ToolTip.visible: containsMouse && actionButton.tooltip !== ""
       ToolTip.delay: 500
       ToolTip.text: actionButton.tooltip
+    }
+  }
+
+  // The exclusive zone that keeps tiled windows out of the dock (see
+  // components/DockStrip.qml). Loaded only while the panel is open, and through
+  // a Loader so a compositor without layer shell costs the reservation rather
+  // than the whole panel.
+  Loader {
+    id: dockStripLoader
+    active: root.opened
+    source: "components/DockStrip.qml"
+    onLoaded: {
+      item.screen = Qt.binding(function() { return window.screen })
+      item.stripWidth = Qt.binding(function() { return root.dockStripWidth })
     }
   }
 

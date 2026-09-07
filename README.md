@@ -10,11 +10,12 @@ like any other application, and it can stay open beside the editor it was opened
 from for as long as it is useful. It follows you to the workspace you are on.
 
 Opening QuickFile moves the workspace aside rather than covering it: while the
-window is open the same strip is reserved on the monitor, so tiled windows
-retile next to it and a window you were working in never ends up underneath.
-Closing gives the strip straight back. See
-[Window placement](#window-placement) for the rules that dock it to the left
-edge; QuickFile still opens and works without them.
+window is open it reserves the strip it occupies through a layer-shell exclusive
+zone, so tiled windows retile next to it and a window you were working in never
+ends up underneath. The bar keeps its own space and its widgets stay put.
+Closing gives the strip straight back. Pinned, the dock stays where it is when
+you change workspace. See [Window placement](#window-placement) for the rules
+that dock it to the left edge; QuickFile still opens and works without them.
 
 QuickFile is an independent open-source project inspired by the FileBlade
 concept. It does not depend on or copy unreleased FileBlade source code.
@@ -294,12 +295,13 @@ o.bind("SUPER + B", "QuickFile sidebar", "omarchy-shell shell toggle m0sthatedma
 QuickFile is a real window, so Hyprland tiles it by default. To dock it to the
 left edge instead, add a window rule to `~/.config/hypr/hyprland.lua`. The
 values below assume a 30px top bar and the default 10px outer gap; adjust them
-to taste. QuickFile reserves a matching strip on the monitor while it is open,
-measured from the width the rule actually gives the window:
+to taste. `pin` keeps the dock in place across workspaces, and QuickFile
+reserves a matching strip for as long as it is open:
 
 ```lua
 o.window({ class = "^org.quickshell$", title = "^QuickFile$" }, {
   float = true,
+  pin = true,
   size = { 480, "(monitor_h-50)" },
   move = { 10, 40 },
 })

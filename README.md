@@ -1,13 +1,15 @@
 # QuickFile
 
-An IDE-like filesystem blade for the Omarchy desktop. QuickFile lives inside
-`omarchy-shell`: it opens from the bar or `SUPER+B`, follows the active monitor,
-and uses the current Omarchy theme automatically.
+An IDE-like file manager for the Omarchy desktop. QuickFile lives inside
+`omarchy-shell`: it opens from the bar or `SUPER+B` and uses the current Omarchy
+theme automatically.
 
-The blade participates in Hyprland's usable workspace instead of covering it:
-opening QuickFile reserves space on the left and smoothly pushes tiled windows
-aside. After a short focus handoff it uses on-demand keyboard focus, so the rest
-of the desktop remains interactive.
+QuickFile opens as an ordinary application window. Summoning it focuses it
+immediately, so the first keystroke lands in the file list; `Alt+Tab` reaches it
+like any other application, and it can stay open beside the editor it was opened
+from for as long as it is useful. Placement belongs to the compositor — see
+[Window placement](#window-placement) for the rules that dock it to the left
+edge, and note that QuickFile opens as a normal window without them.
 
 QuickFile is an independent open-source project inspired by the FileBlade
 concept. It does not depend on or copy unreleased FileBlade source code.
@@ -15,7 +17,8 @@ concept. It does not depend on or copy unreleased FileBlade source code.
 ## Working now
 
 - Native Omarchy manifest with `service`, `bar-widget`, and `panel` entry points.
-- Hyprland-aware left dock on the focused display, below the Omarchy bar.
+- Application window: focused on summon, reachable with `Alt+Tab`, closable
+  from the compositor like any other window.
 - Expandable directory tree, directory navigation, back/forward/up/home.
 - Git branch and per-path working-tree status.
 - Fuzzy, contains, exact, prefix, suffix, and regular-expression search across
@@ -29,12 +32,12 @@ concept. It does not depend on or copy unreleased FileBlade source code.
 - Back, Forward and Parent navigation remember each directory's exact top row,
   pixel offset and selected entry. Returning to a long directory therefore
   resumes where it was left instead of jumping to the beginning.
-- Hidden-file toggle and native filesystem monitoring while the blade is
+- Hidden-file toggle and native filesystem monitoring while the window is
   visible. External changes update rows quietly without resetting the list;
   `Ctrl+R` remains available for an explicit refresh.
 - Keyboard navigation with arrows or `HJKL`.
 - Persistent click/keyboard selection, independent hover highlighting, and
-  an in-blade bounded text, image, directory, or metadata preview on `Space`.
+  an in-window bounded text, image, directory, or metadata preview on `Space`.
   `Shift+Space` opens the hovered or selected file in system Sushi QuickView.
 - Open through the XDG/GIO default application.
 - Create file/folder, copy, cut, paste, duplicate, rename, and confirmed move
@@ -117,7 +120,7 @@ concept. It does not depend on or copy unreleased FileBlade source code.
 | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy / cut / paste selected items |
 | `Ctrl+D` | Duplicate selected items |
 | `Ctrl+Z` | Undo the latest reversible QuickFile operation |
-| `Space` | Preview the hovered item, otherwise the selected item, in the blade |
+| `Space` | Preview the hovered item, otherwise the selected item, in the window |
 | `Shift+Space` | Open the hovered/selected file in Sushi QuickView |
 | `Ctrl+click` | Toggle one item in the selection |
 | `Shift+click` | Select a range from the anchor |
@@ -141,7 +144,7 @@ QuickFile watches the displayed directories, search scope, relevant Git files,
 and Knowledge sources through GIO. Changes are grouped into short batches and
 applied to existing rows; unchanged data does not rebuild the view. Background
 updates preserve the viewport, selection and unsaved inspector drafts and do
-not activate the Refresh button. Closing the blade stops its watchers; reopening
+not activate the Refresh button. Closing the window stops its watchers; reopening
 it reconciles anything changed in the meantime. If monitoring is unavailable or
 its bounded watch limit is exceeded, a silent 30-second fallback keeps data fresh.
 
@@ -158,7 +161,7 @@ explicit estimates (`≈`, based on file bytes), not model-specific tokenizer
 results.
 
 `AI SESSIONS` is disabled until explicitly enabled either from its header or
-the modules control. While the blade is visible, the adapter checks at an
+the modules control. While the window is visible, the adapter checks at an
 eight-second interval for allowlisted agent executables attached to a terminal
 whose working directory is the displayed folder, a child folder, or its parent
 workspace. It reads process name, PID, terminal, working directory and elapsed
@@ -256,7 +259,7 @@ not require elevated privileges or overwrite Omarchy configuration. Filesystem
 paths cross the QML/backend boundary as opaque tokens and fixed argument-array
 values; recursive scans and watches are bounded. Destructive choices require
 confirmation, and ordinary deletion uses the freedesktop Trash. The optional
-session adapter performs a bounded `/proc` scan only while the blade is visible;
+session adapter performs a bounded `/proc` scan only while the window is visible;
 it neither controls agent processes nor reads their command lines.
 
 ## Development install
@@ -278,6 +281,24 @@ The hotkey belongs in `~/.config/hypr/bindings.lua`:
 ```lua
 o.bind("SUPER + B", "QuickFile sidebar", "omarchy-shell shell toggle m0sthatedman.quickfile")
 ```
+
+### Window placement
+
+QuickFile is a real window, so Hyprland tiles it by default. To dock it to the
+left edge instead, add a window rule to `~/.config/hypr/hyprland.lua`. The
+values below assume a 30px top bar and the default 10px outer gap; adjust them
+to taste:
+
+```lua
+o.window({ class = "^org.quickshell$", title = "^QuickFile$" }, {
+  float = true,
+  size = { 480, "(monitor_h-50)" },
+  move = { 10, 40 },
+})
+```
+
+This is optional. Without it QuickFile still opens, focuses, and works — it just
+takes a tile like any other application rather than a fixed edge.
 
 After editing Hyprland configuration, validate it:
 
@@ -302,11 +323,11 @@ File opening and Trash support use `gio`; Git, `getfacl`, and `lsattr` enrich th
 model when available. Watcher tests use a session D-Bus; for an isolated run use
 `dbus-run-session -- /usr/bin/python3 -m unittest discover -s tests -v`.
 
-The QML harness runs isolated offscreen service and UI regression checks. Its
-test-only window adapter replaces the native Wayland wrapper, while retaining
-the actual panel content and logic. Desktop placement/focus still needs a live
-Omarchy check. GitHub Actions runs backend and native watcher tests on pushes
-and pull requests.
+The QML harness runs isolated offscreen service and UI regression checks against
+the plugin exactly as shipped — there is no test-only window adapter to keep in
+step with the panel. Compositor placement and focus still need a live Omarchy
+check. GitHub Actions runs backend and native watcher tests on pushes and pull
+requests.
 
 ## Architecture
 
@@ -329,7 +350,7 @@ models reconcile changed rows by path token instead of replacing the model.
 
 ## Next milestones
 
-- Independent resizable left and right blades.
+- Independent resizable left and right panes.
 - Memory and Skills remain intentionally folded into Project Knowledge until
   they have distinct, useful workflows instead of duplicate file lists.
 - Declarative extension modules plus an explicitly trusted QML extension tier

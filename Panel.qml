@@ -2,10 +2,10 @@ pragma ComponentBehavior: Bound
 
 import QtQuick
 import QtQuick.Controls
+import QtQuick.Window
 import Quickshell
 import Quickshell.Hyprland
 import Quickshell.Io
-import Quickshell.Wayland
 import qs.Commons
 import "components" as Components
 
@@ -16,8 +16,6 @@ Item {
   property var manifest: null
   property var service: null
   property bool opened: false
-  property bool focusPrimed: false
-  property string targetScreenName: ""
   property int keyboardIndex: -1
   // Selection alone must not resize the file list. The inspector opens only
   // through its toolbar button or an explicit context action.
@@ -58,7 +56,10 @@ Item {
   signal keyboardNavigationRequested(int index)
   readonly property string pluginId: manifest && manifest.id
     ? String(manifest.id) : "m0sthatedman.quickfile"
+  readonly property string windowTitle: "QuickFile"
   readonly property int bladeWidth: Style.space(410)
+  // Only the initial size; the compositor owns the window from then on.
+  readonly property int bladeHeight: Style.space(1100)
   readonly property color background: Color.popups.background
   readonly property color foreground: Color.popups.text
   readonly property color borderColor: Color.popups.border
@@ -66,8 +67,6 @@ Item {
   readonly property color accent: Color.accent
   readonly property int primaryFontSize: Style.font.subtitle
   readonly property int secondaryFontSize: Style.font.body
-  readonly property int revealDuration: 220
-  readonly property real bladeOffset: -root.bladeWidth * (1 - root.revealProgress)
   readonly property var colorChoices: [
     "red", "yellow", "orange", "green", "cyan", "blue", "magenta", "brown"
   ]
@@ -80,22 +79,27 @@ Item {
     { key: "windsurf", label: "WS", name: "Windsurf" }
   ]
   property var itemPalette: ({})
-  property real revealProgress: opened ? 1 : 0
 
-  Behavior on revealProgress {
-    NumberAnimation {
-      duration: root.revealDuration
-      easing.type: Easing.OutCubic
-    }
-  }
-
+  // Asking the compositor to focus a toplevel it has not mapped yet is a no-op,
+  // and Qt reports the window visible before the Wayland surface is up. Retry a
+  // few times across the map, then stop: past this window the user has had time
+  // to click elsewhere deliberately, and stealing focus back would be wrong.
   Timer {
-    id: focusPrimeTimer
-    // Start this only after the Wayland surface is mapped. The short
-    // Exclusive phase gives a keyboard-summoned panel initial focus; settling
-    // on OnDemand then returns normal pointer and keyboard focus to apps.
-    interval: 75
-    onTriggered: if (root.opened) root.focusPrimed = true
+    id: activationTimer
+    interval: 90
+    repeat: true
+    triggeredOnStart: true
+    property int attempts: 0
+    onRunningChanged: if (running) attempts = 0
+    onTriggered: {
+      if (!root.opened) {
+        stop()
+        return
+      }
+      root.raiseWindow()
+      attempts++
+      if (attempts >= 4) stop()
+    }
   }
 
   FileView {
@@ -214,18 +218,9 @@ Item {
     return Math.floor(value / 86400) + "d"
   }
 
-  function focusedScreenName() {
-    var monitor = Hyprland.focusedMonitor
-    if (monitor && monitor.name) return String(monitor.name)
-    var screens = Quickshell.screens
-    return screens.length > 0 ? String(screens[0].name || "") : ""
-  }
-
   function open(payloadJson) {
     var payload = ({})
     try { payload = JSON.parse(String(payloadJson || "{}")) || ({}) } catch (error) {}
-    targetScreenName = focusedScreenName()
-    focusPrimed = false
     opened = true
     keyboardIndex = selectedEntryIndex()
     if (service) {
@@ -237,10 +232,40 @@ Item {
   function close() {
     dismissEditor()
     hoveredToken = ""
-    focusPrimeTimer.stop()
-    focusPrimed = false
     opened = false
     if (service) service.setPanelVisible(false)
+  }
+
+  // Summoning from a keybinding must land the caret in QuickFile, not merely
+  // put a window on screen. A newly mapped toplevel is usually focused by the
+  // compositor, but not in every case: a floating window placed away from the
+  // pointer under `follow_mouse` is one of them, and that is exactly the
+  // placement the shipped window rules ask for. Ask for activation explicitly
+  // and let the compositor honour it (Hyprland: `misc:focus_on_activate`).
+  function raiseWindow() {
+    // xdg-activation first: it is the portable request, and a compositor that
+    // hands us a token will honour it without any Hyprland-specific path.
+    var handle = keyScope.Window.window
+    if (handle && typeof handle.requestActivate === "function") handle.requestActivate()
+    // Hyprland ignores activation from a client that did not receive the key
+    // press itself — the compositor did — so ask it directly. Matching on the
+    // window title keeps this to the one toplevel this plugin owns.
+    try {
+      // Hyprland's IPC evaluates this as Lua against its dispatcher table; the
+      // flat "focuswindow title:..." string form is rejected by this API.
+      Hyprland.dispatch('hl.dsp.focus({ window = "title:^' + windowTitle + '$" })')
+    } catch (error) {
+      // Not running under Hyprland: the activation request above is all we can
+      // reasonably do, and the window is on screen either way.
+    }
+  }
+
+  // The compositor closed the window (Alt-F4, `killactive`, a close button).
+  // Run the same teardown as close(), then let the host clear its own open
+  // state; without this the next summon would toggle the panel shut instead.
+  function dismissFromCompositor() {
+    close()
+    if (shell && typeof shell.hide === "function") shell.hide(pluginId)
   }
 
   function requestClose() {
@@ -1205,2076 +1230,2111 @@ Item {
     }
   }
 
-  Variants {
-    model: Quickshell.screens
+  // QuickFile is an application window, not a layer-shell blade.
+  //
+  // It is summoned by a keybinding, lives for minutes, and must join the
+  // normal window stack: the compositor focuses it on map, Alt-Tab reaches it,
+  // and it can stay open beside the editor it was opened from. A layer surface
+  // gets none of that for free — it has to negotiate keyboard focus with the
+  // compositor, and every such scheme trades away either focus-on-summon or
+  // the pointer behaviour of the surfaces below it.
+  //
+  // Placement is the compositor's business. `omarchy quickfile rules` (see
+  // README) pins it to the left edge; without those rules it simply opens as
+  // an ordinary window, which is a working fallback rather than a broken one.
+  FloatingWindow {
+    id: window
+    objectName: "quickfilePanelWindow"
+    title: root.windowTitle
+    color: root.background
+    visible: root.opened
+    implicitWidth: root.bladeWidth
+    implicitHeight: root.bladeHeight
+    minimumSize: Qt.size(Style.space(300), Style.space(320))
 
-    PanelWindow {
-      id: window
-      objectName: "quickfilePanelWindow"
-      required property var modelData
-      screen: modelData
-      visible: (root.opened || root.revealProgress > 0.001)
-        && (root.targetScreenName === ""
-          || String(modelData.name || "") === root.targetScreenName)
-      // Keep the layer surface and its exclusive zone stable. Resizing this
-      // surface on every animation frame forces the compositor to configure
-      // and retile every workspace window repeatedly, which produces visible
-      // bands and stutter. The blade itself slides on the scene graph below.
-      implicitWidth: root.bladeWidth
-      color: "transparent"
-      exclusionMode: visible ? ExclusionMode.Auto : ExclusionMode.Ignore
-
-      anchors {
-        top: true
-        bottom: true
-        left: true
-      }
-      margins {
-        // The bar already owns Hyprland's top exclusive zone. Match the
-        // compositor's outer window gap instead of adding the bar twice.
-        top: Style.spacing.xl
-        bottom: Style.spacing.xl
-        left: Style.spacing.xl
-      }
-
-      WlrLayershell.namespace: "omarchy-quickfile"
-      WlrLayershell.layer: WlrLayer.Top
-      WlrLayershell.keyboardFocus: root.opened
-        ? (root.focusPrimed ? WlrKeyboardFocus.OnDemand
-          : WlrKeyboardFocus.Exclusive)
-        : WlrKeyboardFocus.None
-
-      readonly property bool keyboardFocusOnDemand: root.opened
-        && WlrLayershell.keyboardFocus === WlrKeyboardFocus.OnDemand
-
-      function claimKeyboardFocus() {
-        if (!root.opened || !visible) return
+    onVisibleChanged: {
+      if (visible) {
+        // The surface is mapped but its children have not finished layout;
+        // give Qt an active-focus target inside the window on the next tick so
+        // the key handlers below receive the very first keystroke.
         Qt.callLater(function() { keyScope.forceActiveFocus() })
+        activationTimer.restart()
+        return
       }
+      // The window can also disappear because the user closed it from the
+      // compositor. Tell the host so its open/closed bookkeeping — and the bar
+      // widget that reads it — does not drift out of sync with reality.
+      if (root.opened) root.dismissFromCompositor()
+    }
 
-      function beginFocusPrime() {
-        if (!root.opened || !backingWindowVisible) return
-        root.focusPrimed = false
-        focusPrimeTimer.restart()
+    // Alt-F4, a titlebar close button and `killactive` all arrive as a close
+    // request on the backing window. Nothing acts on it by default here: the
+    // window's visibility is bound to `opened`, so Qt hiding the surface would
+    // be undone on the next binding evaluation and QuickFile would look
+    // unclosable. Refuse the tear-down and run our own teardown instead.
+    Connections {
+      target: keyScope.Window.window
+      ignoreUnknownSignals: true
+      function onClosing(event) {
+        if (event) event.accepted = false
+        root.dismissFromCompositor()
       }
+      // Quickshell may surface the same request under its own name depending
+      // on how the toplevel was torn down; both routes run one teardown.
+      function onCloseRequested() { root.dismissFromCompositor() }
+    }
 
-      onVisibleChanged: {
-        if (visible) {
-          claimKeyboardFocus()
-          beginFocusPrime()
-        }
-      }
-      onBackingWindowVisibleChanged: beginFocusPrime()
+    // Fills the window. Rounding, borders and the open/close animation belong
+    // to the compositor for a real window, so the plugin no longer draws or
+    // animates a blade of its own.
+    Rectangle {
+      id: blade
+      objectName: "quickfileBlade"
+      anchors.fill: parent
+      color: root.background
+      clip: true
 
-      Connections {
-        target: root
-        function onOpenedChanged() {
-          if (root.opened) {
-            window.claimKeyboardFocus()
-            window.beginFocusPrime()
+      FocusScope {
+        id: keyScope
+        objectName: "quickfileKeyScope"
+        anchors.fill: parent
+        focus: true
+        readonly property var moduleHeights: ({
+          sessions: sessionsModule.height,
+          devices: devicesModule.height,
+          favorites: favoritesModule.height,
+          knowledge: knowledgeModule.height
+        })
+        Keys.priority: Keys.BeforeItem
+        Keys.onPressed: function(event) {
+          if (root.editorMode !== "") return
+          if (event.key === Qt.Key_P && (event.modifiers & Qt.ControlModifier) !== 0) {
+            root.openQuickNav()
+            event.accepted = true
+            return
+          }
+          if (noteEditor.activeFocus || pathField.activeFocus || previewText.activeFocus) return
+          if (searchField.activeFocus) {
+            if (event.key === Qt.Key_Escape) {
+              if (searchField.text !== "") searchField.clear()
+              else keyScope.forceActiveFocus()
+              event.accepted = true
+            } else if ((event.key === Qt.Key_Up || event.key === Qt.Key_Down)
+                && root.handleVerticalNavigationKey(event.key, event.modifiers)) {
+              event.accepted = true
+            }
+            return
+          }
+          if (event.key === Qt.Key_Escape) {
+            if (root.inlinePreviewOpen) root.closeInlinePreview()
+            else if (root.service && root.service.selectedTokens.length > 0)
+              root.service.clearSelection()
+            else root.requestClose()
+            event.accepted = true
+          } else if (event.key === Qt.Key_A
+              && (event.modifiers & Qt.ControlModifier) !== 0) {
+            root.service.selectAllVisible()
+            event.accepted = true
+          } else if (event.key === Qt.Key_Z
+              && (event.modifiers & Qt.ControlModifier) !== 0) {
+            if (root.service && root.service.undoAvailable)
+              root.service.undoLast()
+            event.accepted = true
+          } else if (event.key === Qt.Key_C
+              && (event.modifiers & Qt.ControlModifier) !== 0) {
+            root.service.copySelected()
+            event.accepted = true
+          } else if (event.key === Qt.Key_X
+              && (event.modifiers & Qt.ControlModifier) !== 0) {
+            root.service.cutSelected()
+            event.accepted = true
+          } else if (event.key === Qt.Key_V
+              && (event.modifiers & Qt.ControlModifier) !== 0) {
+            root.service.pasteHere()
+            event.accepted = true
+          } else if (event.key === Qt.Key_D
+              && (event.modifiers & Qt.ControlModifier) !== 0) {
+            root.service.duplicateSelected()
+            event.accepted = true
+          } else if (event.key === Qt.Key_Space
+              && (event.modifiers & Qt.ControlModifier) !== 0) {
+            if (root.keyboardIndex >= 0) root.service.toggleIndex(root.keyboardIndex)
+            event.accepted = true
+          } else if (event.key === Qt.Key_Space) {
+            root.previewHoveredOrSelected((event.modifiers & Qt.ShiftModifier) !== 0)
+            event.accepted = true
+          } else if (root.handleVerticalNavigationKey(event.key, event.modifiers)) {
+            event.accepted = true
+          } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+            if (root.keyboardIndex >= 0) root.service.activateIndex(root.keyboardIndex)
+            event.accepted = true
+          } else if (event.key === Qt.Key_Right || event.key === Qt.Key_L) {
+            if (root.keyboardIndex >= 0) root.service.enterIndex(root.keyboardIndex)
+            event.accepted = true
+          } else if (root.handleTrashShortcut(event.key)) {
+            event.accepted = true
+          } else if (event.key === Qt.Key_Left || event.key === Qt.Key_H) {
+            root.service.goParent()
+            event.accepted = true
+          } else if (event.key === Qt.Key_Slash
+              || (event.key === Qt.Key_F && event.modifiers & Qt.ControlModifier)) {
+            searchField.forceActiveFocus()
+            searchField.selectAll()
+            event.accepted = true
+          } else if (event.key === Qt.Key_Period) {
+            root.service.setShowHidden(!root.service.showHidden)
+            event.accepted = true
+          } else if (event.key === Qt.Key_R && event.modifiers & Qt.ControlModifier) {
+            root.service.refreshAll()
+            event.accepted = true
           }
         }
-      }
 
-      Rectangle {
-        id: blade
-        objectName: "quickfileBlade"
-        anchors.top: parent.top
-        anchors.bottom: parent.bottom
-        anchors.right: parent.right
-        width: root.bladeWidth
-        color: root.background
-        radius: Style.cornerRadius
-        border.width: Math.max(1, Style.normalBorderWidth)
-        border.color: root.borderColor
-        clip: true
-        transform: Translate {
-          objectName: "quickfileBladeSlide"
-          x: root.bladeOffset
+        Rectangle {
+          id: header
+          anchors.top: parent.top
+          anchors.left: parent.left
+          anchors.right: parent.right
+          height: Style.space(46)
+          color: Qt.alpha(root.foreground, 0.025)
+
+          Text {
+            anchors.left: parent.left
+            anchors.leftMargin: Style.space(14)
+            anchors.verticalCenter: parent.verticalCenter
+            text: "QUICKFILE"
+            color: root.foreground
+            font.family: Style.font.family
+            font.pixelSize: root.secondaryFontSize
+            font.bold: true
+            font.letterSpacing: 1.2
+            renderType: Text.NativeRendering
+          }
+
+          Row {
+            anchors.right: parent.right
+            anchors.rightMargin: Style.space(8)
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.space(2)
+            Components.IconButton {
+              glyph: "󰉖"
+              tooltip: "New file"
+              onClicked: root.beginEditor("new-file")
+            }
+            Components.IconButton {
+              glyph: "󰉓"
+              tooltip: "New folder"
+              onClicked: root.beginEditor("new-folder")
+            }
+            Components.IconButton {
+              glyph: "󰩺"
+              tooltip: "Trash"
+              onClicked: root.openTrashBrowser()
+            }
+            Components.IconButton {
+              glyph: "󰑐"
+              tooltip: "Refresh"
+              active: root.service ? root.service.foregroundBusy : false
+              onClicked: if (root.service) root.service.refreshAll()
+            }
+            Components.IconButton {
+              glyph: "󰈉"
+              tooltip: "Show hidden files"
+              active: root.service ? root.service.showHidden : false
+              onClicked: if (root.service) root.service.setShowHidden(!root.service.showHidden)
+            }
+            Components.IconButton {
+              glyph: "󰈈"
+              tooltip: "Inline preview · Space (Shift+Space: Sushi)"
+              active: root.inlinePreviewOpen
+              available: root.service && root.service.selectedEntry !== null
+              onClicked: {
+                if (root.inlinePreviewOpen) root.closeInlinePreview()
+                else root.showInlinePreview(root.service.selectedEntry)
+              }
+            }
+            Components.IconButton {
+              glyph: "󰏘"
+              tooltip: "Color, note, and properties"
+              active: root.inspectorOpen
+              available: root.service && root.service.selectedEntry !== null
+              onClicked: root.inspectorOpen = !root.inspectorOpen
+            }
+            Components.IconButton {
+              glyph: "󰒓"
+              tooltip: "Arrange modules"
+              active: moduleSettingsPopup.visible
+              onClicked: moduleSettingsPopup.visible
+                ? moduleSettingsPopup.close() : moduleSettingsPopup.open()
+            }
+            Components.IconButton {
+              glyph: "󰅖"
+              tooltip: "Close"
+              onClicked: root.requestClose()
+            }
+          }
         }
 
-        FocusScope {
-          id: keyScope
-          objectName: "quickfileKeyScope"
-          anchors.fill: parent
+        Popup {
+          id: moduleSettingsPopup
+          objectName: "quickfileModuleSettings"
+          parent: keyScope
+          x: blade.width - width - Style.space(8)
+          y: header.height + Style.space(5)
+          width: Style.space(302)
+          height: Style.space(258)
+          padding: Style.space(8)
+          modal: false
           focus: true
-          readonly property var moduleHeights: ({
-            sessions: sessionsModule.height,
-            devices: devicesModule.height,
-            favorites: favoritesModule.height,
-            knowledge: knowledgeModule.height
-          })
-          Keys.priority: Keys.BeforeItem
-          Keys.onPressed: function(event) {
-            if (root.editorMode !== "") return
-            if (event.key === Qt.Key_P && (event.modifiers & Qt.ControlModifier) !== 0) {
-              root.openQuickNav()
-              event.accepted = true
-              return
+          closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+          background: Rectangle {
+            color: root.background
+            radius: Style.cornerRadius
+            border.width: Math.max(1, Style.normalBorderWidth)
+            border.color: root.borderColor
+          }
+          contentItem: Column {
+            spacing: Style.space(4)
+            Text {
+              width: parent.width
+              height: Style.space(25)
+              text: "MODULES"
+              color: root.foreground
+              font.family: Style.font.family
+              font.pixelSize: Style.font.bodySmall
+              font.bold: true
+              font.letterSpacing: 1
+              verticalAlignment: Text.AlignVCenter
             }
-            if (noteEditor.activeFocus || pathField.activeFocus || previewText.activeFocus) return
-            if (searchField.activeFocus) {
-              if (event.key === Qt.Key_Escape) {
-                if (searchField.text !== "") searchField.clear()
-                else keyScope.forceActiveFocus()
-                event.accepted = true
-              } else if ((event.key === Qt.Key_Up || event.key === Qt.Key_Down)
-                  && root.handleVerticalNavigationKey(event.key, event.modifiers)) {
-                event.accepted = true
+            Rectangle {
+              width: parent.width
+              height: Style.space(43)
+              radius: Style.cornerRadius > 0 ? Style.space(5) : 0
+              color: Qt.alpha(root.accent, 0.07)
+              border.width: Style.normalBorderWidth
+              border.color: Style.normalBorderColor
+              Column {
+                anchors.left: parent.left
+                anchors.leftMargin: Style.space(9)
+                anchors.right: sessionOptIn.left
+                anchors.rightMargin: Style.space(8)
+                anchors.verticalCenter: parent.verticalCenter
+                Text {
+                  text: "Active AI sessions"
+                  color: root.foreground
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.bodySmall
+                  font.bold: true
+                }
+                Text {
+                  text: "Opt-in · local process metadata only"
+                  color: root.muted
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                }
               }
-              return
+              Rectangle {
+                id: sessionOptIn
+                anchors.right: parent.right
+                anchors.rightMargin: Style.space(8)
+                anchors.verticalCenter: parent.verticalCenter
+                width: Style.space(48)
+                height: Style.space(24)
+                radius: height / 2
+                color: root.service && root.service.activeSessionsEnabled
+                  ? Qt.alpha(root.accent, 0.32) : Qt.alpha(root.muted, 0.15)
+                border.width: 1
+                border.color: root.service && root.service.activeSessionsEnabled
+                  ? root.accent : root.muted
+                Rectangle {
+                  width: Style.space(18)
+                  height: width
+                  radius: width / 2
+                  anchors.verticalCenter: parent.verticalCenter
+                  x: root.service && root.service.activeSessionsEnabled
+                    ? parent.width - width - Style.space(3) : Style.space(3)
+                  color: root.service && root.service.activeSessionsEnabled
+                    ? root.accent : root.muted
+                  Behavior on x { NumberAnimation { duration: 120 } }
+                }
+                MouseArea {
+                  anchors.fill: parent
+                  enabled: root.service && root.service.settingsLoaded
+                  cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+                  onClicked: root.service.setActiveSessionsEnabled(
+                    !root.service.activeSessionsEnabled)
+                }
+              }
             }
-            if (event.key === Qt.Key_Escape) {
-              if (root.inlinePreviewOpen) root.closeInlinePreview()
-              else if (root.service && root.service.selectedTokens.length > 0)
-                root.service.clearSelection()
-              else root.requestClose()
-              event.accepted = true
-            } else if (event.key === Qt.Key_A
-                && (event.modifiers & Qt.ControlModifier) !== 0) {
-              root.service.selectAllVisible()
-              event.accepted = true
-            } else if (event.key === Qt.Key_Z
-                && (event.modifiers & Qt.ControlModifier) !== 0) {
-              if (root.service && root.service.undoAvailable)
-                root.service.undoLast()
-              event.accepted = true
-            } else if (event.key === Qt.Key_C
-                && (event.modifiers & Qt.ControlModifier) !== 0) {
-              root.service.copySelected()
-              event.accepted = true
-            } else if (event.key === Qt.Key_X
-                && (event.modifiers & Qt.ControlModifier) !== 0) {
-              root.service.cutSelected()
-              event.accepted = true
-            } else if (event.key === Qt.Key_V
-                && (event.modifiers & Qt.ControlModifier) !== 0) {
-              root.service.pasteHere()
-              event.accepted = true
-            } else if (event.key === Qt.Key_D
-                && (event.modifiers & Qt.ControlModifier) !== 0) {
-              root.service.duplicateSelected()
-              event.accepted = true
-            } else if (event.key === Qt.Key_Space
-                && (event.modifiers & Qt.ControlModifier) !== 0) {
-              if (root.keyboardIndex >= 0) root.service.toggleIndex(root.keyboardIndex)
-              event.accepted = true
-            } else if (event.key === Qt.Key_Space) {
-              root.previewHoveredOrSelected((event.modifiers & Qt.ShiftModifier) !== 0)
-              event.accepted = true
-            } else if (root.handleVerticalNavigationKey(event.key, event.modifiers)) {
-              event.accepted = true
-            } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-              if (root.keyboardIndex >= 0) root.service.activateIndex(root.keyboardIndex)
-              event.accepted = true
-            } else if (event.key === Qt.Key_Right || event.key === Qt.Key_L) {
-              if (root.keyboardIndex >= 0) root.service.enterIndex(root.keyboardIndex)
-              event.accepted = true
-            } else if (root.handleTrashShortcut(event.key)) {
-              event.accepted = true
-            } else if (event.key === Qt.Key_Left || event.key === Qt.Key_H) {
-              root.service.goParent()
-              event.accepted = true
-            } else if (event.key === Qt.Key_Slash
-                || (event.key === Qt.Key_F && event.modifiers & Qt.ControlModifier)) {
-              searchField.forceActiveFocus()
-              searchField.selectAll()
-              event.accepted = true
-            } else if (event.key === Qt.Key_Period) {
-              root.service.setShowHidden(!root.service.showHidden)
-              event.accepted = true
-            } else if (event.key === Qt.Key_R && event.modifiers & Qt.ControlModifier) {
-              root.service.refreshAll()
-              event.accepted = true
+            Repeater {
+              model: root.moduleLayoutSnapshot()
+              delegate: Rectangle {
+                required property int index
+                required property var modelData
+                width: parent.width
+                height: Style.space(38)
+                radius: Style.cornerRadius > 0 ? Style.space(4) : 0
+                color: moduleRowMouse.containsMouse ? Style.hoverFill : "transparent"
+                Text {
+                  anchors.left: parent.left
+                  anchors.leftMargin: Style.space(7)
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: parent.width - Style.space(128)
+                  text: root.moduleGlyph(String(parent.modelData.id)) + "  "
+                    + root.moduleLabel(String(parent.modelData.id))
+                  color: root.foreground
+                  elide: Text.ElideRight
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.bodySmall
+                }
+                MouseArea {
+                  id: moduleRowMouse
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  acceptedButtons: Qt.NoButton
+                }
+                Row {
+                  z: 2
+                  anchors.right: parent.right
+                  anchors.rightMargin: Style.space(2)
+                  anchors.verticalCenter: parent.verticalCenter
+                  spacing: 0
+                  Components.IconButton {
+                    glyph: "󰁝"
+                    tooltip: "Move up"
+                    buttonSize: Style.space(27)
+                    available: root.service && root.service.settingsLoaded && index > 0
+                    onClicked: root.service.moveModule(String(modelData.id), -1)
+                  }
+                  Components.IconButton {
+                    glyph: "󰁅"
+                    tooltip: "Move down"
+                    buttonSize: Style.space(27)
+                    available: root.service && root.service.settingsLoaded
+                      && index < root.moduleLayoutSnapshot().length - 1
+                    onClicked: root.service.moveModule(String(modelData.id), 1)
+                  }
+                  Components.IconButton {
+                    glyph: modelData.pinned === true ? "󰐃" : "󰐂"
+                    tooltip: modelData.pinned === true
+                      ? "Unpin when empty" : "Keep visible when empty"
+                    active: modelData.pinned === true
+                    buttonSize: Style.space(27)
+                    available: root.service && root.service.settingsLoaded
+                    onClicked: root.service.setModulePinned(String(modelData.id),
+                      modelData.pinned !== true)
+                  }
+                  Components.IconButton {
+                    glyph: modelData.collapsed === true ? "󰅂" : "󰅀"
+                    tooltip: modelData.collapsed === true ? "Expand" : "Collapse"
+                    active: modelData.collapsed === true
+                    buttonSize: Style.space(27)
+                    available: root.service && root.service.settingsLoaded
+                    onClicked: root.service.setModuleCollapsed(String(modelData.id),
+                      modelData.collapsed !== true)
+                  }
+                }
+              }
             }
+            Text {
+              visible: root.service && String(root.service.settingsError || "") !== ""
+              width: parent.width
+              text: root.service ? String(root.service.settingsError || "") : ""
+              color: Color.urgent
+              elide: Text.ElideRight
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+            }
+          }
+        }
+
+        Components.Divider {
+          anchors.top: header.bottom
+          anchors.left: parent.left
+          anchors.right: parent.right
+        }
+
+        Rectangle {
+          id: locationBar
+          anchors.top: header.bottom
+          anchors.topMargin: 1
+          anchors.left: parent.left
+          anchors.right: parent.right
+          height: Style.space(39)
+          color: "transparent"
+
+          Row {
+            id: navButtons
+            anchors.left: parent.left
+            anchors.leftMargin: Style.space(8)
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.space(1)
+            Components.IconButton {
+              glyph: "󰁍"
+              tooltip: "Back"
+              buttonSize: Style.space(26)
+              available: root.service && root.service.backStack.length > 0
+              onClicked: root.service.goBack()
+            }
+            Components.IconButton {
+              glyph: "󰁔"
+              tooltip: "Forward"
+              buttonSize: Style.space(26)
+              available: root.service && root.service.forwardStack.length > 0
+              onClicked: root.service.goForward()
+            }
+            Components.IconButton {
+              glyph: "󰁞"
+              tooltip: "Parent folder"
+              buttonSize: Style.space(26)
+              onClicked: if (root.service) root.service.goParent()
+            }
+            Components.IconButton {
+              glyph: "󰋜"
+              tooltip: "Home folder"
+              buttonSize: Style.space(26)
+              onClicked: if (root.service) root.service.goHome()
+            }
+            Components.IconButton {
+              glyph: "󰍉"
+              tooltip: "Quick Nav · Ctrl+P"
+              buttonSize: Style.space(26)
+              onClicked: root.openQuickNav()
+            }
+          }
+
+          Text {
+            anchors.left: navButtons.right
+            anchors.leftMargin: Style.space(8)
+            anchors.right: parent.right
+            anchors.rightMargin: Style.space(10)
+            anchors.verticalCenter: parent.verticalCenter
+            text: root.service ? root.service.rootPath : "Loading…"
+            color: root.foreground
+            opacity: 0.82
+            elide: Text.ElideMiddle
+            font.family: Style.font.family
+            font.pixelSize: root.primaryFontSize
+            renderType: Text.NativeRendering
+          }
+          DirectoryDropTarget {
+            objectName: "quickfileCurrentFolderDrop"
+            destinationEntry: root.service ? ({ isDir: true,
+              token: root.service.rootToken, path: root.service.rootPath }) : null
+          }
+        }
+
+        Rectangle {
+          id: searchSurface
+          anchors.top: locationBar.bottom
+          anchors.left: parent.left
+          anchors.leftMargin: Style.space(9)
+          anchors.right: parent.right
+          anchors.rightMargin: Style.space(9)
+          height: Style.space(34)
+          radius: Style.cornerRadius > 0 ? Style.space(6) : 0
+          color: Style.controlFill(searchField.activeFocus, searchMouse.containsMouse,
+            root.foreground, root.accent)
+          border.width: Style.controlBorderWidth(searchField.activeFocus, searchMouse.containsMouse)
+          border.color: Style.controlBorder(searchField.activeFocus, searchMouse.containsMouse,
+            root.foreground, root.accent)
+
+          MouseArea {
+            id: searchMouse
+            anchors.fill: parent
+            hoverEnabled: true
+            onClicked: searchField.forceActiveFocus()
+          }
+
+          Text {
+            anchors.left: parent.left
+            anchors.leftMargin: Style.space(9)
+            anchors.verticalCenter: parent.verticalCenter
+            text: "󰍉"
+            color: root.muted
+            font.family: Style.font.family
+            font.pixelSize: Style.font.body
+            renderType: Text.NativeRendering
+          }
+
+          TextField {
+            id: searchField
+            anchors.left: parent.left
+            anchors.leftMargin: Style.space(29)
+            anchors.right: searchModeButton.left
+            anchors.rightMargin: Style.space(6)
+            anchors.verticalCenter: parent.verticalCenter
+            height: parent.height
+            color: root.foreground
+            placeholderText: "Search files…"
+            placeholderTextColor: Qt.alpha(root.muted, 0.78)
+            selectByMouse: true
+            font.family: Style.font.family
+            font.pixelSize: root.primaryFontSize
+            background: Item {}
+            onTextEdited: searchDebounce.restart()
           }
 
           Rectangle {
-            id: header
-            anchors.top: parent.top
-            anchors.left: parent.left
+            id: searchModeButton
             anchors.right: parent.right
-            height: Style.space(46)
-            color: Qt.alpha(root.foreground, 0.025)
-
+            anchors.rightMargin: Style.space(4)
+            anchors.verticalCenter: parent.verticalCenter
+            width: modeText.implicitWidth + Style.space(10)
+            height: Style.space(24)
+            radius: Style.cornerRadius > 0 ? Style.space(4) : 0
+            color: modeMouse.containsMouse ? Style.hoverFill : "transparent"
             Text {
-              anchors.left: parent.left
-              anchors.leftMargin: Style.space(14)
-              anchors.verticalCenter: parent.verticalCenter
-              text: "QUICKFILE"
-              color: root.foreground
+              id: modeText
+              anchors.centerIn: parent
+              text: root.service ? String(root.service.searchMode).toUpperCase() : "FUZZY"
+              color: root.accent
               font.family: Style.font.family
               font.pixelSize: root.secondaryFontSize
-              font.bold: true
-              font.letterSpacing: 1.2
               renderType: Text.NativeRendering
             }
-
-            Row {
-              anchors.right: parent.right
-              anchors.rightMargin: Style.space(8)
-              anchors.verticalCenter: parent.verticalCenter
-              spacing: Style.space(2)
-              Components.IconButton {
-                glyph: "󰉖"
-                tooltip: "New file"
-                onClicked: root.beginEditor("new-file")
-              }
-              Components.IconButton {
-                glyph: "󰉓"
-                tooltip: "New folder"
-                onClicked: root.beginEditor("new-folder")
-              }
-              Components.IconButton {
-                glyph: "󰩺"
-                tooltip: "Trash"
-                onClicked: root.openTrashBrowser()
-              }
-              Components.IconButton {
-                glyph: "󰑐"
-                tooltip: "Refresh"
-                active: root.service ? root.service.foregroundBusy : false
-                onClicked: if (root.service) root.service.refreshAll()
-              }
-              Components.IconButton {
-                glyph: "󰈉"
-                tooltip: "Show hidden files"
-                active: root.service ? root.service.showHidden : false
-                onClicked: if (root.service) root.service.setShowHidden(!root.service.showHidden)
-              }
-              Components.IconButton {
-                glyph: "󰈈"
-                tooltip: "Inline preview · Space (Shift+Space: Sushi)"
-                active: root.inlinePreviewOpen
-                available: root.service && root.service.selectedEntry !== null
-                onClicked: {
-                  if (root.inlinePreviewOpen) root.closeInlinePreview()
-                  else root.showInlinePreview(root.service.selectedEntry)
-                }
-              }
-              Components.IconButton {
-                glyph: "󰏘"
-                tooltip: "Color, note, and properties"
-                active: root.inspectorOpen
-                available: root.service && root.service.selectedEntry !== null
-                onClicked: root.inspectorOpen = !root.inspectorOpen
-              }
-              Components.IconButton {
-                glyph: "󰒓"
-                tooltip: "Arrange modules"
-                active: moduleSettingsPopup.visible
-                onClicked: moduleSettingsPopup.visible
-                  ? moduleSettingsPopup.close() : moduleSettingsPopup.open()
-              }
-              Components.IconButton {
-                glyph: "󰅖"
-                tooltip: "Close"
-                onClicked: root.requestClose()
+            MouseArea {
+              id: modeMouse
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: {
+                if (!root.service) return
+                var modes = ["fuzzy", "contains", "exact", "prefix", "suffix", "regex"]
+                var next = (modes.indexOf(root.service.searchMode) + 1) % modes.length
+                root.service.searchMode = modes[next]
+                searchDebounce.restart()
               }
             }
           }
 
-          Popup {
-            id: moduleSettingsPopup
-            objectName: "quickfileModuleSettings"
-            parent: keyScope
-            x: blade.width - width - Style.space(8)
-            y: header.height + Style.space(5)
-            width: Style.space(302)
-            height: Style.space(258)
-            padding: Style.space(8)
-            modal: false
-            focus: true
-            closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
-            background: Rectangle {
-              color: root.background
-              radius: Style.cornerRadius
-              border.width: Math.max(1, Style.normalBorderWidth)
-              border.color: root.borderColor
+          Timer {
+            id: searchDebounce
+            interval: 180
+            onTriggered: if (root.service)
+              root.service.setSearch(searchField.text, root.service.searchMode)
+          }
+        }
+
+        Item {
+          id: sessionsModule
+          objectName: "quickfileSessionsModule"
+          anchors.left: parent.left
+          anchors.right: parent.right
+          y: searchSurface.y + searchSurface.height + Style.space(6)
+            + root.moduleStackOffset("sessions", keyScope.moduleHeights)
+          visible: root.moduleVisible("sessions")
+          height: visible ? sessionsHeader.height + sessionsBody.height : 0
+
+          Rectangle {
+            id: sessionsHeader
+            anchors.top: parent.top
+            anchors.left: parent.left
+            anchors.right: parent.right
+            height: Style.space(27)
+            color: "transparent"
+            Text {
+              anchors.left: parent.left
+              anchors.leftMargin: Style.space(12)
+              anchors.verticalCenter: parent.verticalCenter
+              text: (root.service && root.service.sessionsCollapsed ? "󰅂" : "󰅀")
+                + "  󰚩  AI SESSIONS"
+              color: root.service && root.service.activeSessions.length > 0
+                ? root.accent : root.muted
+              font.family: Style.font.family
+              font.pixelSize: Style.font.bodySmall
+              font.bold: true
+              renderType: Text.NativeRendering
             }
-            contentItem: Column {
-              spacing: Style.space(4)
-              Text {
-                width: parent.width
-                height: Style.space(25)
-                text: "MODULES"
-                color: root.foreground
-                font.family: Style.font.family
-                font.pixelSize: Style.font.bodySmall
-                font.bold: true
-                font.letterSpacing: 1
-                verticalAlignment: Text.AlignVCenter
+            Text {
+              id: sessionsToggle
+              z: 2
+              anchors.right: parent.right
+              anchors.rightMargin: Style.space(12)
+              anchors.verticalCenter: parent.verticalCenter
+              text: !root.service || !root.service.settingsLoaded ? "…"
+                : root.service.activeSessionsEnabled
+                  ? (root.service.sessionsBusy ? "CHECKING…"
+                    : root.service.activeSessions.length + " ACTIVE")
+                  : "ENABLE"
+              color: root.service && root.service.activeSessionsEnabled
+                ? root.accent : root.muted
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              font.bold: true
+              renderType: Text.NativeRendering
+              MouseArea {
+                anchors.fill: parent
+                anchors.margins: -Style.space(7)
+                enabled: root.service && root.service.settingsLoaded
+                hoverEnabled: true
+                cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+                onClicked: root.service.setActiveSessionsEnabled(
+                  !root.service.activeSessionsEnabled)
+                ToolTip.visible: containsMouse
+                ToolTip.delay: 500
+                ToolTip.text: root.service && root.service.activeSessionsEnabled
+                  ? "Disable read-only process detection"
+                  : "Opt in to local, read-only terminal session detection"
               }
-              Rectangle {
-                width: parent.width
-                height: Style.space(43)
-                radius: Style.cornerRadius > 0 ? Style.space(5) : 0
-                color: Qt.alpha(root.accent, 0.07)
-                border.width: Style.normalBorderWidth
-                border.color: Style.normalBorderColor
-                Column {
+            }
+            MouseArea {
+              anchors.left: parent.left
+              anchors.right: sessionsToggle.left
+              anchors.top: parent.top
+              anchors.bottom: parent.bottom
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.toggleModuleCollapsed("sessions")
+            }
+          }
+
+          Item {
+            id: sessionsBody
+            anchors.top: sessionsHeader.bottom
+            anchors.left: parent.left
+            anchors.right: parent.right
+            height: root.service && !root.service.sessionsCollapsed
+              ? (root.service.activeSessionsEnabled && root.service.activeSessions.length > 0
+                ? Math.min(sessionsList.contentHeight, Style.space(126)) : Style.space(42)) : 0
+            clip: true
+
+            StableListView {
+              id: sessionsList
+              objectName: "quickfileSessionsList"
+              anchors.fill: parent
+              visible: root.service && root.service.activeSessionsEnabled
+                && root.service.activeSessions.length > 0
+              boundsBehavior: Flickable.StopAtBounds
+              model: root.service ? root.service.sessionsModel : null
+              delegate: Rectangle {
+                id: sessionRow
+                required property var rowData
+                readonly property var modelData: rowData
+                width: sessionsList.width
+                height: Style.space(42)
+                color: sessionMouse.containsMouse ? Style.hoverFill : "transparent"
+                Rectangle {
                   anchors.left: parent.left
-                  anchors.leftMargin: Style.space(9)
-                  anchors.right: sessionOptIn.left
-                  anchors.rightMargin: Style.space(8)
+                  anchors.leftMargin: Style.space(45)
                   anchors.verticalCenter: parent.verticalCenter
+                  width: Style.space(28)
+                  height: Style.space(22)
+                  radius: Style.cornerRadius > 0 ? Style.space(4) : 0
+                  color: Qt.alpha(root.accent, 0.12)
+                  border.width: 1
+                  border.color: Qt.alpha(root.accent, 0.5)
                   Text {
-                    text: "Active AI sessions"
-                    color: root.foreground
+                    anchors.centerIn: parent
+                    text: root.agentBadges([sessionRow.modelData.agent])
+                    color: root.accent
                     font.family: Style.font.family
-                    font.pixelSize: Style.font.bodySmall
+                    font.pixelSize: Style.font.caption
                     font.bold: true
                   }
+                }
+                Column {
+                  anchors.left: parent.left
+                  anchors.leftMargin: Style.space(80)
+                  anchors.right: sessionAgeLabel.left
+                  anchors.rightMargin: Style.space(7)
+                  anchors.verticalCenter: parent.verticalCenter
+                  spacing: 0
                   Text {
-                    text: "Opt-in · local process metadata only"
+                    width: parent.width
+                    text: String(sessionRow.modelData.label || "AI agent")
+                    color: root.foreground
+                    elide: Text.ElideRight
+                    font.family: Style.font.family
+                    font.pixelSize: root.primaryFontSize
+                  }
+                  Text {
+                    width: parent.width
+                    text: String(sessionRow.modelData.location || "")
                     color: root.muted
+                    elide: Text.ElideMiddle
                     font.family: Style.font.family
                     font.pixelSize: Style.font.caption
                   }
                 }
-                Rectangle {
-                  id: sessionOptIn
+                Text {
+                  id: sessionAgeLabel
                   anchors.right: parent.right
-                  anchors.rightMargin: Style.space(8)
+                  anchors.rightMargin: Style.space(12)
                   anchors.verticalCenter: parent.verticalCenter
-                  width: Style.space(48)
-                  height: Style.space(24)
-                  radius: height / 2
-                  color: root.service && root.service.activeSessionsEnabled
-                    ? Qt.alpha(root.accent, 0.32) : Qt.alpha(root.muted, 0.15)
-                  border.width: 1
-                  border.color: root.service && root.service.activeSessionsEnabled
-                    ? root.accent : root.muted
-                  Rectangle {
-                    width: Style.space(18)
-                    height: width
-                    radius: width / 2
-                    anchors.verticalCenter: parent.verticalCenter
-                    x: root.service && root.service.activeSessionsEnabled
-                      ? parent.width - width - Style.space(3) : Style.space(3)
-                    color: root.service && root.service.activeSessionsEnabled
-                      ? root.accent : root.muted
-                    Behavior on x { NumberAnimation { duration: 120 } }
-                  }
-                  MouseArea {
-                    anchors.fill: parent
-                    enabled: root.service && root.service.settingsLoaded
-                    cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
-                    onClicked: root.service.setActiveSessionsEnabled(
-                      !root.service.activeSessionsEnabled)
-                  }
+                  text: root.sessionAge(sessionRow.modelData.ageSeconds)
+                  color: root.muted
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                }
+                MouseArea {
+                  id: sessionMouse
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.service.navigateSession(sessionRow.modelData)
+                  ToolTip.visible: containsMouse
+                  ToolTip.delay: 650
+                  ToolTip.text: String(sessionRow.modelData.cwd || "")
                 }
               }
-              Repeater {
-                model: root.moduleLayoutSnapshot()
-                delegate: Rectangle {
-                  required property int index
-                  required property var modelData
-                  width: parent.width
-                  height: Style.space(38)
-                  radius: Style.cornerRadius > 0 ? Style.space(4) : 0
-                  color: moduleRowMouse.containsMouse ? Style.hoverFill : "transparent"
-                  Text {
-                    anchors.left: parent.left
-                    anchors.leftMargin: Style.space(7)
-                    anchors.verticalCenter: parent.verticalCenter
-                    width: parent.width - Style.space(128)
-                    text: root.moduleGlyph(String(parent.modelData.id)) + "  "
-                      + root.moduleLabel(String(parent.modelData.id))
-                    color: root.foreground
-                    elide: Text.ElideRight
-                    font.family: Style.font.family
-                    font.pixelSize: Style.font.bodySmall
-                  }
-                  MouseArea {
-                    id: moduleRowMouse
-                    anchors.fill: parent
-                    hoverEnabled: true
-                    acceptedButtons: Qt.NoButton
-                  }
-                  Row {
-                    z: 2
-                    anchors.right: parent.right
-                    anchors.rightMargin: Style.space(2)
-                    anchors.verticalCenter: parent.verticalCenter
-                    spacing: 0
-                    Components.IconButton {
-                      glyph: "󰁝"
-                      tooltip: "Move up"
-                      buttonSize: Style.space(27)
-                      available: root.service && root.service.settingsLoaded && index > 0
-                      onClicked: root.service.moveModule(String(modelData.id), -1)
-                    }
-                    Components.IconButton {
-                      glyph: "󰁅"
-                      tooltip: "Move down"
-                      buttonSize: Style.space(27)
-                      available: root.service && root.service.settingsLoaded
-                        && index < root.moduleLayoutSnapshot().length - 1
-                      onClicked: root.service.moveModule(String(modelData.id), 1)
-                    }
-                    Components.IconButton {
-                      glyph: modelData.pinned === true ? "󰐃" : "󰐂"
-                      tooltip: modelData.pinned === true
-                        ? "Unpin when empty" : "Keep visible when empty"
-                      active: modelData.pinned === true
-                      buttonSize: Style.space(27)
-                      available: root.service && root.service.settingsLoaded
-                      onClicked: root.service.setModulePinned(String(modelData.id),
-                        modelData.pinned !== true)
-                    }
-                    Components.IconButton {
-                      glyph: modelData.collapsed === true ? "󰅂" : "󰅀"
-                      tooltip: modelData.collapsed === true ? "Expand" : "Collapse"
-                      active: modelData.collapsed === true
-                      buttonSize: Style.space(27)
-                      available: root.service && root.service.settingsLoaded
-                      onClicked: root.service.setModuleCollapsed(String(modelData.id),
-                        modelData.collapsed !== true)
-                    }
-                  }
-                }
-              }
+              ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+            }
+            Text {
+              anchors.left: parent.left
+              anchors.leftMargin: Style.space(48)
+              anchors.right: parent.right
+              anchors.rightMargin: Style.space(12)
+              anchors.verticalCenter: parent.verticalCenter
+              visible: !sessionsList.visible
+              text: !root.service ? ""
+                : !root.service.activeSessionsEnabled
+                  ? "Read-only and off until you opt in"
+                  : root.service.sessionsError !== ""
+                    ? root.service.sessionsError : "No active terminal sessions here"
+              color: root.service && root.service.sessionsError !== ""
+                ? Color.urgent : root.muted
+              elide: Text.ElideRight
+              font.family: Style.font.family
+              font.pixelSize: Style.font.bodySmall
+            }
+          }
+        }
+
+        Item {
+          id: devicesModule
+          objectName: "quickfileDevicesModule"
+          anchors.left: parent.left
+          anchors.right: parent.right
+          y: searchSurface.y + searchSurface.height + Style.space(6)
+            + root.moduleStackOffset("devices", keyScope.moduleHeights)
+          visible: root.moduleVisible("devices")
+          height: visible ? devicesHeader.height + devicesList.height : 0
+
+        Rectangle {
+          id: devicesHeader
+          anchors.top: parent.top
+          anchors.left: parent.left
+          anchors.right: parent.right
+          height: Style.space(27)
+          color: "transparent"
+
+          Text {
+            anchors.left: parent.left
+            anchors.leftMargin: Style.space(12)
+            anchors.verticalCenter: parent.verticalCenter
+            text: (root.service && root.service.volumesCollapsed ? "󰅂" : "󰅀")
+              + "  󰋊  DEVICES"
+            color: root.service && root.service.volumes.length > 0
+              ? root.accent : root.muted
+            font.family: Style.font.family
+            font.pixelSize: Style.font.bodySmall
+            font.bold: true
+            renderType: Text.NativeRendering
+          }
+          Text {
+            anchors.right: parent.right
+            anchors.rightMargin: Style.space(12)
+            anchors.verticalCenter: parent.verticalCenter
+            text: !root.service ? ""
+              : root.service.volumeActionKind !== ""
+                ? root.service.volumeActionKind.toUpperCase() + "ING…"
+              : root.service.volumesError !== "" ? "DEVICE ERROR"
+              : root.service.volumes.length
+                + (root.service.volumes.length === 1 ? " drive" : " drives")
+            color: root.service && root.service.volumesError !== ""
+              ? Color.urgent : root.muted
+            font.family: Style.font.family
+            font.pixelSize: Style.font.bodySmall
+            renderType: Text.NativeRendering
+          }
+          MouseArea {
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.toggleModuleCollapsed("devices")
+            ToolTip.visible: containsMouse && root.service
+              && root.service.volumesError !== ""
+            ToolTip.delay: 600
+            ToolTip.text: root.service ? root.service.volumesError : ""
+          }
+        }
+
+        StableListView {
+          id: devicesList
+          objectName: "quickfileDevicesList"
+          anchors.top: devicesHeader.bottom
+          anchors.left: parent.left
+          anchors.right: parent.right
+          height: visible ? Math.min(contentHeight, Style.space(126)) : 0
+          visible: devicesHeader.visible && root.service
+            && !root.service.volumesCollapsed && root.service.volumes.length > 0
+          clip: true
+          boundsBehavior: Flickable.StopAtBounds
+          model: root.service ? root.service.volumesModel : null
+
+          delegate: Rectangle {
+            id: deviceRow
+            required property int index
+            required property var rowData
+            readonly property var modelData: rowData
+            width: devicesList.width
+            height: Style.space(42)
+            readonly property bool current: root.volumeIsCurrent(modelData)
+            color: current ? Style.focusFillColor
+              : (deviceMouse.containsMouse ? Style.hoverFill : "transparent")
+            DirectoryDropTarget {
+              destinationEntry: deviceRow.modelData.mounted === true ? ({ isDir: true,
+                token: deviceRow.modelData.mountToken, path: deviceRow.modelData.mountPath }) : null
+            }
+
+            Text {
+              id: deviceIcon
+              anchors.left: parent.left
+              anchors.leftMargin: Style.space(48)
+              anchors.verticalCenter: parent.verticalCenter
+              width: Style.space(19)
+              text: root.volumeGlyph(deviceRow.modelData)
+              color: deviceRow.current ? root.accent : root.foreground
+              font.family: Style.font.family
+              font.pixelSize: root.primaryFontSize
+              renderType: Text.NativeRendering
+            }
+            Column {
+              anchors.left: deviceIcon.right
+              anchors.leftMargin: Style.space(5)
+              anchors.right: volumeActionButton.left
+              anchors.rightMargin: Style.space(6)
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: 0
               Text {
-                visible: root.service && String(root.service.settingsError || "") !== ""
                 width: parent.width
-                text: root.service ? String(root.service.settingsError || "") : ""
-                color: Color.urgent
+                text: String(deviceRow.modelData.name || deviceRow.modelData.device || "Drive")
+                color: deviceRow.current ? root.accent : root.foreground
                 elide: Text.ElideRight
                 font.family: Style.font.family
-                font.pixelSize: Style.font.caption
+                font.pixelSize: root.primaryFontSize
+                renderType: Text.NativeRendering
               }
+              Text {
+                width: parent.width
+                text: root.volumeDetail(deviceRow.modelData)
+                color: root.muted
+                elide: Text.ElideMiddle
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+                renderType: Text.NativeRendering
+              }
+            }
+            MouseArea {
+              id: deviceMouse
+              z: 1
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: {
+                root.keyboardIndex = -1
+                root.service.openVolume(deviceRow.modelData)
+                keyScope.forceActiveFocus()
+              }
+            }
+            Components.IconButton {
+              id: volumeActionButton
+              z: 3
+              anchors.right: parent.right
+              anchors.rightMargin: Style.space(8)
+              anchors.verticalCenter: parent.verticalCenter
+              glyph: deviceRow.modelData.mounted === true ? "󰍃" : "󰐕"
+              tooltip: deviceRow.modelData.mounted === true
+                ? "Safely unmount drive" : "Mount and open drive"
+              buttonSize: Style.space(27)
+              available: root.service && !root.service.volumesBusy
+                && (deviceRow.modelData.mounted === true
+                  ? deviceRow.modelData.canUnmount === true
+                  : deviceRow.modelData.canMount === true)
+              onClicked: {
+                if (deviceRow.modelData.mounted === true)
+                  root.service.unmountVolume(deviceRow.modelData)
+                else root.service.openVolume(deviceRow.modelData)
+              }
+            }
+          }
+
+          ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+        }
+        }
+
+        Item {
+          id: favoritesModule
+          objectName: "quickfileFavoritesModule"
+          anchors.left: parent.left
+          anchors.right: parent.right
+          y: searchSurface.y + searchSurface.height + Style.space(6)
+            + root.moduleStackOffset("favorites", keyScope.moduleHeights)
+          visible: root.moduleVisible("favorites")
+          height: visible ? favoritesHeader.height + favoritesList.height : 0
+
+        Rectangle {
+          id: favoritesHeader
+          anchors.top: parent.top
+          anchors.left: parent.left
+          anchors.right: parent.right
+          height: Style.space(25)
+          color: "transparent"
+
+          Text {
+            anchors.left: parent.left
+            anchors.leftMargin: Style.space(12)
+            anchors.verticalCenter: parent.verticalCenter
+            text: (root.service && root.service.favoritesCollapsed ? "󰅂" : "󰅀")
+              + "  ★  FAVORITES"
+            color: root.accent
+            font.family: Style.font.family
+            font.pixelSize: Style.font.bodySmall
+            font.bold: true
+            renderType: Text.NativeRendering
+          }
+          Text {
+            anchors.right: parent.right
+            anchors.rightMargin: Style.space(12)
+            anchors.verticalCenter: parent.verticalCenter
+            text: root.service ? root.service.favorites.length + " pinned" : ""
+            color: root.muted
+            font.family: Style.font.family
+            font.pixelSize: Style.font.bodySmall
+            renderType: Text.NativeRendering
+          }
+          MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.toggleModuleCollapsed("favorites")
+          }
+        }
+
+        StableListView {
+          id: favoritesList
+          objectName: "quickfileFavoritesList"
+          anchors.top: favoritesHeader.bottom
+          anchors.left: parent.left
+          anchors.right: parent.right
+          height: visible ? Math.min(contentHeight, Style.space(152)) : 0
+          visible: favoritesHeader.visible && root.service
+            && !root.service.favoritesCollapsed
+          clip: true
+          boundsBehavior: Flickable.StopAtBounds
+          model: root.service ? root.service.favoritesModel : null
+
+          delegate: Rectangle {
+            id: favoriteRow
+            required property int index
+            required property var rowData
+            readonly property var modelData: rowData
+            width: favoritesList.width
+            height: Style.space(38)
+            readonly property bool persistentSelected: root.service
+              && root.service.isSelected(String(modelData.token || ""))
+            color: persistentSelected ? Style.selectedFill
+              : (root.service && root.service.selectedToken === String(modelData.token || ""))
+                ? Style.focusFillColor
+                : (favoriteMouse.containsMouse ? Style.hoverFill : "transparent")
+            DirectoryDropTarget { destinationEntry: favoriteRow.modelData }
+
+            Text {
+              id: favoriteIcon
+              anchors.left: parent.left
+              // Align children beneath the FAVORITES label instead of the
+              // header chevron/star, making the module hierarchy explicit.
+              anchors.leftMargin: Style.space(48)
+              anchors.verticalCenter: parent.verticalCenter
+              text: root.fileGlyph(favoriteRow.modelData)
+              color: root.entryColor(favoriteRow.modelData)
+              font.family: Style.font.family
+              font.pixelSize: root.primaryFontSize
+              renderType: Text.NativeRendering
+            }
+            Column {
+              anchors.left: favoriteIcon.right
+              anchors.leftMargin: Style.space(7)
+              anchors.right: unstarButton.left
+              anchors.rightMargin: Style.space(6)
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: 0
+              Text {
+                width: parent.width
+                text: favoriteRow.modelData.name
+                color: root.entryColor(favoriteRow.modelData)
+                elide: Text.ElideRight
+                font.family: Style.font.family
+                font.pixelSize: root.primaryFontSize
+                renderType: Text.NativeRendering
+              }
+              Text {
+                width: parent.width
+                text: favoriteRow.modelData.parentPath || ""
+                color: root.muted
+                elide: Text.ElideMiddle
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+                renderType: Text.NativeRendering
+              }
+            }
+            Text {
+              id: unstarButton
+              z: 3
+              anchors.right: parent.right
+              anchors.rightMargin: Style.space(11)
+              anchors.verticalCenter: parent.verticalCenter
+              text: "󰅖"
+              color: unstarMouse.containsMouse ? Color.urgent : root.muted
+              font.family: Style.font.family
+              font.pixelSize: root.secondaryFontSize
+              renderType: Text.NativeRendering
+              MouseArea {
+                id: unstarMouse
+                anchors.fill: parent
+                anchors.margins: -Style.space(7)
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.service.toggleFavoriteEntry(favoriteRow.modelData)
+              }
+            }
+            MouseArea {
+              id: favoriteMouse
+              z: 1
+              anchors.fill: parent
+              hoverEnabled: true
+              acceptedButtons: Qt.LeftButton | Qt.RightButton
+              cursorShape: favoriteDrag.active ? Qt.ClosedHandCursor : Qt.PointingHandCursor
+              onEntered: {
+                root.hoveredToken = String(favoriteRow.modelData.token || "")
+              }
+              onExited: if (root.hoveredToken === String(favoriteRow.modelData.token || ""))
+                root.hoveredToken = ""
+              onClicked: function(event) {
+                root.keyboardIndex = -1
+                root.service.selectFavorite(favoriteRow.modelData,
+                  event.button === Qt.RightButton && favoriteRow.persistentSelected
+                    ? "focus" : root.pointerSelectionMode(event.modifiers))
+                keyScope.forceActiveFocus()
+                if (event.button === Qt.RightButton) root.inspectorOpen = true
+              }
+              onDoubleClicked: root.service.enterEntry(favoriteRow.modelData)
+            }
+            DragHandler {
+              id: favoriteDrag
+              target: null
+              acceptedButtons: Qt.LeftButton
+              cursorShape: Qt.ClosedHandCursor
+              onActiveChanged: if (active) {
+                root.keyboardIndex = -1
+                if (!favoriteRow.persistentSelected)
+                  root.service.selectFavorite(favoriteRow.modelData, "replace")
+              }
+            }
+            Drag.active: favoriteDrag.active
+            Drag.dragType: Drag.Automatic
+            Drag.supportedActions: Qt.CopyAction | Qt.MoveAction
+            Drag.mimeData: root.dragMimeData(favoriteRow.modelData)
+          }
+
+          ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+        }
+        }
+
+        Item {
+          id: knowledgeModule
+          objectName: "quickfileKnowledgeModule"
+          anchors.left: parent.left
+          anchors.right: parent.right
+          y: searchSurface.y + searchSurface.height + Style.space(6)
+            + root.moduleStackOffset("knowledge", keyScope.moduleHeights)
+          visible: root.moduleVisible("knowledge")
+          height: visible ? knowledgeHeader.height + knowledgeList.height : 0
+
+        Rectangle {
+          id: knowledgeHeader
+          anchors.top: parent.top
+          anchors.left: parent.left
+          anchors.right: parent.right
+          height: Style.space(27)
+          color: "transparent"
+
+          Text {
+            anchors.left: parent.left
+            anchors.leftMargin: Style.space(12)
+            anchors.verticalCenter: parent.verticalCenter
+            text: (root.service && root.service.knowledgeCollapsed ? "󰅂" : "󰅀")
+              + "  󰧑  PROJECT KNOWLEDGE"
+            color: root.service && root.service.knowledgeFiles.length > 0
+              ? root.accent : root.muted
+            font.family: Style.font.family
+            font.pixelSize: Style.font.bodySmall
+            font.bold: true
+            renderType: Text.NativeRendering
+          }
+          Text {
+            anchors.right: parent.right
+            anchors.rightMargin: Style.space(12)
+            anchors.verticalCenter: parent.verticalCenter
+            text: !root.service ? ""
+              : root.service.knowledgeBusy && root.service.knowledgeRootToken === ""
+                ? "SCANNING…"
+              : root.service.knowledgeError !== "" ? "INDEX ERROR"
+              : (root.service.knowledgeFiles.length
+                + (root.service.knowledgeTruncated ? "+" : "")
+                + " files  ·  ≈" + root.compactTokens(root.service.knowledgeTotalTokens))
+            color: root.service && root.service.knowledgeError !== ""
+              ? Color.urgent : root.muted
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+            renderType: Text.NativeRendering
+          }
+          MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.toggleModuleCollapsed("knowledge")
+          }
+        }
+
+        StableListView {
+          id: knowledgeList
+          objectName: "quickfileKnowledgeList"
+          anchors.top: knowledgeHeader.bottom
+          anchors.left: parent.left
+          anchors.right: parent.right
+          height: visible ? Math.min(contentHeight, Style.space(184)) : 0
+          visible: root.service && !root.service.knowledgeCollapsed
+            && root.service.knowledgeFiles.length > 0
+          clip: true
+          boundsBehavior: Flickable.StopAtBounds
+          model: root.service ? root.service.knowledgeModel : null
+          section.property: "scope"
+          section.criteria: ViewSection.FullString
+          section.delegate: Rectangle {
+            required property string section
+            width: knowledgeList.width
+            height: Style.space(21)
+            color: Qt.alpha(root.foreground, 0.018)
+            Text {
+              anchors.left: parent.left
+              anchors.leftMargin: Style.space(48)
+              anchors.verticalCenter: parent.verticalCenter
+              text: parent.section
+              color: root.muted
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              font.bold: true
+              renderType: Text.NativeRendering
+            }
+          }
+
+          delegate: Rectangle {
+            id: knowledgeRow
+            required property int index
+            required property var rowData
+            readonly property var modelData: rowData
+            width: knowledgeList.width
+            height: Style.space(42)
+            readonly property bool persistentSelected: root.service
+              && root.service.isSelected(String(modelData.token || ""))
+            color: persistentSelected ? Style.selectedFill
+              : (root.service && root.service.selectedToken === String(modelData.token || ""))
+                ? Style.focusFillColor
+                : (knowledgeMouse.containsMouse ? Style.hoverFill : "transparent")
+
+            Text {
+              id: knowledgeIcon
+              anchors.left: parent.left
+              // Keep Knowledge children aligned with Favorite children.
+              anchors.leftMargin: Style.space(48)
+              anchors.verticalCenter: parent.verticalCenter
+              width: Style.space(19)
+              text: root.fileGlyph(knowledgeRow.modelData)
+              color: root.entryColor(knowledgeRow.modelData)
+              font.family: Style.font.family
+              font.pixelSize: root.primaryFontSize
+              renderType: Text.NativeRendering
+            }
+            Column {
+              anchors.left: knowledgeIcon.right
+              anchors.leftMargin: Style.space(5)
+              anchors.right: knowledgeMeta.left
+              anchors.rightMargin: Style.space(8)
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.space(1)
+              Text {
+                width: parent.width
+                text: (knowledgeRow.modelData.starred === true ? "★  " : "")
+                  + String(knowledgeRow.modelData.name || "")
+                  + (knowledgeRow.modelData.hasSymlinkBinding === true ? "  󰌷" : "")
+                color: root.entryColor(knowledgeRow.modelData)
+                elide: Text.ElideRight
+                font.family: Style.font.family
+                font.pixelSize: root.primaryFontSize
+                renderType: Text.NativeRendering
+              }
+              Text {
+                width: parent.width
+                text: String(knowledgeRow.modelData.displayPath || "")
+                color: root.muted
+                elide: Text.ElideMiddle
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+                renderType: Text.NativeRendering
+              }
+            }
+            Column {
+              id: knowledgeMeta
+              anchors.right: parent.right
+              anchors.rightMargin: Style.space(11)
+              anchors.verticalCenter: parent.verticalCenter
+              width: Style.space(126)
+              spacing: Style.space(2)
+              Text {
+                width: parent.width
+                horizontalAlignment: Text.AlignRight
+                text: root.agentBadges(knowledgeRow.modelData.agents)
+                color: root.accent
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                renderType: Text.NativeRendering
+              }
+              Row {
+                anchors.right: parent.right
+                spacing: Style.space(5)
+                Rectangle {
+                  width: Style.space(65)
+                  height: Style.space(5)
+                  radius: height / 2
+                  color: Qt.alpha(root.muted, 0.18)
+                  Rectangle {
+                    width: parent.width * Math.max(0, Math.min(1,
+                      Number(knowledgeRow.modelData.tokenEstimate || 0)
+                        / Math.max(1, root.service.knowledgeMaxTokens)))
+                    height: parent.height
+                    radius: parent.radius
+                    color: root.accent
+                  }
+                }
+                Text {
+                  width: Style.space(45)
+                  text: "≈" + root.compactTokens(knowledgeRow.modelData.tokenEstimate)
+                  horizontalAlignment: Text.AlignRight
+                  color: root.muted
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                  renderType: Text.NativeRendering
+                }
+              }
+            }
+            MouseArea {
+              id: knowledgeMouse
+              anchors.fill: parent
+              hoverEnabled: true
+              acceptedButtons: Qt.LeftButton | Qt.RightButton
+              cursorShape: knowledgeDrag.active ? Qt.ClosedHandCursor : Qt.PointingHandCursor
+              onEntered: root.hoveredToken = String(knowledgeRow.modelData.token || "")
+              onExited: if (root.hoveredToken === String(knowledgeRow.modelData.token || ""))
+                root.hoveredToken = ""
+              onClicked: function(event) {
+                root.keyboardIndex = -1
+                root.service.selectKnowledge(knowledgeRow.modelData,
+                  event.button === Qt.RightButton && knowledgeRow.persistentSelected
+                    ? "focus" : root.pointerSelectionMode(event.modifiers))
+                keyScope.forceActiveFocus()
+                if (event.button === Qt.RightButton) root.inspectorOpen = true
+              }
+              onDoubleClicked: root.service.enterEntry(knowledgeRow.modelData)
+              ToolTip.visible: containsMouse && root.knowledgeTooltip(knowledgeRow.modelData) !== ""
+              ToolTip.delay: 700
+              ToolTip.text: root.knowledgeTooltip(knowledgeRow.modelData)
+            }
+            DragHandler {
+              id: knowledgeDrag
+              target: null
+              acceptedButtons: Qt.LeftButton
+              cursorShape: Qt.ClosedHandCursor
+              onActiveChanged: if (active && !knowledgeRow.persistentSelected) {
+                root.keyboardIndex = -1
+                root.service.selectKnowledge(knowledgeRow.modelData, "replace")
+              }
+            }
+            Drag.active: knowledgeDrag.active
+            Drag.dragType: Drag.Automatic
+            Drag.supportedActions: Qt.CopyAction | Qt.MoveAction
+            Drag.mimeData: root.dragMimeData(knowledgeRow.modelData)
+          }
+
+          ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+        }
+        }
+
+        Rectangle {
+          id: contextStrip
+          y: searchSurface.y + searchSurface.height + Style.space(2)
+            + root.moduleStackHeight(keyScope.moduleHeights)
+          anchors.left: parent.left
+          anchors.right: parent.right
+          height: Style.space(25)
+          color: "transparent"
+
+          Text {
+            anchors.left: parent.left
+            anchors.leftMargin: Style.space(12)
+            anchors.verticalCenter: parent.verticalCenter
+            text: root.service && root.service.git && root.service.git.branch
+              ? ("FILES  ·  󰘬 " + root.service.git.branch) : "FILES"
+            color: root.service && root.service.git && root.service.git.branch
+              ? root.accent : root.muted
+            font.family: Style.font.family
+            font.pixelSize: Style.font.bodySmall
+            font.bold: true
+            renderType: Text.NativeRendering
+          }
+          Text {
+            anchors.right: parent.right
+            anchors.rightMargin: Style.space(12)
+            anchors.verticalCenter: parent.verticalCenter
+            text: !root.service ? ""
+              : root.service.selectedTokens.length > 1
+                ? root.service.selectedTokens.length + " selected"
+                : (root.service.entries.length + (root.service.truncated ? "+" : "") + " items")
+                  + (root.service.query !== "" && root.service.searchEngine === "rg" ? " · rg" : "")
+            color: root.muted
+            font.family: Style.font.family
+            font.pixelSize: Style.font.bodySmall
+            renderType: Text.NativeRendering
+          }
+        }
+
+        Rectangle {
+          id: footer
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.bottom: parent.bottom
+          height: Style.space(28)
+          color: Qt.alpha(root.foreground, 0.025)
+          border.width: 0
+
+          Rectangle {
+            anchors.left: parent.left
+            anchors.bottom: parent.bottom
+            height: Style.space(2)
+            width: root.service && root.service.operationProgress >= 0
+              ? parent.width * root.service.operationProgress : 0
+            color: root.accent
+            visible: root.service && root.service.operationBusy
+            Behavior on width { NumberAnimation { duration: 90 } }
+          }
+
+          Row {
+            id: footerActions
+            anchors.left: parent.left
+            anchors.leftMargin: Style.space(5)
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.space(2)
+            Components.IconButton {
+              visible: root.service && root.service.operationBusy
+              glyph: "󰜺"
+              tooltip: "Cancel operation"
+              buttonSize: Style.space(23)
+              available: root.service && !root.service.operationCancelling
+              onClicked: root.service.cancelOperation()
+            }
+            Components.IconButton {
+              visible: root.service && !root.service.operationBusy
+                && root.service.undoAvailable
+              glyph: "󰕌"
+              tooltip: "Undo " + (root.service ? root.service.undoLabel : "") + "  ·  Ctrl+Z"
+              buttonSize: Style.space(23)
+              available: root.service && root.service.undoAvailable
+              onClicked: root.service.undoLast()
+            }
+          }
+
+          Text {
+            anchors.left: footerActions.right
+            anchors.right: parent.right
+            anchors.leftMargin: Style.space(5)
+            anchors.rightMargin: Style.space(10)
+            anchors.verticalCenter: parent.verticalCenter
+            horizontalAlignment: Text.AlignRight
+            text: !root.service ? ""
+              : root.service.operationBusy ? root.operationStatus()
+              : root.service.actionBusy ? "Working…"
+              : root.service.clipboardToken !== ""
+                ? ((root.service.clipboardMode === "cut" ? "Cut: " : "Copy: ")
+                  + root.service.clipboardName)
+                : root.service.actionMessage
+            color: root.muted
+            elide: Text.ElideMiddle
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+            renderType: Text.NativeRendering
+          }
+        }
+
+        Rectangle {
+          id: inspector
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.bottom: footer.top
+          height: !visible ? 0 : Math.min(
+            root.inspectorDetailsVisible ? Style.space(468) : Style.space(266),
+            blade.height * (root.inspectorDetailsVisible ? 0.48 : 0.34))
+          visible: root.inspectorOpen && root.service
+            && root.service.selectedEntry !== null
+          color: Qt.alpha(root.foreground, 0.018)
+          clip: true
+
+          Behavior on height {
+            NumberAnimation {
+              duration: 150
+              easing.type: Easing.OutCubic
             }
           }
 
           Components.Divider {
-            anchors.top: header.bottom
+            anchors.top: parent.top
             anchors.left: parent.left
             anchors.right: parent.right
           }
 
           Rectangle {
-            id: locationBar
-            anchors.top: header.bottom
-            anchors.topMargin: 1
+            id: inspectorHeader
+            anchors.top: parent.top
             anchors.left: parent.left
             anchors.right: parent.right
-            height: Style.space(39)
+            height: Style.space(70)
+            color: "transparent"
+            Text {
+              anchors.left: parent.left
+              anchors.leftMargin: Style.space(12)
+              anchors.top: parent.top
+              anchors.topMargin: Style.space(10)
+              text: root.service && root.service.selectedEntry
+                ? root.service.selectedEntry.name : "Properties"
+              color: root.foreground
+              elide: Text.ElideRight
+              width: parent.width - Style.space(118)
+              font.family: Style.font.family
+              font.pixelSize: Style.font.bodySmall
+              font.bold: true
+              renderType: Text.NativeRendering
+            }
+            Components.IconButton {
+              anchors.right: inspectorDetailsButton.left
+              anchors.rightMargin: Style.space(2)
+              anchors.top: parent.top
+              anchors.topMargin: Style.space(5)
+              glyph: root.service && root.service.selectedEntry
+                && root.service.selectedEntry.starred === true ? "★" : "☆"
+              tooltip: root.service && root.service.selectedEntry
+                && root.service.selectedEntry.starred === true ? "Unpin favorite" : "Pin favorite"
+              active: root.service && root.service.selectedEntry
+                && root.service.selectedEntry.starred === true
+              buttonSize: Style.space(25)
+              available: root.service && root.service.selectedEntry && !root.service.actionBusy
+              onClicked: root.saveMetadata(!(root.service.selectedEntry.starred === true))
+            }
+            Components.IconButton {
+              id: inspectorDetailsButton
+              anchors.right: closeInspectorButton.left
+              anchors.rightMargin: Style.space(2)
+              anchors.top: parent.top
+              anchors.topMargin: Style.space(5)
+              glyph: "󰒓"
+              tooltip: root.inspectorDetailsVisible
+                ? "Compact inspector"
+                : "Expand inspector"
+              active: root.inspectorDetailsVisible
+              buttonSize: Style.space(25)
+              onClicked: root.inspectorDetailsVisible = !root.inspectorDetailsVisible
+            }
+            Components.IconButton {
+              id: closeInspectorButton
+              anchors.right: parent.right
+              anchors.rightMargin: Style.space(6)
+              anchors.top: parent.top
+              anchors.topMargin: Style.space(5)
+              glyph: "󰅖"
+              tooltip: "Close inspector"
+              buttonSize: Style.space(25)
+              onClicked: root.inspectorOpen = false
+            }
+
+            Row {
+              anchors.left: parent.left
+              anchors.leftMargin: Style.space(9)
+              anchors.bottom: parent.bottom
+              anchors.bottomMargin: Style.space(5)
+              spacing: Style.space(4)
+
+              Components.IconButton {
+                glyph: "󰏋"
+                tooltip: "Open"
+                framed: true
+                buttonSize: Style.space(27)
+                available: root.service && root.service.selectedToken !== ""
+                onClicked: root.service.openSelected()
+              }
+              Components.IconButton {
+                glyph: "󰆏"
+                tooltip: "Copy  ·  Ctrl+C"
+                framed: true
+                buttonSize: Style.space(27)
+                available: root.service && root.service.selectedToken !== ""
+                onClicked: root.service.copySelected()
+              }
+              Components.IconButton {
+                glyph: "󰆐"
+                tooltip: "Cut  ·  Ctrl+X"
+                framed: true
+                buttonSize: Style.space(27)
+                available: root.service && root.service.selectedToken !== ""
+                onClicked: root.service.cutSelected()
+              }
+              Components.IconButton {
+                glyph: "󰆒"
+                tooltip: "Paste  ·  Ctrl+V"
+                framed: true
+                buttonSize: Style.space(27)
+                available: root.service && root.service.clipboardToken !== ""
+                  && root.service.rootToken !== "" && !root.service.actionBusy
+                onClicked: root.service.pasteHere()
+              }
+              Components.IconButton {
+                glyph: "󰆴"
+                tooltip: "Duplicate  ·  Ctrl+D"
+                framed: true
+                buttonSize: Style.space(27)
+                available: root.service && root.service.selectedToken !== ""
+                  && !root.service.actionBusy
+                onClicked: root.service.duplicateSelected()
+              }
+              Components.IconButton {
+                glyph: "󰑕"
+                tooltip: "Rename"
+                framed: true
+                buttonSize: Style.space(27)
+                available: root.service && root.service.selectedToken !== ""
+                  && root.service.selectedTokens.length <= 1
+                  && !root.service.actionBusy
+                onClicked: root.beginEditor("rename")
+              }
+              Components.IconButton {
+                glyph: "󰩺"
+                tooltip: "Move to Trash  ·  Delete / Backspace"
+                framed: true
+                buttonSize: Style.space(27)
+                available: root.service && root.service.selectedToken !== ""
+                onClicked: root.beginEditor("trash")
+              }
+            }
+          }
+
+          Rectangle {
+            id: inspectorTabs
+            objectName: "quickfileInspectorTabs"
+            anchors.top: inspectorHeader.bottom
+            anchors.left: parent.left
+            anchors.right: parent.right
+            height: Style.space(34)
             color: "transparent"
 
             Row {
-              id: navButtons
-              anchors.left: parent.left
-              anchors.leftMargin: Style.space(8)
-              anchors.verticalCenter: parent.verticalCenter
-              spacing: Style.space(1)
-              Components.IconButton {
-                glyph: "󰁍"
-                tooltip: "Back"
-                buttonSize: Style.space(26)
-                available: root.service && root.service.backStack.length > 0
-                onClicked: root.service.goBack()
-              }
-              Components.IconButton {
-                glyph: "󰁔"
-                tooltip: "Forward"
-                buttonSize: Style.space(26)
-                available: root.service && root.service.forwardStack.length > 0
-                onClicked: root.service.goForward()
-              }
-              Components.IconButton {
-                glyph: "󰁞"
-                tooltip: "Parent folder"
-                buttonSize: Style.space(26)
-                onClicked: if (root.service) root.service.goParent()
-              }
-              Components.IconButton {
-                glyph: "󰋜"
-                tooltip: "Home folder"
-                buttonSize: Style.space(26)
-                onClicked: if (root.service) root.service.goHome()
-              }
-              Components.IconButton {
-                glyph: "󰍉"
-                tooltip: "Quick Nav · Ctrl+P"
-                buttonSize: Style.space(26)
-                onClicked: root.openQuickNav()
-              }
-            }
-
-            Text {
-              anchors.left: navButtons.right
-              anchors.leftMargin: Style.space(8)
-              anchors.right: parent.right
-              anchors.rightMargin: Style.space(10)
-              anchors.verticalCenter: parent.verticalCenter
-              text: root.service ? root.service.rootPath : "Loading…"
-              color: root.foreground
-              opacity: 0.82
-              elide: Text.ElideMiddle
-              font.family: Style.font.family
-              font.pixelSize: root.primaryFontSize
-              renderType: Text.NativeRendering
-            }
-            DirectoryDropTarget {
-              objectName: "quickfileCurrentFolderDrop"
-              destinationEntry: root.service ? ({ isDir: true,
-                token: root.service.rootToken, path: root.service.rootPath }) : null
-            }
-          }
-
-          Rectangle {
-            id: searchSurface
-            anchors.top: locationBar.bottom
-            anchors.left: parent.left
-            anchors.leftMargin: Style.space(9)
-            anchors.right: parent.right
-            anchors.rightMargin: Style.space(9)
-            height: Style.space(34)
-            radius: Style.cornerRadius > 0 ? Style.space(6) : 0
-            color: Style.controlFill(searchField.activeFocus, searchMouse.containsMouse,
-              root.foreground, root.accent)
-            border.width: Style.controlBorderWidth(searchField.activeFocus, searchMouse.containsMouse)
-            border.color: Style.controlBorder(searchField.activeFocus, searchMouse.containsMouse,
-              root.foreground, root.accent)
-
-            MouseArea {
-              id: searchMouse
               anchors.fill: parent
-              hoverEnabled: true
-              onClicked: searchField.forceActiveFocus()
-            }
+              anchors.leftMargin: Style.space(10)
+              anchors.rightMargin: Style.space(10)
+              anchors.topMargin: Style.space(2)
+              anchors.bottomMargin: Style.space(3)
+              spacing: Style.space(5)
 
-            Text {
-              anchors.left: parent.left
-              anchors.leftMargin: Style.space(9)
-              anchors.verticalCenter: parent.verticalCenter
-              text: "󰍉"
-              color: root.muted
-              font.family: Style.font.family
-              font.pixelSize: Style.font.body
-              renderType: Text.NativeRendering
-            }
-
-            TextField {
-              id: searchField
-              anchors.left: parent.left
-              anchors.leftMargin: Style.space(29)
-              anchors.right: searchModeButton.left
-              anchors.rightMargin: Style.space(6)
-              anchors.verticalCenter: parent.verticalCenter
-              height: parent.height
-              color: root.foreground
-              placeholderText: "Search files…"
-              placeholderTextColor: Qt.alpha(root.muted, 0.78)
-              selectByMouse: true
-              font.family: Style.font.family
-              font.pixelSize: root.primaryFontSize
-              background: Item {}
-              onTextEdited: searchDebounce.restart()
-            }
-
-            Rectangle {
-              id: searchModeButton
-              anchors.right: parent.right
-              anchors.rightMargin: Style.space(4)
-              anchors.verticalCenter: parent.verticalCenter
-              width: modeText.implicitWidth + Style.space(10)
-              height: Style.space(24)
-              radius: Style.cornerRadius > 0 ? Style.space(4) : 0
-              color: modeMouse.containsMouse ? Style.hoverFill : "transparent"
-              Text {
-                id: modeText
-                anchors.centerIn: parent
-                text: root.service ? String(root.service.searchMode).toUpperCase() : "FUZZY"
-                color: root.accent
-                font.family: Style.font.family
-                font.pixelSize: root.secondaryFontSize
-                renderType: Text.NativeRendering
-              }
-              MouseArea {
-                id: modeMouse
-                anchors.fill: parent
-                hoverEnabled: true
-                cursorShape: Qt.PointingHandCursor
-                onClicked: {
-                  if (!root.service) return
-                  var modes = ["fuzzy", "contains", "exact", "prefix", "suffix", "regex"]
-                  var next = (modes.indexOf(root.service.searchMode) + 1) % modes.length
-                  root.service.searchMode = modes[next]
-                  searchDebounce.restart()
-                }
-              }
-            }
-
-            Timer {
-              id: searchDebounce
-              interval: 180
-              onTriggered: if (root.service)
-                root.service.setSearch(searchField.text, root.service.searchMode)
-            }
-          }
-
-          Item {
-            id: sessionsModule
-            objectName: "quickfileSessionsModule"
-            anchors.left: parent.left
-            anchors.right: parent.right
-            y: searchSurface.y + searchSurface.height + Style.space(6)
-              + root.moduleStackOffset("sessions", keyScope.moduleHeights)
-            visible: root.moduleVisible("sessions")
-            height: visible ? sessionsHeader.height + sessionsBody.height : 0
-
-            Rectangle {
-              id: sessionsHeader
-              anchors.top: parent.top
-              anchors.left: parent.left
-              anchors.right: parent.right
-              height: Style.space(27)
-              color: "transparent"
-              Text {
-                anchors.left: parent.left
-                anchors.leftMargin: Style.space(12)
-                anchors.verticalCenter: parent.verticalCenter
-                text: (root.service && root.service.sessionsCollapsed ? "󰅂" : "󰅀")
-                  + "  󰚩  AI SESSIONS"
-                color: root.service && root.service.activeSessions.length > 0
-                  ? root.accent : root.muted
-                font.family: Style.font.family
-                font.pixelSize: Style.font.bodySmall
-                font.bold: true
-                renderType: Text.NativeRendering
-              }
-              Text {
-                id: sessionsToggle
-                z: 2
-                anchors.right: parent.right
-                anchors.rightMargin: Style.space(12)
-                anchors.verticalCenter: parent.verticalCenter
-                text: !root.service || !root.service.settingsLoaded ? "…"
-                  : root.service.activeSessionsEnabled
-                    ? (root.service.sessionsBusy ? "CHECKING…"
-                      : root.service.activeSessions.length + " ACTIVE")
-                    : "ENABLE"
-                color: root.service && root.service.activeSessionsEnabled
-                  ? root.accent : root.muted
-                font.family: Style.font.family
-                font.pixelSize: Style.font.caption
-                font.bold: true
-                renderType: Text.NativeRendering
-                MouseArea {
-                  anchors.fill: parent
-                  anchors.margins: -Style.space(7)
-                  enabled: root.service && root.service.settingsLoaded
-                  hoverEnabled: true
-                  cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
-                  onClicked: root.service.setActiveSessionsEnabled(
-                    !root.service.activeSessionsEnabled)
-                  ToolTip.visible: containsMouse
-                  ToolTip.delay: 500
-                  ToolTip.text: root.service && root.service.activeSessionsEnabled
-                    ? "Disable read-only process detection"
-                    : "Opt in to local, read-only terminal session detection"
-                }
-              }
-              MouseArea {
-                anchors.left: parent.left
-                anchors.right: sessionsToggle.left
-                anchors.top: parent.top
-                anchors.bottom: parent.bottom
-                cursorShape: Qt.PointingHandCursor
-                onClicked: root.toggleModuleCollapsed("sessions")
-              }
-            }
-
-            Item {
-              id: sessionsBody
-              anchors.top: sessionsHeader.bottom
-              anchors.left: parent.left
-              anchors.right: parent.right
-              height: root.service && !root.service.sessionsCollapsed
-                ? (root.service.activeSessionsEnabled && root.service.activeSessions.length > 0
-                  ? Math.min(sessionsList.contentHeight, Style.space(126)) : Style.space(42)) : 0
-              clip: true
-
-              StableListView {
-                id: sessionsList
-                objectName: "quickfileSessionsList"
-                anchors.fill: parent
-                visible: root.service && root.service.activeSessionsEnabled
-                  && root.service.activeSessions.length > 0
-                boundsBehavior: Flickable.StopAtBounds
-                model: root.service ? root.service.sessionsModel : null
+              Repeater {
+                model: [
+                  { id: "properties", label: "Properties", glyph: "󰒓" },
+                  { id: "notes", label: "Notes", glyph: "󰎞" },
+                  { id: "git", label: "Git", glyph: "󰊢" }
+                ]
                 delegate: Rectangle {
-                  id: sessionRow
-                  required property var rowData
-                  readonly property var modelData: rowData
-                  width: sessionsList.width
-                  height: Style.space(42)
-                  color: sessionMouse.containsMouse ? Style.hoverFill : "transparent"
-                  Rectangle {
-                    anchors.left: parent.left
-                    anchors.leftMargin: Style.space(45)
-                    anchors.verticalCenter: parent.verticalCenter
-                    width: Style.space(28)
-                    height: Style.space(22)
-                    radius: Style.cornerRadius > 0 ? Style.space(4) : 0
-                    color: Qt.alpha(root.accent, 0.12)
-                    border.width: 1
-                    border.color: Qt.alpha(root.accent, 0.5)
+                  id: inspectorTabButton
+                  required property var modelData
+                  readonly property bool selected: root.service
+                    && root.service.inspectorTab === String(modelData.id)
+                  width: (inspectorTabs.width - Style.space(30)) / 3
+                  height: parent.height
+                  radius: Style.cornerRadius > 0 ? Style.space(4) : 0
+                  color: selected ? Qt.alpha(root.accent, 0.16)
+                    : inspectorTabMouse.containsMouse ? Style.hoverFill : "transparent"
+                  border.width: selected ? 1 : 0
+                  border.color: selected ? Qt.alpha(root.accent, 0.65) : "transparent"
+
+                  Row {
+                    anchors.centerIn: parent
+                    spacing: Style.space(5)
                     Text {
-                      anchors.centerIn: parent
-                      text: root.agentBadges([sessionRow.modelData.agent])
-                      color: root.accent
+                      text: String(inspectorTabButton.modelData.glyph)
+                      color: inspectorTabButton.selected ? root.accent : root.muted
+                      font.family: Style.font.family
+                      font.pixelSize: root.secondaryFontSize
+                      renderType: Text.NativeRendering
+                    }
+                    Text {
+                      text: String(inspectorTabButton.modelData.label)
+                      color: inspectorTabButton.selected ? root.foreground : root.muted
                       font.family: Style.font.family
                       font.pixelSize: Style.font.caption
-                      font.bold: true
+                      font.bold: inspectorTabButton.selected
+                      renderType: Text.NativeRendering
                     }
                   }
-                  Column {
-                    anchors.left: parent.left
-                    anchors.leftMargin: Style.space(80)
-                    anchors.right: sessionAgeLabel.left
-                    anchors.rightMargin: Style.space(7)
-                    anchors.verticalCenter: parent.verticalCenter
-                    spacing: 0
-                    Text {
-                      width: parent.width
-                      text: String(sessionRow.modelData.label || "AI agent")
-                      color: root.foreground
-                      elide: Text.ElideRight
-                      font.family: Style.font.family
-                      font.pixelSize: root.primaryFontSize
-                    }
-                    Text {
-                      width: parent.width
-                      text: String(sessionRow.modelData.location || "")
-                      color: root.muted
-                      elide: Text.ElideMiddle
-                      font.family: Style.font.family
-                      font.pixelSize: Style.font.caption
-                    }
-                  }
-                  Text {
-                    id: sessionAgeLabel
-                    anchors.right: parent.right
-                    anchors.rightMargin: Style.space(12)
-                    anchors.verticalCenter: parent.verticalCenter
-                    text: root.sessionAge(sessionRow.modelData.ageSeconds)
-                    color: root.muted
-                    font.family: Style.font.family
-                    font.pixelSize: Style.font.caption
-                  }
+
                   MouseArea {
-                    id: sessionMouse
+                    id: inspectorTabMouse
                     anchors.fill: parent
                     hoverEnabled: true
                     cursorShape: Qt.PointingHandCursor
-                    onClicked: root.service.navigateSession(sessionRow.modelData)
-                    ToolTip.visible: containsMouse
-                    ToolTip.delay: 650
-                    ToolTip.text: String(sessionRow.modelData.cwd || "")
+                    onClicked: if (root.service)
+                      root.service.setInspectorTab(String(inspectorTabButton.modelData.id))
                   }
                 }
-                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
-              }
-              Text {
-                anchors.left: parent.left
-                anchors.leftMargin: Style.space(48)
-                anchors.right: parent.right
-                anchors.rightMargin: Style.space(12)
-                anchors.verticalCenter: parent.verticalCenter
-                visible: !sessionsList.visible
-                text: !root.service ? ""
-                  : !root.service.activeSessionsEnabled
-                    ? "Read-only and off until you opt in"
-                    : root.service.sessionsError !== ""
-                      ? root.service.sessionsError : "No active terminal sessions here"
-                color: root.service && root.service.sessionsError !== ""
-                  ? Color.urgent : root.muted
-                elide: Text.ElideRight
-                font.family: Style.font.family
-                font.pixelSize: Style.font.bodySmall
-              }
-            }
-          }
-
-          Item {
-            id: devicesModule
-            objectName: "quickfileDevicesModule"
-            anchors.left: parent.left
-            anchors.right: parent.right
-            y: searchSurface.y + searchSurface.height + Style.space(6)
-              + root.moduleStackOffset("devices", keyScope.moduleHeights)
-            visible: root.moduleVisible("devices")
-            height: visible ? devicesHeader.height + devicesList.height : 0
-
-          Rectangle {
-            id: devicesHeader
-            anchors.top: parent.top
-            anchors.left: parent.left
-            anchors.right: parent.right
-            height: Style.space(27)
-            color: "transparent"
-
-            Text {
-              anchors.left: parent.left
-              anchors.leftMargin: Style.space(12)
-              anchors.verticalCenter: parent.verticalCenter
-              text: (root.service && root.service.volumesCollapsed ? "󰅂" : "󰅀")
-                + "  󰋊  DEVICES"
-              color: root.service && root.service.volumes.length > 0
-                ? root.accent : root.muted
-              font.family: Style.font.family
-              font.pixelSize: Style.font.bodySmall
-              font.bold: true
-              renderType: Text.NativeRendering
-            }
-            Text {
-              anchors.right: parent.right
-              anchors.rightMargin: Style.space(12)
-              anchors.verticalCenter: parent.verticalCenter
-              text: !root.service ? ""
-                : root.service.volumeActionKind !== ""
-                  ? root.service.volumeActionKind.toUpperCase() + "ING…"
-                : root.service.volumesError !== "" ? "DEVICE ERROR"
-                : root.service.volumes.length
-                  + (root.service.volumes.length === 1 ? " drive" : " drives")
-              color: root.service && root.service.volumesError !== ""
-                ? Color.urgent : root.muted
-              font.family: Style.font.family
-              font.pixelSize: Style.font.bodySmall
-              renderType: Text.NativeRendering
-            }
-            MouseArea {
-              anchors.fill: parent
-              hoverEnabled: true
-              cursorShape: Qt.PointingHandCursor
-              onClicked: root.toggleModuleCollapsed("devices")
-              ToolTip.visible: containsMouse && root.service
-                && root.service.volumesError !== ""
-              ToolTip.delay: 600
-              ToolTip.text: root.service ? root.service.volumesError : ""
-            }
-          }
-
-          StableListView {
-            id: devicesList
-            objectName: "quickfileDevicesList"
-            anchors.top: devicesHeader.bottom
-            anchors.left: parent.left
-            anchors.right: parent.right
-            height: visible ? Math.min(contentHeight, Style.space(126)) : 0
-            visible: devicesHeader.visible && root.service
-              && !root.service.volumesCollapsed && root.service.volumes.length > 0
-            clip: true
-            boundsBehavior: Flickable.StopAtBounds
-            model: root.service ? root.service.volumesModel : null
-
-            delegate: Rectangle {
-              id: deviceRow
-              required property int index
-              required property var rowData
-              readonly property var modelData: rowData
-              width: devicesList.width
-              height: Style.space(42)
-              readonly property bool current: root.volumeIsCurrent(modelData)
-              color: current ? Style.focusFillColor
-                : (deviceMouse.containsMouse ? Style.hoverFill : "transparent")
-              DirectoryDropTarget {
-                destinationEntry: deviceRow.modelData.mounted === true ? ({ isDir: true,
-                  token: deviceRow.modelData.mountToken, path: deviceRow.modelData.mountPath }) : null
-              }
-
-              Text {
-                id: deviceIcon
-                anchors.left: parent.left
-                anchors.leftMargin: Style.space(48)
-                anchors.verticalCenter: parent.verticalCenter
-                width: Style.space(19)
-                text: root.volumeGlyph(deviceRow.modelData)
-                color: deviceRow.current ? root.accent : root.foreground
-                font.family: Style.font.family
-                font.pixelSize: root.primaryFontSize
-                renderType: Text.NativeRendering
-              }
-              Column {
-                anchors.left: deviceIcon.right
-                anchors.leftMargin: Style.space(5)
-                anchors.right: volumeActionButton.left
-                anchors.rightMargin: Style.space(6)
-                anchors.verticalCenter: parent.verticalCenter
-                spacing: 0
-                Text {
-                  width: parent.width
-                  text: String(deviceRow.modelData.name || deviceRow.modelData.device || "Drive")
-                  color: deviceRow.current ? root.accent : root.foreground
-                  elide: Text.ElideRight
-                  font.family: Style.font.family
-                  font.pixelSize: root.primaryFontSize
-                  renderType: Text.NativeRendering
-                }
-                Text {
-                  width: parent.width
-                  text: root.volumeDetail(deviceRow.modelData)
-                  color: root.muted
-                  elide: Text.ElideMiddle
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.caption
-                  renderType: Text.NativeRendering
-                }
-              }
-              MouseArea {
-                id: deviceMouse
-                z: 1
-                anchors.fill: parent
-                hoverEnabled: true
-                cursorShape: Qt.PointingHandCursor
-                onClicked: {
-                  root.keyboardIndex = -1
-                  root.service.openVolume(deviceRow.modelData)
-                  keyScope.forceActiveFocus()
-                }
-              }
-              Components.IconButton {
-                id: volumeActionButton
-                z: 3
-                anchors.right: parent.right
-                anchors.rightMargin: Style.space(8)
-                anchors.verticalCenter: parent.verticalCenter
-                glyph: deviceRow.modelData.mounted === true ? "󰍃" : "󰐕"
-                tooltip: deviceRow.modelData.mounted === true
-                  ? "Safely unmount drive" : "Mount and open drive"
-                buttonSize: Style.space(27)
-                available: root.service && !root.service.volumesBusy
-                  && (deviceRow.modelData.mounted === true
-                    ? deviceRow.modelData.canUnmount === true
-                    : deviceRow.modelData.canMount === true)
-                onClicked: {
-                  if (deviceRow.modelData.mounted === true)
-                    root.service.unmountVolume(deviceRow.modelData)
-                  else root.service.openVolume(deviceRow.modelData)
-                }
-              }
-            }
-
-            ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
-          }
-          }
-
-          Item {
-            id: favoritesModule
-            objectName: "quickfileFavoritesModule"
-            anchors.left: parent.left
-            anchors.right: parent.right
-            y: searchSurface.y + searchSurface.height + Style.space(6)
-              + root.moduleStackOffset("favorites", keyScope.moduleHeights)
-            visible: root.moduleVisible("favorites")
-            height: visible ? favoritesHeader.height + favoritesList.height : 0
-
-          Rectangle {
-            id: favoritesHeader
-            anchors.top: parent.top
-            anchors.left: parent.left
-            anchors.right: parent.right
-            height: Style.space(25)
-            color: "transparent"
-
-            Text {
-              anchors.left: parent.left
-              anchors.leftMargin: Style.space(12)
-              anchors.verticalCenter: parent.verticalCenter
-              text: (root.service && root.service.favoritesCollapsed ? "󰅂" : "󰅀")
-                + "  ★  FAVORITES"
-              color: root.accent
-              font.family: Style.font.family
-              font.pixelSize: Style.font.bodySmall
-              font.bold: true
-              renderType: Text.NativeRendering
-            }
-            Text {
-              anchors.right: parent.right
-              anchors.rightMargin: Style.space(12)
-              anchors.verticalCenter: parent.verticalCenter
-              text: root.service ? root.service.favorites.length + " pinned" : ""
-              color: root.muted
-              font.family: Style.font.family
-              font.pixelSize: Style.font.bodySmall
-              renderType: Text.NativeRendering
-            }
-            MouseArea {
-              anchors.fill: parent
-              cursorShape: Qt.PointingHandCursor
-              onClicked: root.toggleModuleCollapsed("favorites")
-            }
-          }
-
-          StableListView {
-            id: favoritesList
-            objectName: "quickfileFavoritesList"
-            anchors.top: favoritesHeader.bottom
-            anchors.left: parent.left
-            anchors.right: parent.right
-            height: visible ? Math.min(contentHeight, Style.space(152)) : 0
-            visible: favoritesHeader.visible && root.service
-              && !root.service.favoritesCollapsed
-            clip: true
-            boundsBehavior: Flickable.StopAtBounds
-            model: root.service ? root.service.favoritesModel : null
-
-            delegate: Rectangle {
-              id: favoriteRow
-              required property int index
-              required property var rowData
-              readonly property var modelData: rowData
-              width: favoritesList.width
-              height: Style.space(38)
-              readonly property bool persistentSelected: root.service
-                && root.service.isSelected(String(modelData.token || ""))
-              color: persistentSelected ? Style.selectedFill
-                : (root.service && root.service.selectedToken === String(modelData.token || ""))
-                  ? Style.focusFillColor
-                  : (favoriteMouse.containsMouse ? Style.hoverFill : "transparent")
-              DirectoryDropTarget { destinationEntry: favoriteRow.modelData }
-
-              Text {
-                id: favoriteIcon
-                anchors.left: parent.left
-                // Align children beneath the FAVORITES label instead of the
-                // header chevron/star, making the module hierarchy explicit.
-                anchors.leftMargin: Style.space(48)
-                anchors.verticalCenter: parent.verticalCenter
-                text: root.fileGlyph(favoriteRow.modelData)
-                color: root.entryColor(favoriteRow.modelData)
-                font.family: Style.font.family
-                font.pixelSize: root.primaryFontSize
-                renderType: Text.NativeRendering
-              }
-              Column {
-                anchors.left: favoriteIcon.right
-                anchors.leftMargin: Style.space(7)
-                anchors.right: unstarButton.left
-                anchors.rightMargin: Style.space(6)
-                anchors.verticalCenter: parent.verticalCenter
-                spacing: 0
-                Text {
-                  width: parent.width
-                  text: favoriteRow.modelData.name
-                  color: root.entryColor(favoriteRow.modelData)
-                  elide: Text.ElideRight
-                  font.family: Style.font.family
-                  font.pixelSize: root.primaryFontSize
-                  renderType: Text.NativeRendering
-                }
-                Text {
-                  width: parent.width
-                  text: favoriteRow.modelData.parentPath || ""
-                  color: root.muted
-                  elide: Text.ElideMiddle
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.caption
-                  renderType: Text.NativeRendering
-                }
-              }
-              Text {
-                id: unstarButton
-                z: 3
-                anchors.right: parent.right
-                anchors.rightMargin: Style.space(11)
-                anchors.verticalCenter: parent.verticalCenter
-                text: "󰅖"
-                color: unstarMouse.containsMouse ? Color.urgent : root.muted
-                font.family: Style.font.family
-                font.pixelSize: root.secondaryFontSize
-                renderType: Text.NativeRendering
-                MouseArea {
-                  id: unstarMouse
-                  anchors.fill: parent
-                  anchors.margins: -Style.space(7)
-                  hoverEnabled: true
-                  cursorShape: Qt.PointingHandCursor
-                  onClicked: root.service.toggleFavoriteEntry(favoriteRow.modelData)
-                }
-              }
-              MouseArea {
-                id: favoriteMouse
-                z: 1
-                anchors.fill: parent
-                hoverEnabled: true
-                acceptedButtons: Qt.LeftButton | Qt.RightButton
-                cursorShape: favoriteDrag.active ? Qt.ClosedHandCursor : Qt.PointingHandCursor
-                onEntered: {
-                  root.hoveredToken = String(favoriteRow.modelData.token || "")
-                }
-                onExited: if (root.hoveredToken === String(favoriteRow.modelData.token || ""))
-                  root.hoveredToken = ""
-                onClicked: function(event) {
-                  root.keyboardIndex = -1
-                  root.service.selectFavorite(favoriteRow.modelData,
-                    event.button === Qt.RightButton && favoriteRow.persistentSelected
-                      ? "focus" : root.pointerSelectionMode(event.modifiers))
-                  keyScope.forceActiveFocus()
-                  if (event.button === Qt.RightButton) root.inspectorOpen = true
-                }
-                onDoubleClicked: root.service.enterEntry(favoriteRow.modelData)
-              }
-              DragHandler {
-                id: favoriteDrag
-                target: null
-                acceptedButtons: Qt.LeftButton
-                cursorShape: Qt.ClosedHandCursor
-                onActiveChanged: if (active) {
-                  root.keyboardIndex = -1
-                  if (!favoriteRow.persistentSelected)
-                    root.service.selectFavorite(favoriteRow.modelData, "replace")
-                }
-              }
-              Drag.active: favoriteDrag.active
-              Drag.dragType: Drag.Automatic
-              Drag.supportedActions: Qt.CopyAction | Qt.MoveAction
-              Drag.mimeData: root.dragMimeData(favoriteRow.modelData)
-            }
-
-            ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
-          }
-          }
-
-          Item {
-            id: knowledgeModule
-            objectName: "quickfileKnowledgeModule"
-            anchors.left: parent.left
-            anchors.right: parent.right
-            y: searchSurface.y + searchSurface.height + Style.space(6)
-              + root.moduleStackOffset("knowledge", keyScope.moduleHeights)
-            visible: root.moduleVisible("knowledge")
-            height: visible ? knowledgeHeader.height + knowledgeList.height : 0
-
-          Rectangle {
-            id: knowledgeHeader
-            anchors.top: parent.top
-            anchors.left: parent.left
-            anchors.right: parent.right
-            height: Style.space(27)
-            color: "transparent"
-
-            Text {
-              anchors.left: parent.left
-              anchors.leftMargin: Style.space(12)
-              anchors.verticalCenter: parent.verticalCenter
-              text: (root.service && root.service.knowledgeCollapsed ? "󰅂" : "󰅀")
-                + "  󰧑  PROJECT KNOWLEDGE"
-              color: root.service && root.service.knowledgeFiles.length > 0
-                ? root.accent : root.muted
-              font.family: Style.font.family
-              font.pixelSize: Style.font.bodySmall
-              font.bold: true
-              renderType: Text.NativeRendering
-            }
-            Text {
-              anchors.right: parent.right
-              anchors.rightMargin: Style.space(12)
-              anchors.verticalCenter: parent.verticalCenter
-              text: !root.service ? ""
-                : root.service.knowledgeBusy && root.service.knowledgeRootToken === ""
-                  ? "SCANNING…"
-                : root.service.knowledgeError !== "" ? "INDEX ERROR"
-                : (root.service.knowledgeFiles.length
-                  + (root.service.knowledgeTruncated ? "+" : "")
-                  + " files  ·  ≈" + root.compactTokens(root.service.knowledgeTotalTokens))
-              color: root.service && root.service.knowledgeError !== ""
-                ? Color.urgent : root.muted
-              font.family: Style.font.family
-              font.pixelSize: Style.font.caption
-              renderType: Text.NativeRendering
-            }
-            MouseArea {
-              anchors.fill: parent
-              cursorShape: Qt.PointingHandCursor
-              onClicked: root.toggleModuleCollapsed("knowledge")
-            }
-          }
-
-          StableListView {
-            id: knowledgeList
-            objectName: "quickfileKnowledgeList"
-            anchors.top: knowledgeHeader.bottom
-            anchors.left: parent.left
-            anchors.right: parent.right
-            height: visible ? Math.min(contentHeight, Style.space(184)) : 0
-            visible: root.service && !root.service.knowledgeCollapsed
-              && root.service.knowledgeFiles.length > 0
-            clip: true
-            boundsBehavior: Flickable.StopAtBounds
-            model: root.service ? root.service.knowledgeModel : null
-            section.property: "scope"
-            section.criteria: ViewSection.FullString
-            section.delegate: Rectangle {
-              required property string section
-              width: knowledgeList.width
-              height: Style.space(21)
-              color: Qt.alpha(root.foreground, 0.018)
-              Text {
-                anchors.left: parent.left
-                anchors.leftMargin: Style.space(48)
-                anchors.verticalCenter: parent.verticalCenter
-                text: parent.section
-                color: root.muted
-                font.family: Style.font.family
-                font.pixelSize: Style.font.caption
-                font.bold: true
-                renderType: Text.NativeRendering
-              }
-            }
-
-            delegate: Rectangle {
-              id: knowledgeRow
-              required property int index
-              required property var rowData
-              readonly property var modelData: rowData
-              width: knowledgeList.width
-              height: Style.space(42)
-              readonly property bool persistentSelected: root.service
-                && root.service.isSelected(String(modelData.token || ""))
-              color: persistentSelected ? Style.selectedFill
-                : (root.service && root.service.selectedToken === String(modelData.token || ""))
-                  ? Style.focusFillColor
-                  : (knowledgeMouse.containsMouse ? Style.hoverFill : "transparent")
-
-              Text {
-                id: knowledgeIcon
-                anchors.left: parent.left
-                // Keep Knowledge children aligned with Favorite children.
-                anchors.leftMargin: Style.space(48)
-                anchors.verticalCenter: parent.verticalCenter
-                width: Style.space(19)
-                text: root.fileGlyph(knowledgeRow.modelData)
-                color: root.entryColor(knowledgeRow.modelData)
-                font.family: Style.font.family
-                font.pixelSize: root.primaryFontSize
-                renderType: Text.NativeRendering
-              }
-              Column {
-                anchors.left: knowledgeIcon.right
-                anchors.leftMargin: Style.space(5)
-                anchors.right: knowledgeMeta.left
-                anchors.rightMargin: Style.space(8)
-                anchors.verticalCenter: parent.verticalCenter
-                spacing: Style.space(1)
-                Text {
-                  width: parent.width
-                  text: (knowledgeRow.modelData.starred === true ? "★  " : "")
-                    + String(knowledgeRow.modelData.name || "")
-                    + (knowledgeRow.modelData.hasSymlinkBinding === true ? "  󰌷" : "")
-                  color: root.entryColor(knowledgeRow.modelData)
-                  elide: Text.ElideRight
-                  font.family: Style.font.family
-                  font.pixelSize: root.primaryFontSize
-                  renderType: Text.NativeRendering
-                }
-                Text {
-                  width: parent.width
-                  text: String(knowledgeRow.modelData.displayPath || "")
-                  color: root.muted
-                  elide: Text.ElideMiddle
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.caption
-                  renderType: Text.NativeRendering
-                }
-              }
-              Column {
-                id: knowledgeMeta
-                anchors.right: parent.right
-                anchors.rightMargin: Style.space(11)
-                anchors.verticalCenter: parent.verticalCenter
-                width: Style.space(126)
-                spacing: Style.space(2)
-                Text {
-                  width: parent.width
-                  horizontalAlignment: Text.AlignRight
-                  text: root.agentBadges(knowledgeRow.modelData.agents)
-                  color: root.accent
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.caption
-                  font.bold: true
-                  renderType: Text.NativeRendering
-                }
-                Row {
-                  anchors.right: parent.right
-                  spacing: Style.space(5)
-                  Rectangle {
-                    width: Style.space(65)
-                    height: Style.space(5)
-                    radius: height / 2
-                    color: Qt.alpha(root.muted, 0.18)
-                    Rectangle {
-                      width: parent.width * Math.max(0, Math.min(1,
-                        Number(knowledgeRow.modelData.tokenEstimate || 0)
-                          / Math.max(1, root.service.knowledgeMaxTokens)))
-                      height: parent.height
-                      radius: parent.radius
-                      color: root.accent
-                    }
-                  }
-                  Text {
-                    width: Style.space(45)
-                    text: "≈" + root.compactTokens(knowledgeRow.modelData.tokenEstimate)
-                    horizontalAlignment: Text.AlignRight
-                    color: root.muted
-                    font.family: Style.font.family
-                    font.pixelSize: Style.font.caption
-                    renderType: Text.NativeRendering
-                  }
-                }
-              }
-              MouseArea {
-                id: knowledgeMouse
-                anchors.fill: parent
-                hoverEnabled: true
-                acceptedButtons: Qt.LeftButton | Qt.RightButton
-                cursorShape: knowledgeDrag.active ? Qt.ClosedHandCursor : Qt.PointingHandCursor
-                onEntered: root.hoveredToken = String(knowledgeRow.modelData.token || "")
-                onExited: if (root.hoveredToken === String(knowledgeRow.modelData.token || ""))
-                  root.hoveredToken = ""
-                onClicked: function(event) {
-                  root.keyboardIndex = -1
-                  root.service.selectKnowledge(knowledgeRow.modelData,
-                    event.button === Qt.RightButton && knowledgeRow.persistentSelected
-                      ? "focus" : root.pointerSelectionMode(event.modifiers))
-                  keyScope.forceActiveFocus()
-                  if (event.button === Qt.RightButton) root.inspectorOpen = true
-                }
-                onDoubleClicked: root.service.enterEntry(knowledgeRow.modelData)
-                ToolTip.visible: containsMouse && root.knowledgeTooltip(knowledgeRow.modelData) !== ""
-                ToolTip.delay: 700
-                ToolTip.text: root.knowledgeTooltip(knowledgeRow.modelData)
-              }
-              DragHandler {
-                id: knowledgeDrag
-                target: null
-                acceptedButtons: Qt.LeftButton
-                cursorShape: Qt.ClosedHandCursor
-                onActiveChanged: if (active && !knowledgeRow.persistentSelected) {
-                  root.keyboardIndex = -1
-                  root.service.selectKnowledge(knowledgeRow.modelData, "replace")
-                }
-              }
-              Drag.active: knowledgeDrag.active
-              Drag.dragType: Drag.Automatic
-              Drag.supportedActions: Qt.CopyAction | Qt.MoveAction
-              Drag.mimeData: root.dragMimeData(knowledgeRow.modelData)
-            }
-
-            ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
-          }
-          }
-
-          Rectangle {
-            id: contextStrip
-            y: searchSurface.y + searchSurface.height + Style.space(2)
-              + root.moduleStackHeight(keyScope.moduleHeights)
-            anchors.left: parent.left
-            anchors.right: parent.right
-            height: Style.space(25)
-            color: "transparent"
-
-            Text {
-              anchors.left: parent.left
-              anchors.leftMargin: Style.space(12)
-              anchors.verticalCenter: parent.verticalCenter
-              text: root.service && root.service.git && root.service.git.branch
-                ? ("FILES  ·  󰘬 " + root.service.git.branch) : "FILES"
-              color: root.service && root.service.git && root.service.git.branch
-                ? root.accent : root.muted
-              font.family: Style.font.family
-              font.pixelSize: Style.font.bodySmall
-              font.bold: true
-              renderType: Text.NativeRendering
-            }
-            Text {
-              anchors.right: parent.right
-              anchors.rightMargin: Style.space(12)
-              anchors.verticalCenter: parent.verticalCenter
-              text: !root.service ? ""
-                : root.service.selectedTokens.length > 1
-                  ? root.service.selectedTokens.length + " selected"
-                  : (root.service.entries.length + (root.service.truncated ? "+" : "") + " items")
-                    + (root.service.query !== "" && root.service.searchEngine === "rg" ? " · rg" : "")
-              color: root.muted
-              font.family: Style.font.family
-              font.pixelSize: Style.font.bodySmall
-              renderType: Text.NativeRendering
-            }
-          }
-
-          Rectangle {
-            id: footer
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.bottom: parent.bottom
-            height: Style.space(28)
-            color: Qt.alpha(root.foreground, 0.025)
-            border.width: 0
-
-            Rectangle {
-              anchors.left: parent.left
-              anchors.bottom: parent.bottom
-              height: Style.space(2)
-              width: root.service && root.service.operationProgress >= 0
-                ? parent.width * root.service.operationProgress : 0
-              color: root.accent
-              visible: root.service && root.service.operationBusy
-              Behavior on width { NumberAnimation { duration: 90 } }
-            }
-
-            Row {
-              id: footerActions
-              anchors.left: parent.left
-              anchors.leftMargin: Style.space(5)
-              anchors.verticalCenter: parent.verticalCenter
-              spacing: Style.space(2)
-              Components.IconButton {
-                visible: root.service && root.service.operationBusy
-                glyph: "󰜺"
-                tooltip: "Cancel operation"
-                buttonSize: Style.space(23)
-                available: root.service && !root.service.operationCancelling
-                onClicked: root.service.cancelOperation()
-              }
-              Components.IconButton {
-                visible: root.service && !root.service.operationBusy
-                  && root.service.undoAvailable
-                glyph: "󰕌"
-                tooltip: "Undo " + (root.service ? root.service.undoLabel : "") + "  ·  Ctrl+Z"
-                buttonSize: Style.space(23)
-                available: root.service && root.service.undoAvailable
-                onClicked: root.service.undoLast()
-              }
-            }
-
-            Text {
-              anchors.left: footerActions.right
-              anchors.right: parent.right
-              anchors.leftMargin: Style.space(5)
-              anchors.rightMargin: Style.space(10)
-              anchors.verticalCenter: parent.verticalCenter
-              horizontalAlignment: Text.AlignRight
-              text: !root.service ? ""
-                : root.service.operationBusy ? root.operationStatus()
-                : root.service.actionBusy ? "Working…"
-                : root.service.clipboardToken !== ""
-                  ? ((root.service.clipboardMode === "cut" ? "Cut: " : "Copy: ")
-                    + root.service.clipboardName)
-                  : root.service.actionMessage
-              color: root.muted
-              elide: Text.ElideMiddle
-              font.family: Style.font.family
-              font.pixelSize: Style.font.caption
-              renderType: Text.NativeRendering
-            }
-          }
-
-          Rectangle {
-            id: inspector
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.bottom: footer.top
-            height: !visible ? 0 : Math.min(
-              root.inspectorDetailsVisible ? Style.space(468) : Style.space(266),
-              blade.height * (root.inspectorDetailsVisible ? 0.48 : 0.34))
-            visible: root.inspectorOpen && root.service
-              && root.service.selectedEntry !== null
-            color: Qt.alpha(root.foreground, 0.018)
-            clip: true
-
-            Behavior on height {
-              NumberAnimation {
-                duration: 150
-                easing.type: Easing.OutCubic
               }
             }
 
             Components.Divider {
-              anchors.top: parent.top
               anchors.left: parent.left
               anchors.right: parent.right
+              anchors.bottom: parent.bottom
+            }
+          }
+
+          Rectangle {
+            id: pathBar
+            objectName: "quickfilePropertiesTab"
+            anchors.top: inspectorTabs.bottom
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.leftMargin: Style.space(10)
+            anchors.rightMargin: Style.space(8)
+            height: Style.space(42)
+            visible: root.service && root.service.inspectorTab === "properties"
+            color: "transparent"
+
+            Text {
+              id: pathLabel
+              anchors.left: parent.left
+              anchors.verticalCenter: parent.verticalCenter
+              width: Style.space(48)
+              text: "Path"
+              color: root.muted
+              font.family: Style.font.family
+              font.pixelSize: root.secondaryFontSize
+              renderType: Text.NativeRendering
             }
 
-            Rectangle {
-              id: inspectorHeader
-              anchors.top: parent.top
-              anchors.left: parent.left
-              anchors.right: parent.right
-              height: Style.space(70)
-              color: "transparent"
-              Text {
-                anchors.left: parent.left
-                anchors.leftMargin: Style.space(12)
-                anchors.top: parent.top
-                anchors.topMargin: Style.space(10)
-                text: root.service && root.service.selectedEntry
-                  ? root.service.selectedEntry.name : "Properties"
-                color: root.foreground
-                elide: Text.ElideRight
-                width: parent.width - Style.space(118)
-                font.family: Style.font.family
-                font.pixelSize: Style.font.bodySmall
-                font.bold: true
-                renderType: Text.NativeRendering
-              }
-              Components.IconButton {
-                anchors.right: inspectorDetailsButton.left
-                anchors.rightMargin: Style.space(2)
-                anchors.top: parent.top
-                anchors.topMargin: Style.space(5)
-                glyph: root.service && root.service.selectedEntry
-                  && root.service.selectedEntry.starred === true ? "★" : "☆"
-                tooltip: root.service && root.service.selectedEntry
-                  && root.service.selectedEntry.starred === true ? "Unpin favorite" : "Pin favorite"
-                active: root.service && root.service.selectedEntry
-                  && root.service.selectedEntry.starred === true
-                buttonSize: Style.space(25)
-                available: root.service && root.service.selectedEntry && !root.service.actionBusy
-                onClicked: root.saveMetadata(!(root.service.selectedEntry.starred === true))
-              }
-              Components.IconButton {
-                id: inspectorDetailsButton
-                anchors.right: closeInspectorButton.left
-                anchors.rightMargin: Style.space(2)
-                anchors.top: parent.top
-                anchors.topMargin: Style.space(5)
-                glyph: "󰒓"
-                tooltip: root.inspectorDetailsVisible
-                  ? "Compact inspector"
-                  : "Expand inspector"
-                active: root.inspectorDetailsVisible
-                buttonSize: Style.space(25)
-                onClicked: root.inspectorDetailsVisible = !root.inspectorDetailsVisible
-              }
-              Components.IconButton {
-                id: closeInspectorButton
-                anchors.right: parent.right
-                anchors.rightMargin: Style.space(6)
-                anchors.top: parent.top
-                anchors.topMargin: Style.space(5)
-                glyph: "󰅖"
-                tooltip: "Close inspector"
-                buttonSize: Style.space(25)
-                onClicked: root.inspectorOpen = false
-              }
-
-              Row {
-                anchors.left: parent.left
-                anchors.leftMargin: Style.space(9)
-                anchors.bottom: parent.bottom
-                anchors.bottomMargin: Style.space(5)
-                spacing: Style.space(4)
-
-                Components.IconButton {
-                  glyph: "󰏋"
-                  tooltip: "Open"
-                  framed: true
-                  buttonSize: Style.space(27)
-                  available: root.service && root.service.selectedToken !== ""
-                  onClicked: root.service.openSelected()
-                }
-                Components.IconButton {
-                  glyph: "󰆏"
-                  tooltip: "Copy  ·  Ctrl+C"
-                  framed: true
-                  buttonSize: Style.space(27)
-                  available: root.service && root.service.selectedToken !== ""
-                  onClicked: root.service.copySelected()
-                }
-                Components.IconButton {
-                  glyph: "󰆐"
-                  tooltip: "Cut  ·  Ctrl+X"
-                  framed: true
-                  buttonSize: Style.space(27)
-                  available: root.service && root.service.selectedToken !== ""
-                  onClicked: root.service.cutSelected()
-                }
-                Components.IconButton {
-                  glyph: "󰆒"
-                  tooltip: "Paste  ·  Ctrl+V"
-                  framed: true
-                  buttonSize: Style.space(27)
-                  available: root.service && root.service.clipboardToken !== ""
-                    && root.service.rootToken !== "" && !root.service.actionBusy
-                  onClicked: root.service.pasteHere()
-                }
-                Components.IconButton {
-                  glyph: "󰆴"
-                  tooltip: "Duplicate  ·  Ctrl+D"
-                  framed: true
-                  buttonSize: Style.space(27)
-                  available: root.service && root.service.selectedToken !== ""
-                    && !root.service.actionBusy
-                  onClicked: root.service.duplicateSelected()
-                }
-                Components.IconButton {
-                  glyph: "󰑕"
-                  tooltip: "Rename"
-                  framed: true
-                  buttonSize: Style.space(27)
-                  available: root.service && root.service.selectedToken !== ""
-                    && root.service.selectedTokens.length <= 1
-                    && !root.service.actionBusy
-                  onClicked: root.beginEditor("rename")
-                }
-                Components.IconButton {
-                  glyph: "󰩺"
-                  tooltip: "Move to Trash  ·  Delete / Backspace"
-                  framed: true
-                  buttonSize: Style.space(27)
-                  available: root.service && root.service.selectedToken !== ""
-                  onClicked: root.beginEditor("trash")
-                }
+            TextField {
+              id: pathField
+              anchors.left: pathLabel.right
+              anchors.right: copyPathButton.left
+              anchors.rightMargin: Style.space(5)
+              anchors.verticalCenter: parent.verticalCenter
+              height: Style.space(30)
+              text: !root.service ? ""
+                : root.service.selectedProperties
+                  ? String(root.service.selectedProperties.path || "")
+                  : root.service.selectedEntry
+                    ? String(root.service.selectedEntry.path || "") : ""
+              readOnly: true
+              selectByMouse: true
+              color: root.foreground
+              selectionColor: Style.selectionFill
+              selectedTextColor: root.foreground
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              background: Rectangle {
+                radius: Style.cornerRadius > 0 ? Style.space(4) : 0
+                color: Style.normalFill
+                border.width: Style.normalBorderWidth
+                border.color: Style.normalBorderColor
               }
             }
 
-            Rectangle {
-              id: inspectorTabs
-              objectName: "quickfileInspectorTabs"
-              anchors.top: inspectorHeader.bottom
-              anchors.left: parent.left
+            Components.IconButton {
+              id: copyPathButton
               anchors.right: parent.right
-              height: Style.space(34)
-              color: "transparent"
+              anchors.verticalCenter: parent.verticalCenter
+              glyph: "󰆏"
+              tooltip: "Copy full path"
+              buttonSize: Style.space(29)
+              available: root.service && root.service.selectedToken !== ""
+                && !root.service.actionBusy
+              onClicked: root.service.copySelectedPath()
+            }
+          }
 
-              Row {
-                anchors.fill: parent
-                anchors.leftMargin: Style.space(10)
-                anchors.rightMargin: Style.space(10)
-                anchors.topMargin: Style.space(2)
-                anchors.bottomMargin: Style.space(3)
-                spacing: Style.space(5)
+          Rectangle {
+            id: colorBar
+            objectName: "quickfileNotesTab"
+            anchors.top: inspectorTabs.bottom
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.leftMargin: Style.space(10)
+            anchors.rightMargin: Style.space(8)
+            height: Style.space(38)
+            visible: root.service && root.service.inspectorTab === "notes"
+            color: "transparent"
 
-                Repeater {
-                  model: [
-                    { id: "properties", label: "Properties", glyph: "󰒓" },
-                    { id: "notes", label: "Notes", glyph: "󰎞" },
-                    { id: "git", label: "Git", glyph: "󰊢" }
-                  ]
-                  delegate: Rectangle {
-                    id: inspectorTabButton
-                    required property var modelData
-                    readonly property bool selected: root.service
-                      && root.service.inspectorTab === String(modelData.id)
-                    width: (inspectorTabs.width - Style.space(30)) / 3
-                    height: parent.height
-                    radius: Style.cornerRadius > 0 ? Style.space(4) : 0
-                    color: selected ? Qt.alpha(root.accent, 0.16)
-                      : inspectorTabMouse.containsMouse ? Style.hoverFill : "transparent"
-                    border.width: selected ? 1 : 0
-                    border.color: selected ? Qt.alpha(root.accent, 0.65) : "transparent"
+            Text {
+              anchors.left: parent.left
+              anchors.verticalCenter: parent.verticalCenter
+              width: Style.space(48)
+              text: "Color"
+              color: root.muted
+              font.family: Style.font.family
+              font.pixelSize: root.secondaryFontSize
+              renderType: Text.NativeRendering
+            }
+            Row {
+              anchors.left: parent.left
+              anchors.leftMargin: Style.space(54)
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.space(7)
 
-                    Row {
-                      anchors.centerIn: parent
-                      spacing: Style.space(5)
-                      Text {
-                        text: String(inspectorTabButton.modelData.glyph)
-                        color: inspectorTabButton.selected ? root.accent : root.muted
-                        font.family: Style.font.family
-                        font.pixelSize: root.secondaryFontSize
-                        renderType: Text.NativeRendering
-                      }
-                      Text {
-                        text: String(inspectorTabButton.modelData.label)
-                        color: inspectorTabButton.selected ? root.foreground : root.muted
-                        font.family: Style.font.family
-                        font.pixelSize: Style.font.caption
-                        font.bold: inspectorTabButton.selected
-                        renderType: Text.NativeRendering
-                      }
-                    }
-
-                    MouseArea {
-                      id: inspectorTabMouse
-                      anchors.fill: parent
-                      hoverEnabled: true
-                      cursorShape: Qt.PointingHandCursor
-                      onClicked: if (root.service)
-                        root.service.setInspectorTab(String(inspectorTabButton.modelData.id))
-                    }
+              Rectangle {
+                width: Style.space(20)
+                height: width
+                radius: width / 2
+                color: "transparent"
+                border.width: root.colorDraft === "" ? 2 : 1
+                border.color: root.colorDraft === "" ? root.accent : root.muted
+                Text {
+                  anchors.centerIn: parent
+                  text: "×"
+                  color: root.muted
+                  font.pixelSize: Style.font.bodySmall
+                }
+                MouseArea {
+                  anchors.fill: parent
+                  anchors.margins: -Style.space(2)
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: {
+                    root.colorDraft = ""
+                    root.saveMetadata()
                   }
                 }
               }
-
-              Components.Divider {
-                anchors.left: parent.left
-                anchors.right: parent.right
-                anchors.bottom: parent.bottom
-              }
-            }
-
-            Rectangle {
-              id: pathBar
-              objectName: "quickfilePropertiesTab"
-              anchors.top: inspectorTabs.bottom
-              anchors.left: parent.left
-              anchors.right: parent.right
-              anchors.leftMargin: Style.space(10)
-              anchors.rightMargin: Style.space(8)
-              height: Style.space(42)
-              visible: root.service && root.service.inspectorTab === "properties"
-              color: "transparent"
-
-              Text {
-                id: pathLabel
-                anchors.left: parent.left
-                anchors.verticalCenter: parent.verticalCenter
-                width: Style.space(48)
-                text: "Path"
-                color: root.muted
-                font.family: Style.font.family
-                font.pixelSize: root.secondaryFontSize
-                renderType: Text.NativeRendering
-              }
-
-              TextField {
-                id: pathField
-                anchors.left: pathLabel.right
-                anchors.right: copyPathButton.left
-                anchors.rightMargin: Style.space(5)
-                anchors.verticalCenter: parent.verticalCenter
-                height: Style.space(30)
-                text: !root.service ? ""
-                  : root.service.selectedProperties
-                    ? String(root.service.selectedProperties.path || "")
-                    : root.service.selectedEntry
-                      ? String(root.service.selectedEntry.path || "") : ""
-                readOnly: true
-                selectByMouse: true
-                color: root.foreground
-                selectionColor: Style.selectionFill
-                selectedTextColor: root.foreground
-                font.family: Style.font.family
-                font.pixelSize: Style.font.caption
-                background: Rectangle {
-                  radius: Style.cornerRadius > 0 ? Style.space(4) : 0
-                  color: Style.normalFill
-                  border.width: Style.normalBorderWidth
-                  border.color: Style.normalBorderColor
-                }
-              }
-
-              Components.IconButton {
-                id: copyPathButton
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-                glyph: "󰆏"
-                tooltip: "Copy full path"
-                buttonSize: Style.space(29)
-                available: root.service && root.service.selectedToken !== ""
-                  && !root.service.actionBusy
-                onClicked: root.service.copySelectedPath()
-              }
-            }
-
-            Rectangle {
-              id: colorBar
-              objectName: "quickfileNotesTab"
-              anchors.top: inspectorTabs.bottom
-              anchors.left: parent.left
-              anchors.right: parent.right
-              anchors.leftMargin: Style.space(10)
-              anchors.rightMargin: Style.space(8)
-              height: Style.space(38)
-              visible: root.service && root.service.inspectorTab === "notes"
-              color: "transparent"
-
-              Text {
-                anchors.left: parent.left
-                anchors.verticalCenter: parent.verticalCenter
-                width: Style.space(48)
-                text: "Color"
-                color: root.muted
-                font.family: Style.font.family
-                font.pixelSize: root.secondaryFontSize
-                renderType: Text.NativeRendering
-              }
-              Row {
-                anchors.left: parent.left
-                anchors.leftMargin: Style.space(54)
-                anchors.verticalCenter: parent.verticalCenter
-                spacing: Style.space(7)
-
-                Rectangle {
+              Repeater {
+                model: root.colorChoices
+                delegate: Rectangle {
+                  required property var modelData
                   width: Style.space(20)
                   height: width
                   radius: width / 2
-                  color: "transparent"
-                  border.width: root.colorDraft === "" ? 2 : 1
-                  border.color: root.colorDraft === "" ? root.accent : root.muted
-                  Text {
-                    anchors.centerIn: parent
-                    text: "×"
-                    color: root.muted
-                    font.pixelSize: Style.font.bodySmall
-                  }
+                  color: root.paletteColor(String(modelData))
+                  border.width: root.colorDraft === String(modelData) ? 3 : 1
+                  border.color: root.colorDraft === String(modelData)
+                    ? root.foreground : Qt.alpha(root.foreground, 0.32)
                   MouseArea {
                     anchors.fill: parent
                     anchors.margins: -Style.space(2)
                     cursorShape: Qt.PointingHandCursor
                     onClicked: {
-                      root.colorDraft = ""
+                      root.colorDraft = String(parent.modelData)
                       root.saveMetadata()
                     }
                   }
                 }
-                Repeater {
-                  model: root.colorChoices
-                  delegate: Rectangle {
-                    required property var modelData
-                    width: Style.space(20)
-                    height: width
-                    radius: width / 2
-                    color: root.paletteColor(String(modelData))
-                    border.width: root.colorDraft === String(modelData) ? 3 : 1
-                    border.color: root.colorDraft === String(modelData)
-                      ? root.foreground : Qt.alpha(root.foreground, 0.32)
-                    MouseArea {
-                      anchors.fill: parent
-                      anchors.margins: -Style.space(2)
-                      cursorShape: Qt.PointingHandCursor
-                      onClicked: {
-                        root.colorDraft = String(parent.modelData)
-                        root.saveMetadata()
-                      }
-                    }
-                  }
+              }
+            }
+          }
+
+          Rectangle {
+            id: noteBar
+            anchors.top: colorBar.bottom
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.leftMargin: Style.space(10)
+            anchors.rightMargin: Style.space(8)
+            height: Style.space(76)
+            visible: root.service && root.service.inspectorTab === "notes"
+            color: "transparent"
+
+            Text {
+              id: noteLabel
+              anchors.left: parent.left
+              anchors.top: parent.top
+              anchors.topMargin: Style.space(9)
+              width: Style.space(48)
+              text: "Note"
+              color: root.muted
+              font.family: Style.font.family
+              font.pixelSize: root.secondaryFontSize
+              renderType: Text.NativeRendering
+            }
+            TextArea {
+              id: noteEditor
+              objectName: "quickfileNoteEditor"
+              anchors.left: noteLabel.right
+              anchors.right: saveNoteButton.left
+              anchors.rightMargin: Style.space(6)
+              anchors.top: parent.top
+              anchors.bottom: parent.bottom
+              anchors.topMargin: Style.space(4)
+              anchors.bottomMargin: Style.space(5)
+              text: root.noteDraft
+              placeholderText: "Add a note…"
+              color: root.foreground
+              placeholderTextColor: Qt.alpha(root.muted, 0.75)
+              selectionColor: Style.selectionFill
+              selectedTextColor: root.foreground
+              wrapMode: TextEdit.Wrap
+              selectByMouse: true
+              font.family: Style.font.family
+              font.pixelSize: Style.font.bodySmall
+              background: Rectangle {
+                radius: Style.cornerRadius > 0 ? Style.space(4) : 0
+                color: Style.controlFill(noteEditor.activeFocus,
+                  noteEditor.hovered, root.foreground, root.accent)
+                border.width: Style.controlBorderWidth(noteEditor.activeFocus,
+                  noteEditor.hovered)
+                border.color: Style.controlBorder(noteEditor.activeFocus,
+                  noteEditor.hovered, root.foreground, root.accent)
+              }
+              onTextChanged: if (!root.syncingMetadata && root.noteDraft !== text)
+                root.noteDraft = text
+              Keys.onPressed: function(event) {
+                if (event.key === Qt.Key_Return
+                    && (event.modifiers & Qt.ControlModifier) !== 0) {
+                  root.saveMetadata()
+                  keyScope.forceActiveFocus()
+                  event.accepted = true
                 }
               }
             }
-
-            Rectangle {
-              id: noteBar
-              anchors.top: colorBar.bottom
-              anchors.left: parent.left
+            ActionButton {
+              id: saveNoteButton
               anchors.right: parent.right
-              anchors.leftMargin: Style.space(10)
-              anchors.rightMargin: Style.space(8)
-              height: Style.space(76)
-              visible: root.service && root.service.inspectorTab === "notes"
-              color: "transparent"
+              anchors.verticalCenter: parent.verticalCenter
+              glyph: "󰆓"
+              label: "Save"
+              enabled: root.service && root.service.selectedEntry
+                && !root.service.actionBusy
+                && (root.noteDirty || root.colorDirty)
+              onClicked: root.saveMetadata()
+            }
+          }
 
-              Text {
-                id: noteLabel
-                anchors.left: parent.left
-                anchors.top: parent.top
-                anchors.topMargin: Style.space(9)
-                width: Style.space(48)
-                text: "Note"
-                color: root.muted
-                font.family: Style.font.family
-                font.pixelSize: root.secondaryFontSize
-                renderType: Text.NativeRendering
-              }
-              TextArea {
-                id: noteEditor
-                objectName: "quickfileNoteEditor"
-                anchors.left: noteLabel.right
-                anchors.right: saveNoteButton.left
-                anchors.rightMargin: Style.space(6)
-                anchors.top: parent.top
-                anchors.bottom: parent.bottom
-                anchors.topMargin: Style.space(4)
-                anchors.bottomMargin: Style.space(5)
-                text: root.noteDraft
-                placeholderText: "Add a note…"
-                color: root.foreground
-                placeholderTextColor: Qt.alpha(root.muted, 0.75)
-                selectionColor: Style.selectionFill
-                selectedTextColor: root.foreground
-                wrapMode: TextEdit.Wrap
-                selectByMouse: true
-                font.family: Style.font.family
-                font.pixelSize: Style.font.bodySmall
-                background: Rectangle {
-                  radius: Style.cornerRadius > 0 ? Style.space(4) : 0
-                  color: Style.controlFill(noteEditor.activeFocus,
-                    noteEditor.hovered, root.foreground, root.accent)
-                  border.width: Style.controlBorderWidth(noteEditor.activeFocus,
-                    noteEditor.hovered)
-                  border.color: Style.controlBorder(noteEditor.activeFocus,
-                    noteEditor.hovered, root.foreground, root.accent)
-                }
-                onTextChanged: if (!root.syncingMetadata && root.noteDraft !== text)
-                  root.noteDraft = text
-                Keys.onPressed: function(event) {
-                  if (event.key === Qt.Key_Return
-                      && (event.modifiers & Qt.ControlModifier) !== 0) {
-                    root.saveMetadata()
-                    keyScope.forceActiveFocus()
-                    event.accepted = true
-                  }
-                }
-              }
+          Rectangle {
+            id: knowledgeRegistryBar
+            anchors.top: noteBar.bottom
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.leftMargin: Style.space(10)
+            anchors.rightMargin: Style.space(8)
+            height: root.inspectorDetailsVisible ? Style.space(78) : Style.space(40)
+            visible: root.service && root.service.inspectorTab === "notes"
+            color: "transparent"
+
+            Text {
+              id: knowledgeRegistryLabel
+              anchors.left: parent.left
+              anchors.top: parent.top
+              anchors.topMargin: Style.space(9)
+              text: "Project Knowledge"
+              color: root.muted
+              font.family: Style.font.family
+              font.pixelSize: root.secondaryFontSize
+              renderType: Text.NativeRendering
+            }
+
+            Text {
+              anchors.left: knowledgeRegistryLabel.right
+              anchors.leftMargin: Style.space(8)
+              anchors.verticalCenter: knowledgeRegistryLabel.verticalCenter
+              text: !root.service || !root.service.selectedEntry ? ""
+                : root.service.selectedEntry.isDir === true ? "Files only"
+                : root.knowledgeRegisteredDraft ? "Registered" : "Not registered"
+              color: root.knowledgeRegisteredDraft ? root.accent : root.muted
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              renderType: Text.NativeRendering
+            }
+
+            Row {
+              anchors.right: parent.right
+              anchors.top: parent.top
+              anchors.topMargin: Style.space(4)
+              spacing: Style.space(5)
+
               ActionButton {
-                id: saveNoteButton
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-                glyph: "󰆓"
-                label: "Save"
+                glyph: root.knowledgeRegisteredDraft ? "󰆓" : "󰐕"
+                label: root.knowledgeRegisteredDraft ? "Save" : "Add"
                 enabled: root.service && root.service.selectedEntry
+                  && root.service.selectedEntry.isDir !== true
                   && !root.service.actionBusy
-                  && (root.noteDirty || root.colorDirty)
-                onClicked: root.saveMetadata()
+                  && (!root.knowledgeRegisteredDraft
+                    || !root.sameKnowledgeAgents(root.knowledgeAgentsDraft,
+                      root.storedKnowledgeAgents()))
+                onClicked: root.saveKnowledgeRegistry(true)
+              }
+
+              ActionButton {
+                visible: root.knowledgeRegisteredDraft
+                glyph: "󰅖"
+                label: "Remove"
+                enabled: root.service && !root.service.actionBusy
+                onClicked: root.saveKnowledgeRegistry(false)
               }
             }
 
-            Rectangle {
-              id: knowledgeRegistryBar
-              anchors.top: noteBar.bottom
+            Text {
+              id: knowledgeAgentsLabel
+              visible: root.inspectorDetailsVisible
               anchors.left: parent.left
-              anchors.right: parent.right
-              anchors.leftMargin: Style.space(10)
-              anchors.rightMargin: Style.space(8)
-              height: root.inspectorDetailsVisible ? Style.space(78) : Style.space(40)
-              visible: root.service && root.service.inspectorTab === "notes"
-              color: "transparent"
+              anchors.bottom: parent.bottom
+              anchors.bottomMargin: Style.space(12)
+              width: Style.space(48)
+              text: "Agents"
+              color: root.muted
+              font.family: Style.font.family
+              font.pixelSize: root.secondaryFontSize
+              renderType: Text.NativeRendering
+            }
 
-              Text {
-                id: knowledgeRegistryLabel
-                anchors.left: parent.left
-                anchors.top: parent.top
-                anchors.topMargin: Style.space(9)
-                text: "Project Knowledge"
-                color: root.muted
-                font.family: Style.font.family
-                font.pixelSize: root.secondaryFontSize
-                renderType: Text.NativeRendering
+            Row {
+              visible: root.inspectorDetailsVisible
+              anchors.left: knowledgeAgentsLabel.right
+              anchors.leftMargin: Style.space(6)
+              anchors.verticalCenter: knowledgeAgentsLabel.verticalCenter
+              spacing: Style.space(6)
+
+              Repeater {
+                model: root.knowledgeAgentChoices
+                delegate: Rectangle {
+                  id: knowledgeAgentChip
+                  required property var modelData
+                  readonly property bool chosen:
+                    root.knowledgeAgentSelected(String(modelData.key))
+                  width: Style.space(34)
+                  height: Style.space(23)
+                  radius: Style.cornerRadius > 0 ? Style.space(4) : 0
+                  enabled: root.service && root.service.selectedEntry
+                    && root.service.selectedEntry.isDir !== true
+                    && !root.service.actionBusy
+                  opacity: enabled ? 1 : 0.35
+                  color: chosen ? Qt.alpha(root.accent, 0.16) : Style.normalFill
+                  border.width: chosen ? 2 : Style.normalBorderWidth
+                  border.color: chosen ? root.accent : Style.normalBorderColor
+
+                  Text {
+                    anchors.centerIn: parent
+                    text: String(knowledgeAgentChip.modelData.label)
+                    color: knowledgeAgentChip.chosen ? root.accent : root.foreground
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.caption
+                    font.bold: knowledgeAgentChip.chosen
+                    renderType: Text.NativeRendering
+                  }
+                  MouseArea {
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    enabled: knowledgeAgentChip.enabled
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.toggleKnowledgeAgent(
+                      String(knowledgeAgentChip.modelData.key))
+                    ToolTip.visible: containsMouse
+                    ToolTip.delay: 500
+                    ToolTip.text: String(knowledgeAgentChip.modelData.name)
+                  }
+                }
               }
+            }
 
+            ActionButton {
+              visible: root.inspectorDetailsVisible
+              anchors.right: parent.right
+              anchors.verticalCenter: knowledgeAgentsLabel.verticalCenter
+              glyph: "󰌷"
+              label: "Preview"
+              enabled: root.service && root.service.selectedEntry
+                && root.knowledgeRegisteredDraft
+                && !root.service.actionBusy
+              onClicked: root.beginKnowledgeLinks()
+            }
+          }
+
+          ListView {
+            id: inspectorDetailsList
+            visible: root.service && root.service.inspectorTab === "properties"
+            anchors.top: pathBar.bottom
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.bottom: parent.bottom
+            anchors.leftMargin: Style.space(12)
+            anchors.rightMargin: Style.space(8)
+            anchors.bottomMargin: Style.space(7)
+            spacing: Style.space(3)
+            clip: true
+            model: root.propertyRows()
+            delegate: Row {
+              required property var modelData
+              width: ListView.view.width
+              spacing: Style.space(8)
               Text {
-                anchors.left: knowledgeRegistryLabel.right
-                anchors.leftMargin: Style.space(8)
-                anchors.verticalCenter: knowledgeRegistryLabel.verticalCenter
-                text: !root.service || !root.service.selectedEntry ? ""
-                  : root.service.selectedEntry.isDir === true ? "Files only"
-                  : root.knowledgeRegisteredDraft ? "Registered" : "Not registered"
-                color: root.knowledgeRegisteredDraft ? root.accent : root.muted
+                width: Style.space(86)
+                text: parent.modelData.label
+                color: root.muted
+                elide: Text.ElideRight
                 font.family: Style.font.family
                 font.pixelSize: Style.font.caption
                 renderType: Text.NativeRendering
               }
-
-              Row {
-                anchors.right: parent.right
-                anchors.top: parent.top
-                anchors.topMargin: Style.space(4)
-                spacing: Style.space(5)
-
-                ActionButton {
-                  glyph: root.knowledgeRegisteredDraft ? "󰆓" : "󰐕"
-                  label: root.knowledgeRegisteredDraft ? "Save" : "Add"
-                  enabled: root.service && root.service.selectedEntry
-                    && root.service.selectedEntry.isDir !== true
-                    && !root.service.actionBusy
-                    && (!root.knowledgeRegisteredDraft
-                      || !root.sameKnowledgeAgents(root.knowledgeAgentsDraft,
-                        root.storedKnowledgeAgents()))
-                  onClicked: root.saveKnowledgeRegistry(true)
-                }
-
-                ActionButton {
-                  visible: root.knowledgeRegisteredDraft
-                  glyph: "󰅖"
-                  label: "Remove"
-                  enabled: root.service && !root.service.actionBusy
-                  onClicked: root.saveKnowledgeRegistry(false)
-                }
-              }
-
               Text {
-                id: knowledgeAgentsLabel
-                visible: root.inspectorDetailsVisible
-                anchors.left: parent.left
-                anchors.bottom: parent.bottom
-                anchors.bottomMargin: Style.space(12)
-                width: Style.space(48)
-                text: "Agents"
-                color: root.muted
+                width: parent.width - Style.space(94)
+                text: parent.modelData.value
+                color: root.foreground
+                elide: Text.ElideMiddle
                 font.family: Style.font.family
-                font.pixelSize: root.secondaryFontSize
+                font.pixelSize: Style.font.caption
                 renderType: Text.NativeRendering
               }
+            }
+            ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+          }
 
-              Row {
-                visible: root.inspectorDetailsVisible
-                anchors.left: knowledgeAgentsLabel.right
-                anchors.leftMargin: Style.space(6)
-                anchors.verticalCenter: knowledgeAgentsLabel.verticalCenter
-                spacing: Style.space(6)
+          Rectangle {
+            id: gitInspector
+            objectName: "quickfileGitTab"
+            visible: root.service && root.service.inspectorTab === "git"
+            anchors.top: inspectorTabs.bottom
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.bottom: parent.bottom
+            color: "transparent"
 
-                Repeater {
-                  model: root.knowledgeAgentChoices
-                  delegate: Rectangle {
-                    id: knowledgeAgentChip
-                    required property var modelData
-                    readonly property bool chosen:
-                      root.knowledgeAgentSelected(String(modelData.key))
-                    width: Style.space(34)
-                    height: Style.space(23)
-                    radius: Style.cornerRadius > 0 ? Style.space(4) : 0
-                    enabled: root.service && root.service.selectedEntry
-                      && root.service.selectedEntry.isDir !== true
-                      && !root.service.actionBusy
-                    opacity: enabled ? 1 : 0.35
-                    color: chosen ? Qt.alpha(root.accent, 0.16) : Style.normalFill
-                    border.width: chosen ? 2 : Style.normalBorderWidth
-                    border.color: chosen ? root.accent : Style.normalBorderColor
-
-                    Text {
-                      anchors.centerIn: parent
-                      text: String(knowledgeAgentChip.modelData.label)
-                      color: knowledgeAgentChip.chosen ? root.accent : root.foreground
-                      font.family: Style.font.family
-                      font.pixelSize: Style.font.caption
-                      font.bold: knowledgeAgentChip.chosen
-                      renderType: Text.NativeRendering
-                    }
-                    MouseArea {
-                      anchors.fill: parent
-                      hoverEnabled: true
-                      enabled: knowledgeAgentChip.enabled
-                      cursorShape: Qt.PointingHandCursor
-                      onClicked: root.toggleKnowledgeAgent(
-                        String(knowledgeAgentChip.modelData.key))
-                      ToolTip.visible: containsMouse
-                      ToolTip.delay: 500
-                      ToolTip.text: String(knowledgeAgentChip.modelData.name)
-                    }
-                  }
-                }
-              }
-
-              ActionButton {
-                visible: root.inspectorDetailsVisible
-                anchors.right: parent.right
-                anchors.verticalCenter: knowledgeAgentsLabel.verticalCenter
-                glyph: "󰌷"
-                label: "Preview"
-                enabled: root.service && root.service.selectedEntry
-                  && root.knowledgeRegisteredDraft
-                  && !root.service.actionBusy
-                onClicked: root.beginKnowledgeLinks()
-              }
+            Text {
+              anchors.centerIn: parent
+              width: parent.width - Style.space(40)
+              visible: root.gitRows().length === 0
+              text: "Not inside a Git worktree"
+              color: root.muted
+              horizontalAlignment: Text.AlignHCenter
+              wrapMode: Text.Wrap
+              font.family: Style.font.family
+              font.pixelSize: Style.font.bodySmall
+              renderType: Text.NativeRendering
             }
 
             ListView {
-              id: inspectorDetailsList
-              visible: root.service && root.service.inspectorTab === "properties"
-              anchors.top: pathBar.bottom
-              anchors.left: parent.left
-              anchors.right: parent.right
-              anchors.bottom: parent.bottom
+              anchors.fill: parent
               anchors.leftMargin: Style.space(12)
               anchors.rightMargin: Style.space(8)
+              anchors.topMargin: Style.space(10)
               anchors.bottomMargin: Style.space(7)
-              spacing: Style.space(3)
+              visible: root.gitRows().length > 0
+              spacing: Style.space(8)
               clip: true
-              model: root.propertyRows()
+              model: root.gitRows()
               delegate: Row {
                 required property var modelData
                 width: ListView.view.width
@@ -3291,7 +3351,8 @@ Item {
                 Text {
                   width: parent.width - Style.space(94)
                   text: parent.modelData.value
-                  color: root.foreground
+                  color: parent.modelData.label === "Status"
+                    && parent.modelData.value !== "Clean" ? root.accent : root.foreground
                   elide: Text.ElideMiddle
                   font.family: Style.font.family
                   font.pixelSize: Style.font.caption
@@ -3300,1132 +3361,1071 @@ Item {
               }
               ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
             }
+          }
+        }
+
+        Rectangle {
+          id: inlinePreviewPane
+          objectName: "quickfileInlinePreview"
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.bottom: inspector.visible ? inspector.top : footer.top
+          height: visible ? Math.min(Style.space(184), blade.height * 0.24) : 0
+          visible: root.inlinePreviewOpen
+          color: Qt.alpha(root.foreground, 0.028)
+          clip: true
+
+          Components.Divider {
+            anchors.top: parent.top
+            anchors.left: parent.left
+            anchors.right: parent.right
+          }
+          Text {
+            id: previewTitle
+            anchors.top: parent.top
+            anchors.topMargin: Style.space(7)
+            anchors.left: parent.left
+            anchors.leftMargin: Style.space(11)
+            anchors.right: externalPreviewButton.left
+            anchors.rightMargin: Style.space(8)
+            text: "PREVIEW" + (root.service && root.service.previewData
+              ? "  ·  " + String(root.service.previewData.name || "") : "")
+            textFormat: Text.PlainText
+            elide: Text.ElideMiddle
+            color: root.foreground
+            opacity: 0.8
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+            font.bold: true
+          }
+          Components.IconButton {
+            id: externalPreviewButton
+            anchors.top: parent.top
+            anchors.right: closePreviewButton.left
+            glyph: "󰏌"
+            tooltip: "Open in Sushi · Shift+Space"
+            buttonSize: Style.space(25)
+            available: root.service && !!root.service.previewData
+              && root.service.previewData.kind !== "directory"
+            onClicked: root.service.openPreviewExternally({ token: root.service.previewToken,
+              isDir: root.service.previewData.kind === "directory" })
+          }
+          Components.IconButton {
+            id: closePreviewButton
+            anchors.top: parent.top
+            anchors.right: parent.right
+            anchors.rightMargin: Style.space(5)
+            glyph: "󰅖"
+            tooltip: "Close preview · Escape"
+            buttonSize: Style.space(25)
+            onClicked: root.closeInlinePreview()
+          }
+          Text {
+            id: previewSummaryText
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.bottom: parent.bottom
+            anchors.margins: Style.space(9)
+            text: root.previewSummary()
+            elide: Text.ElideMiddle
+            color: root.foreground
+            opacity: 0.8
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+          }
+          Item {
+            anchors.top: closePreviewButton.bottom
+            anchors.bottom: previewSummaryText.top
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.margins: Style.space(8)
+            clip: true
+
+            Image {
+              id: previewImage
+              objectName: "quickfilePreviewImage"
+              anchors.fill: parent
+              visible: root.service && !!root.service.previewData
+                && root.service.previewData.kind === "image" && status !== Image.Error
+              source: root.inlinePreviewOpen && root.service && root.service.previewData
+                && root.service.previewData.kind === "image"
+                && String(root.service.previewData.uri || "").indexOf("file://") === 0
+                  ? String(root.service.previewData.uri) : ""
+              sourceSize.width: 720
+              sourceSize.height: 360
+              asynchronous: true
+              cache: false
+              autoTransform: true
+              fillMode: Image.PreserveAspectFit
+            }
+            Flickable {
+              id: previewScroll
+              anchors.fill: parent
+              clip: true
+              visible: root.service && !!root.service.previewData
+                && (root.service.previewData.kind !== "image" || previewImage.status === Image.Error)
+              contentWidth: width
+              contentHeight: previewText.height
+              boundsBehavior: Flickable.StopAtBounds
+              TextEdit {
+                id: previewText
+                objectName: "quickfilePreviewText"
+                width: previewScroll.width
+                height: Math.max(previewScroll.height, contentHeight)
+                text: root.previewTextContent()
+                textFormat: TextEdit.PlainText
+                readOnly: true
+                selectByMouse: true
+                wrapMode: TextEdit.Wrap
+                color: root.foreground
+                selectionColor: Style.selectionFill
+                selectedTextColor: root.foreground
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+                Keys.onEscapePressed: function(event) {
+                  root.closeInlinePreview()
+                  keyScope.forceActiveFocus()
+                  event.accepted = true
+                }
+              }
+              ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+            }
+            Text {
+              anchors.centerIn: parent
+              width: parent.width
+              visible: root.service && !root.service.previewData
+              text: !root.service ? "" : root.service.previewError
+                ? root.service.previewError : "Loading preview…"
+              textFormat: Text.PlainText
+              wrapMode: Text.Wrap
+              horizontalAlignment: Text.AlignHCenter
+              color: root.service && root.service.previewError ? Color.urgent : root.muted
+              font.family: Style.font.family
+              font.pixelSize: Style.font.bodySmall
+            }
+          }
+        }
+
+        StableListView {
+          id: fileList
+          objectName: "quickfileFileList"
+          rememberLocations: true
+          anchors.top: contextStrip.bottom
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.bottom: inlinePreviewPane.visible ? inlinePreviewPane.top
+            : inspector.visible ? inspector.top : footer.top
+          anchors.topMargin: Style.space(2)
+          anchors.bottomMargin: Style.space(2)
+          clip: true
+          boundsBehavior: Flickable.StopAtBounds
+          model: root.service ? root.service.entriesModel : null
+          currentIndex: root.keyboardIndex
+
+          Connections {
+            target: root
+            function onKeyboardNavigationRequested(index) {
+              fileList.positionViewAtIndex(index, ListView.Contain)
+            }
+          }
+
+          delegate: Rectangle {
+            id: fileRow
+            required property int index
+            required property var rowData
+            readonly property var modelData: rowData
+            width: fileList.width
+            height: modelData.matchKind === "content"
+              ? Style.space(44) : Style.space(29)
+            readonly property bool persistentSelected: root.service
+              && root.service.isSelected(String(modelData.token || ""))
+            color: persistentSelected ? Style.selectedFill
+              : (rowMouse.containsMouse ? Style.hoverFill : "transparent")
+            DirectoryDropTarget { destinationEntry: fileRow.modelData }
 
             Rectangle {
-              id: gitInspector
-              objectName: "quickfileGitTab"
-              visible: root.service && root.service.inspectorTab === "git"
-              anchors.top: inspectorTabs.bottom
+              visible: root.keyboardIndex === fileRow.index
+              width: Style.space(2)
               anchors.left: parent.left
-              anchors.right: parent.right
+              anchors.top: parent.top
               anchors.bottom: parent.bottom
-              color: "transparent"
+              color: root.accent
+            }
+
+            Text {
+              id: chevron
+              anchors.left: parent.left
+              anchors.leftMargin: Style.space(9 + fileRow.modelData.depth * 15)
+              anchors.verticalCenter: parent.verticalCenter
+              width: Style.space(13)
+              text: fileRow.modelData.isDir && fileRow.modelData.hasChildren
+                ? (fileRow.modelData.expanded ? "󰅀" : "󰅂") : ""
+              color: root.muted
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              renderType: Text.NativeRendering
+            }
+
+            Text {
+              id: fileIcon
+              anchors.left: chevron.right
+              anchors.leftMargin: Style.space(3)
+              anchors.verticalCenter: parent.verticalCenter
+              width: Style.space(17)
+              text: root.fileGlyph(fileRow.modelData)
+              color: root.entryColor(fileRow.modelData)
+              opacity: fileRow.modelData.isHidden ? 0.55 : 0.9
+              font.family: Style.font.family
+              font.pixelSize: root.primaryFontSize
+              renderType: Text.NativeRendering
+            }
+
+            Column {
+              id: fileText
+              anchors.left: fileIcon.right
+              anchors.leftMargin: Style.space(4)
+              anchors.right: fileMeta.left
+              anchors.rightMargin: Style.space(7)
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.space(1)
 
               Text {
-                anchors.centerIn: parent
-                width: parent.width - Style.space(40)
-                visible: root.gitRows().length === 0
-                text: "Not inside a Git worktree"
+                width: parent.width
+                text: fileRow.modelData.relativePath || fileRow.modelData.name
+                textFormat: Text.PlainText
+                color: root.entryColor(fileRow.modelData)
+                opacity: fileRow.modelData.isHidden ? 0.58 : 1
+                elide: Text.ElideMiddle
+                font.family: Style.font.family
+                font.pixelSize: root.primaryFontSize
+                renderType: Text.NativeRendering
+              }
+
+              Text {
+                width: parent.width
+                visible: fileRow.modelData.matchKind === "content"
+                text: (fileRow.modelData.matchLine
+                    ? "L" + fileRow.modelData.matchLine + "  " : "")
+                  + String(fileRow.modelData.matchSnippet || "")
+                textFormat: Text.PlainText
                 color: root.muted
-                horizontalAlignment: Text.AlignHCenter
+                elide: Text.ElideRight
+                font.family: Style.font.family
+                font.pixelSize: Style.font.bodySmall
+                renderType: Text.NativeRendering
+              }
+            }
+
+            Row {
+              id: fileMeta
+              z: 3
+              anchors.right: parent.right
+              anchors.rightMargin: Style.space(10)
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.space(6)
+              Text {
+                visible: String(fileRow.modelData.note || "") !== ""
+                text: "󰍩"
+                color: root.muted
+                font.family: Style.font.family
+                font.pixelSize: Style.font.bodySmall
+                renderType: Text.NativeRendering
+              }
+              Text {
+                id: rowStar
+                visible: fileRow.modelData.starred === true || rowMouse.containsMouse
+                text: fileRow.modelData.starred === true ? "★" : "☆"
+                color: fileRow.modelData.starred === true
+                  ? root.entryColor(fileRow.modelData) : root.muted
+                font.family: Style.font.family
+                font.pixelSize: root.secondaryFontSize
+                renderType: Text.NativeRendering
+                MouseArea {
+                  anchors.fill: parent
+                  anchors.margins: -Style.space(5)
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.service.toggleFavoriteEntry(fileRow.modelData)
+                }
+              }
+              Rectangle {
+                id: matchBadge
+                visible: root.service && root.service.query !== ""
+                  && root.matchLabel(fileRow.modelData.matchKind) !== ""
+                width: matchBadgeText.implicitWidth + Style.space(8)
+                height: Style.space(18)
+                radius: Style.cornerRadius > 0 ? Style.space(3) : 0
+                color: Qt.alpha(root.accent, 0.11)
+                Text {
+                  id: matchBadgeText
+                  anchors.centerIn: parent
+                  text: root.matchLabel(fileRow.modelData.matchKind)
+                  color: root.accent
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                  renderType: Text.NativeRendering
+                }
+              }
+              Text {
+                text: root.gitLabel(fileRow.modelData.git)
+                color: text === "D" ? Color.urgent : root.accent
+                visible: text !== ""
+                font.family: Style.font.family
+                font.pixelSize: Style.font.bodySmall
+                font.bold: true
+                renderType: Text.NativeRendering
+              }
+              Text {
+                visible: !root.service || root.service.query === ""
+                text: root.shortTime(fileRow.modelData.modified)
+                color: root.muted
+                font.family: Style.font.family
+                font.pixelSize: Style.font.bodySmall
+                renderType: Text.NativeRendering
+              }
+            }
+
+            MouseArea {
+              id: rowMouse
+              anchors.fill: parent
+              hoverEnabled: true
+              acceptedButtons: Qt.LeftButton | Qt.RightButton
+              cursorShape: rowDrag.active ? Qt.ClosedHandCursor : Qt.PointingHandCursor
+              onEntered: {
+                root.hoveredToken = String(fileRow.modelData.token || "")
+              }
+              onExited: if (root.hoveredToken === String(fileRow.modelData.token || ""))
+                root.hoveredToken = ""
+              onClicked: function(event) {
+                root.keyboardIndex = fileRow.index
+                root.service.selectIndex(fileRow.index,
+                  event.button === Qt.RightButton && fileRow.persistentSelected
+                    ? "focus" : root.pointerSelectionMode(event.modifiers))
+                keyScope.forceActiveFocus()
+                if (event.button === Qt.RightButton) root.inspectorOpen = true
+              }
+              onDoubleClicked: function(event) {
+                root.keyboardIndex = fileRow.index
+                root.service.selectIndex(fileRow.index, "replace")
+                root.service.enterIndex(fileRow.index)
+                event.accepted = true
+              }
+            }
+
+            DragHandler {
+              id: rowDrag
+              target: null
+              acceptedButtons: Qt.LeftButton
+              cursorShape: Qt.ClosedHandCursor
+              onActiveChanged: if (active && !fileRow.persistentSelected) {
+                root.keyboardIndex = fileRow.index
+                root.service.selectIndex(fileRow.index, "replace")
+              }
+            }
+            Drag.active: rowDrag.active
+            Drag.dragType: Drag.Automatic
+            Drag.supportedActions: Qt.CopyAction | Qt.MoveAction
+            Drag.mimeData: root.dragMimeData(fileRow.modelData)
+
+            MouseArea {
+              anchors.left: parent.left
+              anchors.leftMargin: Style.space(4 + fileRow.modelData.depth * 15)
+              anchors.verticalCenter: parent.verticalCenter
+              width: Style.space(22)
+              height: parent.height
+              enabled: fileRow.modelData.isDir && fileRow.modelData.hasChildren
+              cursorShape: Qt.PointingHandCursor
+              onClicked: {
+                root.keyboardIndex = fileRow.index
+                root.service.selectIndex(fileRow.index)
+                root.service.toggleExpanded(fileRow.modelData.token)
+              }
+            }
+          }
+
+          ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+        }
+
+        Column {
+          objectName: "quickfileEmptyState"
+          anchors.centerIn: fileList
+          width: parent.width - Style.space(44)
+          spacing: Style.space(8)
+          visible: root.service && !root.service.foregroundBusy
+            && root.service.entries.length === 0
+          Text {
+            anchors.horizontalCenter: parent.horizontalCenter
+            text: root.service && root.service.errorMessage ? "󰅚" : "󰉖"
+            color: root.service && root.service.errorMessage ? Color.urgent : root.muted
+            font.family: Style.font.family
+            font.pixelSize: Style.space(28)
+            renderType: Text.NativeRendering
+          }
+          Text {
+            width: parent.width
+            horizontalAlignment: Text.AlignHCenter
+            wrapMode: Text.Wrap
+            text: root.service && root.service.errorMessage
+              ? root.service.errorMessage
+              : (searchField.text ? "No matching files" : "This folder is empty")
+            color: root.muted
+            font.family: Style.font.family
+            font.pixelSize: Style.font.bodySmall
+            renderType: Text.NativeRendering
+          }
+        }
+
+        Rectangle {
+          id: editorDialog
+          anchors.fill: parent
+          visible: root.editorMode !== ""
+          color: Qt.rgba(root.background.r, root.background.g, root.background.b, 0.84)
+          z: 20
+          MouseArea { anchors.fill: parent; onClicked: {} }
+          Keys.onEscapePressed: function(event) {
+            root.cancelEditor()
+            if (root.editorMode === "") keyScope.forceActiveFocus()
+            event.accepted = true
+          }
+          Connections {
+            target: root
+            function onEditorModeChanged() {
+              Qt.callLater(function() {
+                if (root.editorMode === "quick-nav") {
+                  quickNavField.forceActiveFocus()
+                  quickNavField.selectAll()
+                } else if (["new-file", "new-folder", "rename"].indexOf(root.editorMode) >= 0) {
+                  editorField.selectAll()
+                  editorField.forceActiveFocus()
+                } else if (root.editorMode !== "") editorDialog.forceActiveFocus()
+              })
+            }
+          }
+
+          Rectangle {
+            anchors.centerIn: parent
+            width: parent.width - Style.space(42)
+            height: editorContent.implicitHeight + Style.space(32)
+            radius: Style.cornerRadius
+            color: root.background
+            border.width: Math.max(1, Style.normalBorderWidth)
+            border.color: root.borderColor
+
+            Column {
+              id: editorContent
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              anchors.margins: Style.space(16)
+              spacing: Style.space(12)
+
+              Text {
+                text: root.editorMode === "new-file" ? "Create file"
+                  : root.editorMode === "new-folder" ? "Create folder"
+                  : root.editorMode === "rename" ? "Rename item"
+                  : root.editorMode === "trash-browser" ? "Trash"
+                  : root.editorMode === "trash-delete" ? "Delete permanently?"
+                  : root.editorMode === "quick-nav" ? "Quick Nav"
+                  : root.editorMode === "drop-choice" ? "Copy or move here?"
+                  : root.editorMode === "conflict" ? "Files already exist"
+                  : root.editorMode === "conflict-replace" ? "Replace existing items?"
+                  : root.editorMode === "knowledge-links"
+                    ? "Connect Project Knowledge"
+                  : "Move to Trash?"
+                color: root.foreground
+                font.family: Style.font.family
+                font.pixelSize: Style.font.body
+                font.bold: true
+                renderType: Text.NativeRendering
+              }
+
+              TextField {
+                id: quickNavField
+                objectName: "quickfileQuickNavSearch"
+                visible: root.editorMode === "quick-nav"
+                width: parent.width
+                height: Style.space(35)
+                text: root.quickNavQuery
+                placeholderText: "Filter places, projects and recent folders…"
+                placeholderTextColor: root.muted
+                color: root.foreground
+                selectByMouse: true
+                font.family: Style.font.family
+                font.pixelSize: Style.font.bodySmall
+                background: Rectangle {
+                  radius: Style.space(4)
+                  color: Style.focusFillColor
+                  border.width: Style.focusBorderWidth
+                  border.color: Style.focusBorderColor
+                }
+                onTextEdited: {
+                  root.quickNavQuery = text
+                  root.quickNavIndex = 0
+                }
+                Keys.onPressed: function(event) {
+                  if (event.key === Qt.Key_Down || event.key === Qt.Key_Up) {
+                    root.quickNavIndex = Math.max(0, Math.min(root.quickNavResults.length - 1,
+                      root.quickNavIndex + (event.key === Qt.Key_Down ? 1 : -1)))
+                    quickNavList.positionViewAtIndex(root.quickNavIndex, ListView.Contain)
+                    event.accepted = true
+                  } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                    if (root.activateQuickLocation(root.quickNavIndex)) keyScope.forceActiveFocus()
+                    event.accepted = true
+                  } else if (event.key === Qt.Key_Escape) {
+                    root.dismissEditor()
+                    keyScope.forceActiveFocus()
+                    event.accepted = true
+                  }
+                }
+              }
+
+              ListView {
+                id: quickNavList
+                objectName: "quickfileQuickNavList"
+                visible: root.editorMode === "quick-nav" && count > 0
+                width: parent.width
+                height: visible ? Math.min(contentHeight, Style.space(308), blade.height * 0.42) : 0
+                model: root.quickNavResults
+                currentIndex: root.quickNavIndex
+                clip: true
+                boundsBehavior: Flickable.StopAtBounds
+                spacing: Style.space(3)
+                delegate: Rectangle {
+                  id: locationRow
+                  required property var modelData
+                  required property int index
+                  width: quickNavList.width
+                  height: Style.space(51)
+                  radius: Style.space(4)
+                  color: index === root.quickNavIndex ? Style.focusFillColor
+                    : locationMouse.containsMouse ? Style.hoverFill : "transparent"
+                  Text {
+                    id: locationSource
+                    anchors.top: parent.top
+                    anchors.right: parent.right
+                    anchors.margins: Style.space(7)
+                    text: root.quickLocationLabel(locationRow.modelData)
+                    color: root.foreground
+                    opacity: 0.75
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.caption
+                  }
+                  Column {
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.margins: Style.space(7)
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: Style.space(3)
+                    Text {
+                      width: parent.width - locationSource.width - Style.space(9)
+                      text: String(locationRow.modelData.name || "Folder")
+                      textFormat: Text.PlainText
+                      elide: Text.ElideMiddle
+                      color: root.foreground
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.bodySmall
+                    }
+                    Text {
+                      width: parent.width
+                      text: String(locationRow.modelData.path || "")
+                      textFormat: Text.PlainText
+                      elide: Text.ElideMiddle
+                      color: root.foreground
+                      opacity: 0.8
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.caption
+                    }
+                  }
+                  MouseArea {
+                    id: locationMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: {
+                      if (root.activateQuickLocation(locationRow.index)) keyScope.forceActiveFocus()
+                    }
+                    ToolTip.visible: containsMouse
+                    ToolTip.delay: 650
+                    ToolTip.text: String(locationRow.modelData.path || "")
+                  }
+                }
+                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+              }
+
+              Text {
+                visible: root.editorMode === "quick-nav" && root.service
+                  && (root.service.quickNavBusy || root.service.quickNavError !== ""
+                    || root.quickNavResults.length === 0)
+                width: parent.width
+                text: !root.service ? "" : root.service.quickNavError
+                  ? root.service.quickNavError : root.service.quickNavBusy
+                    ? "Loading locations…" : "No matching locations"
+                textFormat: Text.PlainText
                 wrapMode: Text.Wrap
+                color: root.service && root.service.quickNavError ? Color.urgent : root.muted
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+              }
+
+              Text {
+                visible: root.editorMode === "drop-choice"
+                width: parent.width
+                text: root.pendingDrop ? root.pendingDrop.count
+                  + (root.pendingDrop.count === 1 ? " item\n" : " items\n")
+                  + "Destination: " + root.pendingDrop.destinationPath : ""
+                textFormat: Text.PlainText
+                wrapMode: Text.Wrap
+                color: root.foreground
+                font.family: Style.font.family
+                font.pixelSize: Style.font.bodySmall
+              }
+              Row {
+                visible: root.editorMode === "drop-choice"
+                spacing: Style.space(8)
+                ActionButton {
+                  glyph: "󰆏"
+                  label: "Copy here"
+                  tooltip: "Keep the originals in their current location"
+                  enabled: root.service && !root.service.actionBusy
+                  onClicked: root.commitDirectoryDrop(false)
+                }
+                ActionButton {
+                  glyph: "󰆐"
+                  label: "Move here"
+                  tooltip: "Move the originals to this folder"
+                  enabled: root.service && !root.service.actionBusy
+                  onClicked: root.commitDirectoryDrop(true)
+                }
+              }
+
+              Text {
+                visible: root.editorMode === "conflict" || root.editorMode === "conflict-replace"
+                width: parent.width
+                text: root.editorMode === "conflict-replace"
+                  ? "Existing items below will be moved to Trash, then replaced with the incoming items. Undo restores them."
+                  : "Choose how to handle the existing destination items."
+                wrapMode: Text.Wrap
+                color: root.editorMode === "conflict-replace" ? Color.urgent : root.foreground
+                font.family: Style.font.family
+                font.pixelSize: Style.font.bodySmall
+              }
+              ListView {
+                id: conflictsList
+                objectName: "quickfileConflictsList"
+                visible: root.editorMode === "conflict" || root.editorMode === "conflict-replace"
+                width: parent.width
+                height: visible ? Math.min(contentHeight, Style.space(234), blade.height * 0.28) : 0
+                model: root.conflictRows
+                spacing: Style.space(5)
+                clip: true
+                boundsBehavior: Flickable.StopAtBounds
+                delegate: Rectangle {
+                  id: conflictRow
+                  required property var modelData
+                  width: conflictsList.width
+                  height: Style.space(73)
+                  radius: Style.space(4)
+                  color: Style.normalFill
+                  Column {
+                    anchors.fill: parent
+                    anchors.margins: Style.space(7)
+                    spacing: Style.space(3)
+                    Text {
+                      width: parent.width
+                      text: String(conflictRow.modelData.name || "Existing item")
+                        + " · " + String(conflictRow.modelData.targetKind || "file")
+                      textFormat: Text.PlainText
+                      elide: Text.ElideMiddle
+                      color: root.foreground
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.bodySmall
+                    }
+                    Text {
+                      width: parent.width
+                      text: "Existing: " + String(conflictRow.modelData.targetPath || "")
+                      textFormat: Text.PlainText
+                      elide: Text.ElideMiddle
+                      color: root.foreground
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.caption
+                    }
+                    Text {
+                      width: parent.width
+                      text: "Incoming: " + String(conflictRow.modelData.sourcePath || "")
+                      textFormat: Text.PlainText
+                      elide: Text.ElideMiddle
+                      color: root.foreground
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.caption
+                    }
+                  }
+                  MouseArea {
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    acceptedButtons: Qt.NoButton
+                    ToolTip.visible: containsMouse
+                    ToolTip.delay: 600
+                    ToolTip.text: String(conflictRow.modelData.sourcePath || "") + "\n→ "
+                      + String(conflictRow.modelData.targetPath || "")
+                  }
+                }
+                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+              }
+              Text {
+                visible: root.editorMode === "conflict" || root.editorMode === "conflict-replace"
+                width: parent.width
+                text: root.conflictRows.length > 1
+                  ? "This choice applies to all " + root.conflictRows.length + " conflicts in this operation."
+                  : "This choice applies to this operation."
+                wrapMode: Text.Wrap
+                color: root.foreground
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+              }
+              Grid {
+                visible: root.editorMode === "conflict"
+                columns: 2
+                spacing: Style.space(8)
+                ActionButton {
+                  glyph: "󰆴"
+                  label: "Keep both"
+                  tooltip: "Give incoming items a new, unused name"
+                  enabled: root.service && !root.service.actionBusy
+                  onClicked: root.chooseConflictPolicy("keep-both")
+                }
+                ActionButton {
+                  glyph: "󰒭"
+                  label: "Skip"
+                  tooltip: "Keep existing items and skip conflicting incoming items"
+                  enabled: root.service && !root.service.actionBusy
+                  onClicked: root.chooseConflictPolicy("skip")
+                }
+                ActionButton {
+                  glyph: "󰝰"
+                  label: "Merge folders"
+                  tooltip: "Combine folder contents; existing files remain protected"
+                  enabled: root.service && !root.service.actionBusy && root.conflictsCanMerge
+                  onClicked: root.chooseConflictPolicy("merge")
+                }
+                ActionButton {
+                  glyph: "󰁯"
+                  label: "Replace…"
+                  destructive: true
+                  tooltip: "Review a separate confirmation before replacing existing items"
+                  enabled: root.service && !root.service.actionBusy
+                  onClicked: root.chooseConflictPolicy("replace")
+                }
+              }
+
+              Text {
+                visible: root.editorMode === "trash" || root.editorMode === "trash-delete"
+                width: parent.width
+                wrapMode: Text.Wrap
+                text: root.editorMode === "trash-delete"
+                  ? (!root.pendingTrashEntry ? ""
+                    : ("“" + root.pendingTrashEntry.name
+                      + "” will be deleted permanently. This cannot be undone."))
+                  : (!root.service || !root.service.selectedEntry ? ""
+                  : root.service.selectedTokens.length > 1
+                    ? (root.service.selectedTokens.length
+                      + " selected items can be restored from Trash.")
+                    : ("“" + root.service.selectedEntry.name
+                      + "” can be restored from Trash."))
+                color: root.muted
                 font.family: Style.font.family
                 font.pixelSize: Style.font.bodySmall
                 renderType: Text.NativeRendering
               }
 
               ListView {
-                anchors.fill: parent
-                anchors.leftMargin: Style.space(12)
-                anchors.rightMargin: Style.space(8)
-                anchors.topMargin: Style.space(10)
-                anchors.bottomMargin: Style.space(7)
-                visible: root.gitRows().length > 0
-                spacing: Style.space(8)
+                id: trashList
+                visible: root.editorMode === "trash-browser"
+                width: parent.width
+                height: visible ? Style.space(330) : 0
+                spacing: Style.space(5)
                 clip: true
-                model: root.gitRows()
-                delegate: Row {
+                boundsBehavior: Flickable.StopAtBounds
+                model: root.service ? root.service.trashEntries : []
+
+                delegate: Rectangle {
+                  id: trashRow
                   required property var modelData
                   width: ListView.view.width
-                  spacing: Style.space(8)
-                  Text {
-                    width: Style.space(86)
-                    text: parent.modelData.label
-                    color: root.muted
-                    elide: Text.ElideRight
-                    font.family: Style.font.family
-                    font.pixelSize: Style.font.caption
-                    renderType: Text.NativeRendering
+                  height: Style.space(58)
+                  radius: Style.cornerRadius > 0 ? Style.space(4) : 0
+                  color: Qt.alpha(root.foreground, 0.035)
+                  border.width: 1
+                  border.color: root.borderColor
+
+                  Column {
+                    anchors.left: parent.left
+                    anchors.leftMargin: Style.space(8)
+                    anchors.right: trashActions.left
+                    anchors.rightMargin: Style.space(7)
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: Style.space(2)
+                    Text {
+                      width: parent.width
+                      text: String(trashRow.modelData.name || "")
+                      color: root.foreground
+                      elide: Text.ElideMiddle
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.bodySmall
+                      renderType: Text.NativeRendering
+                    }
+                    Text {
+                      width: parent.width
+                      text: String(trashRow.modelData.originalPath || "")
+                      color: root.muted
+                      elide: Text.ElideMiddle
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.caption
+                      renderType: Text.NativeRendering
+                    }
                   }
-                  Text {
-                    width: parent.width - Style.space(94)
-                    text: parent.modelData.value
-                    color: parent.modelData.label === "Status"
-                      && parent.modelData.value !== "Clean" ? root.accent : root.foreground
-                    elide: Text.ElideMiddle
-                    font.family: Style.font.family
-                    font.pixelSize: Style.font.caption
-                    renderType: Text.NativeRendering
-                  }
-                }
-                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
-              }
-            }
-          }
 
-          Rectangle {
-            id: inlinePreviewPane
-            objectName: "quickfileInlinePreview"
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.bottom: inspector.visible ? inspector.top : footer.top
-            height: visible ? Math.min(Style.space(184), blade.height * 0.24) : 0
-            visible: root.inlinePreviewOpen
-            color: Qt.alpha(root.foreground, 0.028)
-            clip: true
-
-            Components.Divider {
-              anchors.top: parent.top
-              anchors.left: parent.left
-              anchors.right: parent.right
-            }
-            Text {
-              id: previewTitle
-              anchors.top: parent.top
-              anchors.topMargin: Style.space(7)
-              anchors.left: parent.left
-              anchors.leftMargin: Style.space(11)
-              anchors.right: externalPreviewButton.left
-              anchors.rightMargin: Style.space(8)
-              text: "PREVIEW" + (root.service && root.service.previewData
-                ? "  ·  " + String(root.service.previewData.name || "") : "")
-              textFormat: Text.PlainText
-              elide: Text.ElideMiddle
-              color: root.foreground
-              opacity: 0.8
-              font.family: Style.font.family
-              font.pixelSize: Style.font.caption
-              font.bold: true
-            }
-            Components.IconButton {
-              id: externalPreviewButton
-              anchors.top: parent.top
-              anchors.right: closePreviewButton.left
-              glyph: "󰏌"
-              tooltip: "Open in Sushi · Shift+Space"
-              buttonSize: Style.space(25)
-              available: root.service && !!root.service.previewData
-                && root.service.previewData.kind !== "directory"
-              onClicked: root.service.openPreviewExternally({ token: root.service.previewToken,
-                isDir: root.service.previewData.kind === "directory" })
-            }
-            Components.IconButton {
-              id: closePreviewButton
-              anchors.top: parent.top
-              anchors.right: parent.right
-              anchors.rightMargin: Style.space(5)
-              glyph: "󰅖"
-              tooltip: "Close preview · Escape"
-              buttonSize: Style.space(25)
-              onClicked: root.closeInlinePreview()
-            }
-            Text {
-              id: previewSummaryText
-              anchors.left: parent.left
-              anchors.right: parent.right
-              anchors.bottom: parent.bottom
-              anchors.margins: Style.space(9)
-              text: root.previewSummary()
-              elide: Text.ElideMiddle
-              color: root.foreground
-              opacity: 0.8
-              font.family: Style.font.family
-              font.pixelSize: Style.font.caption
-            }
-            Item {
-              anchors.top: closePreviewButton.bottom
-              anchors.bottom: previewSummaryText.top
-              anchors.left: parent.left
-              anchors.right: parent.right
-              anchors.margins: Style.space(8)
-              clip: true
-
-              Image {
-                id: previewImage
-                objectName: "quickfilePreviewImage"
-                anchors.fill: parent
-                visible: root.service && !!root.service.previewData
-                  && root.service.previewData.kind === "image" && status !== Image.Error
-                source: root.inlinePreviewOpen && root.service && root.service.previewData
-                  && root.service.previewData.kind === "image"
-                  && String(root.service.previewData.uri || "").indexOf("file://") === 0
-                    ? String(root.service.previewData.uri) : ""
-                sourceSize.width: 720
-                sourceSize.height: 360
-                asynchronous: true
-                cache: false
-                autoTransform: true
-                fillMode: Image.PreserveAspectFit
-              }
-              Flickable {
-                id: previewScroll
-                anchors.fill: parent
-                clip: true
-                visible: root.service && !!root.service.previewData
-                  && (root.service.previewData.kind !== "image" || previewImage.status === Image.Error)
-                contentWidth: width
-                contentHeight: previewText.height
-                boundsBehavior: Flickable.StopAtBounds
-                TextEdit {
-                  id: previewText
-                  objectName: "quickfilePreviewText"
-                  width: previewScroll.width
-                  height: Math.max(previewScroll.height, contentHeight)
-                  text: root.previewTextContent()
-                  textFormat: TextEdit.PlainText
-                  readOnly: true
-                  selectByMouse: true
-                  wrapMode: TextEdit.Wrap
-                  color: root.foreground
-                  selectionColor: Style.selectionFill
-                  selectedTextColor: root.foreground
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.caption
-                  Keys.onEscapePressed: function(event) {
-                    root.closeInlinePreview()
-                    keyScope.forceActiveFocus()
-                    event.accepted = true
+                  Row {
+                    id: trashActions
+                    anchors.right: parent.right
+                    anchors.rightMargin: Style.space(6)
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: Style.space(4)
+                    Components.IconButton {
+                      glyph: "󰁯"
+                      tooltip: "Restore"
+                      buttonSize: Style.space(25)
+                      available: root.service && !root.service.actionBusy
+                      onClicked: root.service.restoreTrash(String(trashRow.modelData.uri))
+                    }
+                    Components.IconButton {
+                      glyph: "󰆴"
+                      tooltip: "Delete permanently"
+                      buttonSize: Style.space(25)
+                      available: root.service && !root.service.actionBusy
+                      onClicked: root.confirmTrashDelete(trashRow.modelData)
+                    }
                   }
                 }
+
                 ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
               }
+
               Text {
-                anchors.centerIn: parent
+                visible: root.editorMode === "trash-browser"
+                  && root.service && (root.service.trashBusy
+                    || root.service.trashEntries.length === 0
+                    || root.service.trashError !== "")
                 width: parent.width
-                visible: root.service && !root.service.previewData
-                text: !root.service ? "" : root.service.previewError
-                  ? root.service.previewError : "Loading preview…"
-                textFormat: Text.PlainText
-                wrapMode: Text.Wrap
                 horizontalAlignment: Text.AlignHCenter
-                color: root.service && root.service.previewError ? Color.urgent : root.muted
-                font.family: Style.font.family
-                font.pixelSize: Style.font.bodySmall
-              }
-            }
-          }
-
-          StableListView {
-            id: fileList
-            objectName: "quickfileFileList"
-            rememberLocations: true
-            anchors.top: contextStrip.bottom
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.bottom: inlinePreviewPane.visible ? inlinePreviewPane.top
-              : inspector.visible ? inspector.top : footer.top
-            anchors.topMargin: Style.space(2)
-            anchors.bottomMargin: Style.space(2)
-            clip: true
-            boundsBehavior: Flickable.StopAtBounds
-            model: root.service ? root.service.entriesModel : null
-            currentIndex: root.keyboardIndex
-
-            Connections {
-              target: root
-              function onKeyboardNavigationRequested(index) {
-                fileList.positionViewAtIndex(index, ListView.Contain)
-              }
-            }
-
-            delegate: Rectangle {
-              id: fileRow
-              required property int index
-              required property var rowData
-              readonly property var modelData: rowData
-              width: fileList.width
-              height: modelData.matchKind === "content"
-                ? Style.space(44) : Style.space(29)
-              readonly property bool persistentSelected: root.service
-                && root.service.isSelected(String(modelData.token || ""))
-              color: persistentSelected ? Style.selectedFill
-                : (rowMouse.containsMouse ? Style.hoverFill : "transparent")
-              DirectoryDropTarget { destinationEntry: fileRow.modelData }
-
-              Rectangle {
-                visible: root.keyboardIndex === fileRow.index
-                width: Style.space(2)
-                anchors.left: parent.left
-                anchors.top: parent.top
-                anchors.bottom: parent.bottom
-                color: root.accent
-              }
-
-              Text {
-                id: chevron
-                anchors.left: parent.left
-                anchors.leftMargin: Style.space(9 + fileRow.modelData.depth * 15)
-                anchors.verticalCenter: parent.verticalCenter
-                width: Style.space(13)
-                text: fileRow.modelData.isDir && fileRow.modelData.hasChildren
-                  ? (fileRow.modelData.expanded ? "󰅀" : "󰅂") : ""
-                color: root.muted
+                wrapMode: Text.Wrap
+                text: !root.service ? ""
+                  : root.service.trashBusy ? "Loading Trash…"
+                  : root.service.trashError ? root.service.trashError
+                  : "Trash is empty"
+                color: root.service && root.service.trashError ? Color.urgent : root.muted
                 font.family: Style.font.family
                 font.pixelSize: Style.font.caption
                 renderType: Text.NativeRendering
               }
 
               Text {
-                id: fileIcon
-                anchors.left: chevron.right
-                anchors.leftMargin: Style.space(3)
-                anchors.verticalCenter: parent.verticalCenter
-                width: Style.space(17)
-                text: root.fileGlyph(fileRow.modelData)
-                color: root.entryColor(fileRow.modelData)
-                opacity: fileRow.modelData.isHidden ? 0.55 : 0.9
+                visible: root.editorMode === "knowledge-links"
+                width: parent.width
+                wrapMode: Text.Wrap
+                text: !root.service ? ""
+                  : root.service.knowledgeLinkPlan
+                    ? ("Source: " + root.service.knowledgeLinkPlan.source
+                      + "\nProject: " + root.service.knowledgeLinkPlan.projectRoot)
+                    : root.service.actionBusy ? "Preparing a safe link preview…"
+                    : "Preparing preview…"
+                color: root.muted
                 font.family: Style.font.family
-                font.pixelSize: root.primaryFontSize
+                font.pixelSize: Style.font.caption
                 renderType: Text.NativeRendering
               }
 
-              Column {
-                id: fileText
-                anchors.left: fileIcon.right
-                anchors.leftMargin: Style.space(4)
-                anchors.right: fileMeta.left
-                anchors.rightMargin: Style.space(7)
-                anchors.verticalCenter: parent.verticalCenter
-                spacing: Style.space(1)
+              ListView {
+                id: knowledgeLinkList
+                visible: root.editorMode === "knowledge-links"
+                  && root.service && root.service.knowledgeLinkPlan
+                width: parent.width
+                height: visible ? Math.min(contentHeight, Style.space(330)) : 0
+                spacing: Style.space(5)
+                clip: true
+                boundsBehavior: Flickable.StopAtBounds
+                model: visible && root.service.knowledgeLinkPlan
+                  ? root.service.knowledgeLinkPlan.entries : []
 
-                Text {
-                  width: parent.width
-                  text: fileRow.modelData.relativePath || fileRow.modelData.name
-                  textFormat: Text.PlainText
-                  color: root.entryColor(fileRow.modelData)
-                  opacity: fileRow.modelData.isHidden ? 0.58 : 1
-                  elide: Text.ElideMiddle
-                  font.family: Style.font.family
-                  font.pixelSize: root.primaryFontSize
-                  renderType: Text.NativeRendering
-                }
+                delegate: Rectangle {
+                  id: knowledgeLinkRow
+                  required property var modelData
+                  width: ListView.view.width
+                  height: Style.space(55)
+                  radius: Style.cornerRadius > 0 ? Style.space(4) : 0
+                  color: Qt.alpha(root.knowledgeLinkStatusColor(modelData.status), 0.08)
+                  border.width: 1
+                  border.color: Qt.alpha(
+                    root.knowledgeLinkStatusColor(modelData.status), 0.45)
 
-                Text {
-                  width: parent.width
-                  visible: fileRow.modelData.matchKind === "content"
-                  text: (fileRow.modelData.matchLine
-                      ? "L" + fileRow.modelData.matchLine + "  " : "")
-                    + String(fileRow.modelData.matchSnippet || "")
-                  textFormat: Text.PlainText
-                  color: root.muted
-                  elide: Text.ElideRight
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.bodySmall
-                  renderType: Text.NativeRendering
-                }
-              }
-
-              Row {
-                id: fileMeta
-                z: 3
-                anchors.right: parent.right
-                anchors.rightMargin: Style.space(10)
-                anchors.verticalCenter: parent.verticalCenter
-                spacing: Style.space(6)
-                Text {
-                  visible: String(fileRow.modelData.note || "") !== ""
-                  text: "󰍩"
-                  color: root.muted
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.bodySmall
-                  renderType: Text.NativeRendering
-                }
-                Text {
-                  id: rowStar
-                  visible: fileRow.modelData.starred === true || rowMouse.containsMouse
-                  text: fileRow.modelData.starred === true ? "★" : "☆"
-                  color: fileRow.modelData.starred === true
-                    ? root.entryColor(fileRow.modelData) : root.muted
-                  font.family: Style.font.family
-                  font.pixelSize: root.secondaryFontSize
-                  renderType: Text.NativeRendering
-                  MouseArea {
-                    anchors.fill: parent
-                    anchors.margins: -Style.space(5)
-                    hoverEnabled: true
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: root.service.toggleFavoriteEntry(fileRow.modelData)
-                  }
-                }
-                Rectangle {
-                  id: matchBadge
-                  visible: root.service && root.service.query !== ""
-                    && root.matchLabel(fileRow.modelData.matchKind) !== ""
-                  width: matchBadgeText.implicitWidth + Style.space(8)
-                  height: Style.space(18)
-                  radius: Style.cornerRadius > 0 ? Style.space(3) : 0
-                  color: Qt.alpha(root.accent, 0.11)
                   Text {
-                    id: matchBadgeText
-                    anchors.centerIn: parent
-                    text: root.matchLabel(fileRow.modelData.matchKind)
-                    color: root.accent
+                    id: knowledgeLinkAgent
+                    anchors.left: parent.left
+                    anchors.leftMargin: Style.space(8)
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: Style.space(25)
+                    text: root.agentBadges([knowledgeLinkRow.modelData.agent])
+                    color: root.knowledgeLinkStatusColor(knowledgeLinkRow.modelData.status)
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.caption
+                    font.bold: true
+                    renderType: Text.NativeRendering
+                  }
+
+                  Column {
+                    anchors.left: knowledgeLinkAgent.right
+                    anchors.leftMargin: Style.space(5)
+                    anchors.right: knowledgeLinkState.left
+                    anchors.rightMargin: Style.space(6)
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: Style.space(2)
+                    Text {
+                      width: parent.width
+                      text: String(knowledgeLinkRow.modelData.relativeTarget || "")
+                      color: root.foreground
+                      elide: Text.ElideMiddle
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.bodySmall
+                      renderType: Text.NativeRendering
+                    }
+                    Text {
+                      width: parent.width
+                      text: String(knowledgeLinkRow.modelData.reason || "")
+                        + (knowledgeLinkRow.modelData.warning
+                          ? " · " + knowledgeLinkRow.modelData.warning : "")
+                      color: root.muted
+                      elide: Text.ElideRight
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.caption
+                      renderType: Text.NativeRendering
+                    }
+                  }
+
+                  Text {
+                    id: knowledgeLinkState
+                    anchors.right: parent.right
+                    anchors.rightMargin: Style.space(8)
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: Style.space(70)
+                    horizontalAlignment: Text.AlignRight
+                    text: root.knowledgeLinkStatusLabel(knowledgeLinkRow.modelData.status)
+                    color: root.knowledgeLinkStatusColor(knowledgeLinkRow.modelData.status)
                     font.family: Style.font.family
                     font.pixelSize: Style.font.caption
                     font.bold: true
                     renderType: Text.NativeRendering
                   }
                 }
-                Text {
-                  text: root.gitLabel(fileRow.modelData.git)
-                  color: text === "D" ? Color.urgent : root.accent
-                  visible: text !== ""
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.bodySmall
-                  font.bold: true
-                  renderType: Text.NativeRendering
-                }
-                Text {
-                  visible: !root.service || root.service.query === ""
-                  text: root.shortTime(fileRow.modelData.modified)
-                  color: root.muted
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.bodySmall
-                  renderType: Text.NativeRendering
-                }
+
+                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
               }
 
-              MouseArea {
-                id: rowMouse
-                anchors.fill: parent
-                hoverEnabled: true
-                acceptedButtons: Qt.LeftButton | Qt.RightButton
-                cursorShape: rowDrag.active ? Qt.ClosedHandCursor : Qt.PointingHandCursor
-                onEntered: {
-                  root.hoveredToken = String(fileRow.modelData.token || "")
+              Text {
+                visible: root.editorMode === "knowledge-links"
+                  && root.service && root.service.knowledgeLinkPlan
+                width: parent.width
+                wrapMode: Text.Wrap
+                text: !root.service || !root.service.knowledgeLinkPlan ? ""
+                  : ((root.service.knowledgeLinkPlan.createdCount !== undefined
+                      ? "Created " + root.service.knowledgeLinkPlan.createdCount + " · " : "")
+                    + root.service.knowledgeLinkPlan.createCount + " to create · "
+                    + root.service.knowledgeLinkPlan.connectedCount + " connected · "
+                    + root.service.knowledgeLinkPlan.conflictCount + " conflicts. "
+                    + "Existing files and foreign links are never replaced."
+                    + (root.service.knowledgeLinkPlan.errors
+                        && root.service.knowledgeLinkPlan.errors.length > 0
+                      ? " " + root.service.knowledgeLinkPlan.errors.length
+                        + " links could not be created." : ""))
+                color: root.foreground
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+                renderType: Text.NativeRendering
+              }
+
+              TextField {
+                id: editorField
+                visible: root.editorMode === "new-file"
+                  || root.editorMode === "new-folder"
+                  || root.editorMode === "rename"
+                text: root.editorValue
+                width: parent.width
+                height: Style.space(36)
+                color: root.foreground
+                selectByMouse: true
+                font.family: Style.font.family
+                font.pixelSize: Style.font.bodySmall
+                background: Rectangle {
+                  radius: Style.cornerRadius > 0 ? Style.space(5) : 0
+                  color: Style.focusFillColor
+                  border.width: Style.focusBorderWidth
+                  border.color: Style.focusBorderColor
                 }
-                onExited: if (root.hoveredToken === String(fileRow.modelData.token || ""))
-                  root.hoveredToken = ""
-                onClicked: function(event) {
-                  root.keyboardIndex = fileRow.index
-                  root.service.selectIndex(fileRow.index,
-                    event.button === Qt.RightButton && fileRow.persistentSelected
-                      ? "focus" : root.pointerSelectionMode(event.modifiers))
+                onTextEdited: root.editorValue = text
+                Keys.onEscapePressed: function(event) {
+                  root.editorMode = ""
                   keyScope.forceActiveFocus()
-                  if (event.button === Qt.RightButton) root.inspectorOpen = true
+                  event.accepted = true
                 }
-                onDoubleClicked: function(event) {
-                  root.keyboardIndex = fileRow.index
-                  root.service.selectIndex(fileRow.index, "replace")
-                  root.service.enterIndex(fileRow.index)
+                Keys.onReturnPressed: function(event) {
+                  root.commitEditor()
                   event.accepted = true
                 }
               }
 
-              DragHandler {
-                id: rowDrag
-                target: null
-                acceptedButtons: Qt.LeftButton
-                cursorShape: Qt.ClosedHandCursor
-                onActiveChanged: if (active && !fileRow.persistentSelected) {
-                  root.keyboardIndex = fileRow.index
-                  root.service.selectIndex(fileRow.index, "replace")
-                }
+              Text {
+                visible: root.editorError !== ""
+                width: parent.width
+                wrapMode: Text.Wrap
+                text: root.editorError
+                color: Color.urgent
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+                renderType: Text.NativeRendering
               }
-              Drag.active: rowDrag.active
-              Drag.dragType: Drag.Automatic
-              Drag.supportedActions: Qt.CopyAction | Qt.MoveAction
-              Drag.mimeData: root.dragMimeData(fileRow.modelData)
 
-              MouseArea {
-                anchors.left: parent.left
-                anchors.leftMargin: Style.space(4 + fileRow.modelData.depth * 15)
-                anchors.verticalCenter: parent.verticalCenter
-                width: Style.space(22)
-                height: parent.height
-                enabled: fileRow.modelData.isDir && fileRow.modelData.hasChildren
-                cursorShape: Qt.PointingHandCursor
-                onClicked: {
-                  root.keyboardIndex = fileRow.index
-                  root.service.selectIndex(fileRow.index)
-                  root.service.toggleExpanded(fileRow.modelData.token)
-                }
-              }
-            }
-
-            ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
-          }
-
-          Column {
-            objectName: "quickfileEmptyState"
-            anchors.centerIn: fileList
-            width: parent.width - Style.space(44)
-            spacing: Style.space(8)
-            visible: root.service && !root.service.foregroundBusy
-              && root.service.entries.length === 0
-            Text {
-              anchors.horizontalCenter: parent.horizontalCenter
-              text: root.service && root.service.errorMessage ? "󰅚" : "󰉖"
-              color: root.service && root.service.errorMessage ? Color.urgent : root.muted
-              font.family: Style.font.family
-              font.pixelSize: Style.space(28)
-              renderType: Text.NativeRendering
-            }
-            Text {
-              width: parent.width
-              horizontalAlignment: Text.AlignHCenter
-              wrapMode: Text.Wrap
-              text: root.service && root.service.errorMessage
-                ? root.service.errorMessage
-                : (searchField.text ? "No matching files" : "This folder is empty")
-              color: root.muted
-              font.family: Style.font.family
-              font.pixelSize: Style.font.bodySmall
-              renderType: Text.NativeRendering
-            }
-          }
-
-          Rectangle {
-            id: editorDialog
-            anchors.fill: parent
-            visible: root.editorMode !== ""
-            color: Qt.rgba(root.background.r, root.background.g, root.background.b, 0.84)
-            z: 20
-            MouseArea { anchors.fill: parent; onClicked: {} }
-            Keys.onEscapePressed: function(event) {
-              root.cancelEditor()
-              if (root.editorMode === "") keyScope.forceActiveFocus()
-              event.accepted = true
-            }
-            Connections {
-              target: root
-              function onEditorModeChanged() {
-                Qt.callLater(function() {
-                  if (root.editorMode === "quick-nav") {
-                    quickNavField.forceActiveFocus()
-                    quickNavField.selectAll()
-                  } else if (["new-file", "new-folder", "rename"].indexOf(root.editorMode) >= 0) {
-                    editorField.selectAll()
-                    editorField.forceActiveFocus()
-                  } else if (root.editorMode !== "") editorDialog.forceActiveFocus()
-                })
-              }
-            }
-
-            Rectangle {
-              anchors.centerIn: parent
-              width: parent.width - Style.space(42)
-              height: editorContent.implicitHeight + Style.space(32)
-              radius: Style.cornerRadius
-              color: root.background
-              border.width: Math.max(1, Style.normalBorderWidth)
-              border.color: root.borderColor
-
-              Column {
-                id: editorContent
-                anchors.left: parent.left
+              Row {
                 anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-                anchors.margins: Style.space(16)
-                spacing: Style.space(12)
-
-                Text {
-                  text: root.editorMode === "new-file" ? "Create file"
-                    : root.editorMode === "new-folder" ? "Create folder"
-                    : root.editorMode === "rename" ? "Rename item"
-                    : root.editorMode === "trash-browser" ? "Trash"
-                    : root.editorMode === "trash-delete" ? "Delete permanently?"
-                    : root.editorMode === "quick-nav" ? "Quick Nav"
-                    : root.editorMode === "drop-choice" ? "Copy or move here?"
-                    : root.editorMode === "conflict" ? "Files already exist"
-                    : root.editorMode === "conflict-replace" ? "Replace existing items?"
+                spacing: Style.space(7)
+                ActionButton {
+                  glyph: "󰅖"
+                  label: root.editorMode === "trash-browser" ? "Close"
+                    : root.editorMode === "conflict-replace" ? "Back" : "Cancel"
+                  onClicked: {
+                    root.cancelEditor()
+                    if (root.editorMode === "") keyScope.forceActiveFocus()
+                  }
+                }
+                ActionButton {
+                  visible: ["trash-browser", "quick-nav", "drop-choice", "conflict"].indexOf(root.editorMode) < 0
+                  glyph: root.editorMode === "trash" ? "󰩺"
+                    : root.editorMode === "trash-delete" ? "󰆴"
+                    : root.editorMode === "conflict-replace" ? "󰁯"
+                    : root.editorMode === "knowledge-links" ? "󰌷" : "󰄬"
+                  label: root.editorMode === "trash" ? "Move to Trash"
+                    : root.editorMode === "trash-delete" ? "Delete permanently"
+                    : root.editorMode === "conflict-replace" ? "Replace existing items"
                     : root.editorMode === "knowledge-links"
-                      ? "Connect Project Knowledge"
-                    : "Move to Trash?"
-                  color: root.foreground
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.body
-                  font.bold: true
-                  renderType: Text.NativeRendering
-                }
-
-                TextField {
-                  id: quickNavField
-                  objectName: "quickfileQuickNavSearch"
-                  visible: root.editorMode === "quick-nav"
-                  width: parent.width
-                  height: Style.space(35)
-                  text: root.quickNavQuery
-                  placeholderText: "Filter places, projects and recent folders…"
-                  placeholderTextColor: root.muted
-                  color: root.foreground
-                  selectByMouse: true
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.bodySmall
-                  background: Rectangle {
-                    radius: Style.space(4)
-                    color: Style.focusFillColor
-                    border.width: Style.focusBorderWidth
-                    border.color: Style.focusBorderColor
-                  }
-                  onTextEdited: {
-                    root.quickNavQuery = text
-                    root.quickNavIndex = 0
-                  }
-                  Keys.onPressed: function(event) {
-                    if (event.key === Qt.Key_Down || event.key === Qt.Key_Up) {
-                      root.quickNavIndex = Math.max(0, Math.min(root.quickNavResults.length - 1,
-                        root.quickNavIndex + (event.key === Qt.Key_Down ? 1 : -1)))
-                      quickNavList.positionViewAtIndex(root.quickNavIndex, ListView.Contain)
-                      event.accepted = true
-                    } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-                      if (root.activateQuickLocation(root.quickNavIndex)) keyScope.forceActiveFocus()
-                      event.accepted = true
-                    } else if (event.key === Qt.Key_Escape) {
-                      root.dismissEditor()
-                      keyScope.forceActiveFocus()
-                      event.accepted = true
-                    }
-                  }
-                }
-
-                ListView {
-                  id: quickNavList
-                  objectName: "quickfileQuickNavList"
-                  visible: root.editorMode === "quick-nav" && count > 0
-                  width: parent.width
-                  height: visible ? Math.min(contentHeight, Style.space(308), blade.height * 0.42) : 0
-                  model: root.quickNavResults
-                  currentIndex: root.quickNavIndex
-                  clip: true
-                  boundsBehavior: Flickable.StopAtBounds
-                  spacing: Style.space(3)
-                  delegate: Rectangle {
-                    id: locationRow
-                    required property var modelData
-                    required property int index
-                    width: quickNavList.width
-                    height: Style.space(51)
-                    radius: Style.space(4)
-                    color: index === root.quickNavIndex ? Style.focusFillColor
-                      : locationMouse.containsMouse ? Style.hoverFill : "transparent"
-                    Text {
-                      id: locationSource
-                      anchors.top: parent.top
-                      anchors.right: parent.right
-                      anchors.margins: Style.space(7)
-                      text: root.quickLocationLabel(locationRow.modelData)
-                      color: root.foreground
-                      opacity: 0.75
-                      font.family: Style.font.family
-                      font.pixelSize: Style.font.caption
-                    }
-                    Column {
-                      anchors.left: parent.left
-                      anchors.right: parent.right
-                      anchors.margins: Style.space(7)
-                      anchors.verticalCenter: parent.verticalCenter
-                      spacing: Style.space(3)
-                      Text {
-                        width: parent.width - locationSource.width - Style.space(9)
-                        text: String(locationRow.modelData.name || "Folder")
-                        textFormat: Text.PlainText
-                        elide: Text.ElideMiddle
-                        color: root.foreground
-                        font.family: Style.font.family
-                        font.pixelSize: Style.font.bodySmall
-                      }
-                      Text {
-                        width: parent.width
-                        text: String(locationRow.modelData.path || "")
-                        textFormat: Text.PlainText
-                        elide: Text.ElideMiddle
-                        color: root.foreground
-                        opacity: 0.8
-                        font.family: Style.font.family
-                        font.pixelSize: Style.font.caption
-                      }
-                    }
-                    MouseArea {
-                      id: locationMouse
-                      anchors.fill: parent
-                      hoverEnabled: true
-                      cursorShape: Qt.PointingHandCursor
-                      onClicked: {
-                        if (root.activateQuickLocation(locationRow.index)) keyScope.forceActiveFocus()
-                      }
-                      ToolTip.visible: containsMouse
-                      ToolTip.delay: 650
-                      ToolTip.text: String(locationRow.modelData.path || "")
-                    }
-                  }
-                  ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
-                }
-
-                Text {
-                  visible: root.editorMode === "quick-nav" && root.service
-                    && (root.service.quickNavBusy || root.service.quickNavError !== ""
-                      || root.quickNavResults.length === 0)
-                  width: parent.width
-                  text: !root.service ? "" : root.service.quickNavError
-                    ? root.service.quickNavError : root.service.quickNavBusy
-                      ? "Loading locations…" : "No matching locations"
-                  textFormat: Text.PlainText
-                  wrapMode: Text.Wrap
-                  color: root.service && root.service.quickNavError ? Color.urgent : root.muted
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.caption
-                }
-
-                Text {
-                  visible: root.editorMode === "drop-choice"
-                  width: parent.width
-                  text: root.pendingDrop ? root.pendingDrop.count
-                    + (root.pendingDrop.count === 1 ? " item\n" : " items\n")
-                    + "Destination: " + root.pendingDrop.destinationPath : ""
-                  textFormat: Text.PlainText
-                  wrapMode: Text.Wrap
-                  color: root.foreground
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.bodySmall
-                }
-                Row {
-                  visible: root.editorMode === "drop-choice"
-                  spacing: Style.space(8)
-                  ActionButton {
-                    glyph: "󰆏"
-                    label: "Copy here"
-                    tooltip: "Keep the originals in their current location"
-                    enabled: root.service && !root.service.actionBusy
-                    onClicked: root.commitDirectoryDrop(false)
-                  }
-                  ActionButton {
-                    glyph: "󰆐"
-                    label: "Move here"
-                    tooltip: "Move the originals to this folder"
-                    enabled: root.service && !root.service.actionBusy
-                    onClicked: root.commitDirectoryDrop(true)
-                  }
-                }
-
-                Text {
-                  visible: root.editorMode === "conflict" || root.editorMode === "conflict-replace"
-                  width: parent.width
-                  text: root.editorMode === "conflict-replace"
-                    ? "Existing items below will be moved to Trash, then replaced with the incoming items. Undo restores them."
-                    : "Choose how to handle the existing destination items."
-                  wrapMode: Text.Wrap
-                  color: root.editorMode === "conflict-replace" ? Color.urgent : root.foreground
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.bodySmall
-                }
-                ListView {
-                  id: conflictsList
-                  objectName: "quickfileConflictsList"
-                  visible: root.editorMode === "conflict" || root.editorMode === "conflict-replace"
-                  width: parent.width
-                  height: visible ? Math.min(contentHeight, Style.space(234), blade.height * 0.28) : 0
-                  model: root.conflictRows
-                  spacing: Style.space(5)
-                  clip: true
-                  boundsBehavior: Flickable.StopAtBounds
-                  delegate: Rectangle {
-                    id: conflictRow
-                    required property var modelData
-                    width: conflictsList.width
-                    height: Style.space(73)
-                    radius: Style.space(4)
-                    color: Style.normalFill
-                    Column {
-                      anchors.fill: parent
-                      anchors.margins: Style.space(7)
-                      spacing: Style.space(3)
-                      Text {
-                        width: parent.width
-                        text: String(conflictRow.modelData.name || "Existing item")
-                          + " · " + String(conflictRow.modelData.targetKind || "file")
-                        textFormat: Text.PlainText
-                        elide: Text.ElideMiddle
-                        color: root.foreground
-                        font.family: Style.font.family
-                        font.pixelSize: Style.font.bodySmall
-                      }
-                      Text {
-                        width: parent.width
-                        text: "Existing: " + String(conflictRow.modelData.targetPath || "")
-                        textFormat: Text.PlainText
-                        elide: Text.ElideMiddle
-                        color: root.foreground
-                        font.family: Style.font.family
-                        font.pixelSize: Style.font.caption
-                      }
-                      Text {
-                        width: parent.width
-                        text: "Incoming: " + String(conflictRow.modelData.sourcePath || "")
-                        textFormat: Text.PlainText
-                        elide: Text.ElideMiddle
-                        color: root.foreground
-                        font.family: Style.font.family
-                        font.pixelSize: Style.font.caption
-                      }
-                    }
-                    MouseArea {
-                      anchors.fill: parent
-                      hoverEnabled: true
-                      acceptedButtons: Qt.NoButton
-                      ToolTip.visible: containsMouse
-                      ToolTip.delay: 600
-                      ToolTip.text: String(conflictRow.modelData.sourcePath || "") + "\n→ "
-                        + String(conflictRow.modelData.targetPath || "")
-                    }
-                  }
-                  ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
-                }
-                Text {
-                  visible: root.editorMode === "conflict" || root.editorMode === "conflict-replace"
-                  width: parent.width
-                  text: root.conflictRows.length > 1
-                    ? "This choice applies to all " + root.conflictRows.length + " conflicts in this operation."
-                    : "This choice applies to this operation."
-                  wrapMode: Text.Wrap
-                  color: root.foreground
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.caption
-                }
-                Grid {
-                  visible: root.editorMode === "conflict"
-                  columns: 2
-                  spacing: Style.space(8)
-                  ActionButton {
-                    glyph: "󰆴"
-                    label: "Keep both"
-                    tooltip: "Give incoming items a new, unused name"
-                    enabled: root.service && !root.service.actionBusy
-                    onClicked: root.chooseConflictPolicy("keep-both")
-                  }
-                  ActionButton {
-                    glyph: "󰒭"
-                    label: "Skip"
-                    tooltip: "Keep existing items and skip conflicting incoming items"
-                    enabled: root.service && !root.service.actionBusy
-                    onClicked: root.chooseConflictPolicy("skip")
-                  }
-                  ActionButton {
-                    glyph: "󰝰"
-                    label: "Merge folders"
-                    tooltip: "Combine folder contents; existing files remain protected"
-                    enabled: root.service && !root.service.actionBusy && root.conflictsCanMerge
-                    onClicked: root.chooseConflictPolicy("merge")
-                  }
-                  ActionButton {
-                    glyph: "󰁯"
-                    label: "Replace…"
-                    destructive: true
-                    tooltip: "Review a separate confirmation before replacing existing items"
-                    enabled: root.service && !root.service.actionBusy
-                    onClicked: root.chooseConflictPolicy("replace")
-                  }
-                }
-
-                Text {
-                  visible: root.editorMode === "trash" || root.editorMode === "trash-delete"
-                  width: parent.width
-                  wrapMode: Text.Wrap
-                  text: root.editorMode === "trash-delete"
-                    ? (!root.pendingTrashEntry ? ""
-                      : ("“" + root.pendingTrashEntry.name
-                        + "” will be deleted permanently. This cannot be undone."))
-                    : (!root.service || !root.service.selectedEntry ? ""
-                    : root.service.selectedTokens.length > 1
-                      ? (root.service.selectedTokens.length
-                        + " selected items can be restored from Trash.")
-                      : ("“" + root.service.selectedEntry.name
-                        + "” can be restored from Trash."))
-                  color: root.muted
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.bodySmall
-                  renderType: Text.NativeRendering
-                }
-
-                ListView {
-                  id: trashList
-                  visible: root.editorMode === "trash-browser"
-                  width: parent.width
-                  height: visible ? Style.space(330) : 0
-                  spacing: Style.space(5)
-                  clip: true
-                  boundsBehavior: Flickable.StopAtBounds
-                  model: root.service ? root.service.trashEntries : []
-
-                  delegate: Rectangle {
-                    id: trashRow
-                    required property var modelData
-                    width: ListView.view.width
-                    height: Style.space(58)
-                    radius: Style.cornerRadius > 0 ? Style.space(4) : 0
-                    color: Qt.alpha(root.foreground, 0.035)
-                    border.width: 1
-                    border.color: root.borderColor
-
-                    Column {
-                      anchors.left: parent.left
-                      anchors.leftMargin: Style.space(8)
-                      anchors.right: trashActions.left
-                      anchors.rightMargin: Style.space(7)
-                      anchors.verticalCenter: parent.verticalCenter
-                      spacing: Style.space(2)
-                      Text {
-                        width: parent.width
-                        text: String(trashRow.modelData.name || "")
-                        color: root.foreground
-                        elide: Text.ElideMiddle
-                        font.family: Style.font.family
-                        font.pixelSize: Style.font.bodySmall
-                        renderType: Text.NativeRendering
-                      }
-                      Text {
-                        width: parent.width
-                        text: String(trashRow.modelData.originalPath || "")
-                        color: root.muted
-                        elide: Text.ElideMiddle
-                        font.family: Style.font.family
-                        font.pixelSize: Style.font.caption
-                        renderType: Text.NativeRendering
-                      }
-                    }
-
-                    Row {
-                      id: trashActions
-                      anchors.right: parent.right
-                      anchors.rightMargin: Style.space(6)
-                      anchors.verticalCenter: parent.verticalCenter
-                      spacing: Style.space(4)
-                      Components.IconButton {
-                        glyph: "󰁯"
-                        tooltip: "Restore"
-                        buttonSize: Style.space(25)
-                        available: root.service && !root.service.actionBusy
-                        onClicked: root.service.restoreTrash(String(trashRow.modelData.uri))
-                      }
-                      Components.IconButton {
-                        glyph: "󰆴"
-                        tooltip: "Delete permanently"
-                        buttonSize: Style.space(25)
-                        available: root.service && !root.service.actionBusy
-                        onClicked: root.confirmTrashDelete(trashRow.modelData)
-                      }
-                    }
-                  }
-
-                  ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
-                }
-
-                Text {
-                  visible: root.editorMode === "trash-browser"
-                    && root.service && (root.service.trashBusy
-                      || root.service.trashEntries.length === 0
-                      || root.service.trashError !== "")
-                  width: parent.width
-                  horizontalAlignment: Text.AlignHCenter
-                  wrapMode: Text.Wrap
-                  text: !root.service ? ""
-                    : root.service.trashBusy ? "Loading Trash…"
-                    : root.service.trashError ? root.service.trashError
-                    : "Trash is empty"
-                  color: root.service && root.service.trashError ? Color.urgent : root.muted
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.caption
-                  renderType: Text.NativeRendering
-                }
-
-                Text {
-                  visible: root.editorMode === "knowledge-links"
-                  width: parent.width
-                  wrapMode: Text.Wrap
-                  text: !root.service ? ""
-                    : root.service.knowledgeLinkPlan
-                      ? ("Source: " + root.service.knowledgeLinkPlan.source
-                        + "\nProject: " + root.service.knowledgeLinkPlan.projectRoot)
-                      : root.service.actionBusy ? "Preparing a safe link preview…"
-                      : "Preparing preview…"
-                  color: root.muted
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.caption
-                  renderType: Text.NativeRendering
-                }
-
-                ListView {
-                  id: knowledgeLinkList
-                  visible: root.editorMode === "knowledge-links"
-                    && root.service && root.service.knowledgeLinkPlan
-                  width: parent.width
-                  height: visible ? Math.min(contentHeight, Style.space(330)) : 0
-                  spacing: Style.space(5)
-                  clip: true
-                  boundsBehavior: Flickable.StopAtBounds
-                  model: visible && root.service.knowledgeLinkPlan
-                    ? root.service.knowledgeLinkPlan.entries : []
-
-                  delegate: Rectangle {
-                    id: knowledgeLinkRow
-                    required property var modelData
-                    width: ListView.view.width
-                    height: Style.space(55)
-                    radius: Style.cornerRadius > 0 ? Style.space(4) : 0
-                    color: Qt.alpha(root.knowledgeLinkStatusColor(modelData.status), 0.08)
-                    border.width: 1
-                    border.color: Qt.alpha(
-                      root.knowledgeLinkStatusColor(modelData.status), 0.45)
-
-                    Text {
-                      id: knowledgeLinkAgent
-                      anchors.left: parent.left
-                      anchors.leftMargin: Style.space(8)
-                      anchors.verticalCenter: parent.verticalCenter
-                      width: Style.space(25)
-                      text: root.agentBadges([knowledgeLinkRow.modelData.agent])
-                      color: root.knowledgeLinkStatusColor(knowledgeLinkRow.modelData.status)
-                      font.family: Style.font.family
-                      font.pixelSize: Style.font.caption
-                      font.bold: true
-                      renderType: Text.NativeRendering
-                    }
-
-                    Column {
-                      anchors.left: knowledgeLinkAgent.right
-                      anchors.leftMargin: Style.space(5)
-                      anchors.right: knowledgeLinkState.left
-                      anchors.rightMargin: Style.space(6)
-                      anchors.verticalCenter: parent.verticalCenter
-                      spacing: Style.space(2)
-                      Text {
-                        width: parent.width
-                        text: String(knowledgeLinkRow.modelData.relativeTarget || "")
-                        color: root.foreground
-                        elide: Text.ElideMiddle
-                        font.family: Style.font.family
-                        font.pixelSize: Style.font.bodySmall
-                        renderType: Text.NativeRendering
-                      }
-                      Text {
-                        width: parent.width
-                        text: String(knowledgeLinkRow.modelData.reason || "")
-                          + (knowledgeLinkRow.modelData.warning
-                            ? " · " + knowledgeLinkRow.modelData.warning : "")
-                        color: root.muted
-                        elide: Text.ElideRight
-                        font.family: Style.font.family
-                        font.pixelSize: Style.font.caption
-                        renderType: Text.NativeRendering
-                      }
-                    }
-
-                    Text {
-                      id: knowledgeLinkState
-                      anchors.right: parent.right
-                      anchors.rightMargin: Style.space(8)
-                      anchors.verticalCenter: parent.verticalCenter
-                      width: Style.space(70)
-                      horizontalAlignment: Text.AlignRight
-                      text: root.knowledgeLinkStatusLabel(knowledgeLinkRow.modelData.status)
-                      color: root.knowledgeLinkStatusColor(knowledgeLinkRow.modelData.status)
-                      font.family: Style.font.family
-                      font.pixelSize: Style.font.caption
-                      font.bold: true
-                      renderType: Text.NativeRendering
-                    }
-                  }
-
-                  ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
-                }
-
-                Text {
-                  visible: root.editorMode === "knowledge-links"
-                    && root.service && root.service.knowledgeLinkPlan
-                  width: parent.width
-                  wrapMode: Text.Wrap
-                  text: !root.service || !root.service.knowledgeLinkPlan ? ""
-                    : ((root.service.knowledgeLinkPlan.createdCount !== undefined
-                        ? "Created " + root.service.knowledgeLinkPlan.createdCount + " · " : "")
-                      + root.service.knowledgeLinkPlan.createCount + " to create · "
-                      + root.service.knowledgeLinkPlan.connectedCount + " connected · "
-                      + root.service.knowledgeLinkPlan.conflictCount + " conflicts. "
-                      + "Existing files and foreign links are never replaced."
-                      + (root.service.knowledgeLinkPlan.errors
-                          && root.service.knowledgeLinkPlan.errors.length > 0
-                        ? " " + root.service.knowledgeLinkPlan.errors.length
-                          + " links could not be created." : ""))
-                  color: root.foreground
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.caption
-                  renderType: Text.NativeRendering
-                }
-
-                TextField {
-                  id: editorField
-                  visible: root.editorMode === "new-file"
-                    || root.editorMode === "new-folder"
-                    || root.editorMode === "rename"
-                  text: root.editorValue
-                  width: parent.width
-                  height: Style.space(36)
-                  color: root.foreground
-                  selectByMouse: true
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.bodySmall
-                  background: Rectangle {
-                    radius: Style.cornerRadius > 0 ? Style.space(5) : 0
-                    color: Style.focusFillColor
-                    border.width: Style.focusBorderWidth
-                    border.color: Style.focusBorderColor
-                  }
-                  onTextEdited: root.editorValue = text
-                  Keys.onEscapePressed: function(event) {
-                    root.editorMode = ""
-                    keyScope.forceActiveFocus()
-                    event.accepted = true
-                  }
-                  Keys.onReturnPressed: function(event) {
-                    root.commitEditor()
-                    event.accepted = true
-                  }
-                }
-
-                Text {
-                  visible: root.editorError !== ""
-                  width: parent.width
-                  wrapMode: Text.Wrap
-                  text: root.editorError
-                  color: Color.urgent
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.caption
-                  renderType: Text.NativeRendering
-                }
-
-                Row {
-                  anchors.right: parent.right
-                  spacing: Style.space(7)
-                  ActionButton {
-                    glyph: "󰅖"
-                    label: root.editorMode === "trash-browser" ? "Close"
-                      : root.editorMode === "conflict-replace" ? "Back" : "Cancel"
-                    onClicked: {
-                      root.cancelEditor()
-                      if (root.editorMode === "") keyScope.forceActiveFocus()
-                    }
-                  }
-                  ActionButton {
-                    visible: ["trash-browser", "quick-nav", "drop-choice", "conflict"].indexOf(root.editorMode) < 0
-                    glyph: root.editorMode === "trash" ? "󰩺"
-                      : root.editorMode === "trash-delete" ? "󰆴"
-                      : root.editorMode === "conflict-replace" ? "󰁯"
-                      : root.editorMode === "knowledge-links" ? "󰌷" : "󰄬"
-                    label: root.editorMode === "trash" ? "Move to Trash"
-                      : root.editorMode === "trash-delete" ? "Delete permanently"
-                      : root.editorMode === "conflict-replace" ? "Replace existing items"
-                      : root.editorMode === "knowledge-links"
-                        ? (!root.service || !root.service.knowledgeLinkPlan
-                          ? "Preparing…"
-                          : "Create " + root.service.knowledgeLinkPlan.createCount)
-                      : "Confirm"
-                    destructive: root.editorMode === "trash-delete" || root.editorMode === "conflict-replace"
-                    enabled: root.service && !root.service.actionBusy
-                      && (root.editorMode !== "knowledge-links"
-                      || (root.service && root.service.knowledgeLinkPlan
-                        && root.service.knowledgeLinkPlan.createCount > 0
-                        && !root.service.actionBusy))
-                    onClicked: root.commitEditor()
-                  }
+                      ? (!root.service || !root.service.knowledgeLinkPlan
+                        ? "Preparing…"
+                        : "Create " + root.service.knowledgeLinkPlan.createCount)
+                    : "Confirm"
+                  destructive: root.editorMode === "trash-delete" || root.editorMode === "conflict-replace"
+                  enabled: root.service && !root.service.actionBusy
+                    && (root.editorMode !== "knowledge-links"
+                    || (root.service && root.service.knowledgeLinkPlan
+                      && root.service.knowledgeLinkPlan.createCount > 0
+                      && !root.service.actionBusy))
+                  onClicked: root.commitEditor()
                 }
               }
             }

@@ -35,9 +35,13 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-VERSION = "0.11.5"
+VERSION = "0.12.0"
 DEFAULT_LIMIT = 2000
 COMMAND_TIMEOUT = 3
+# `git status` is the only command on the navigation path that can scale with
+# repository size rather than with the directory being shown.
+GIT_STATUS_TIMEOUT = 2
+GIT_SLOW_SCOPE_TTL = 120.0
 DEFAULT_CONTENT_FILE_LIMIT = 1024 * 1024
 DEFAULT_CONTENT_BYTE_LIMIT = 8 * 1024 * 1024
 CONTENT_LINE_LIMIT = 4096
@@ -945,19 +949,89 @@ def safe_stat(path: str) -> os.stat_result:
         raise QuickfileError(str(exc), "stat-failed") from exc
 
 
+def git_slow_scope_file() -> Path:
+    override = os.environ.get("QUICKFILE_GIT_SLOW_FILE", "").strip()
+    if override:
+        return Path(override).expanduser()
+    state_home = os.environ.get("XDG_STATE_HOME", "").strip()
+    base = Path(state_home).expanduser() if state_home else Path.home() / ".local" / "state"
+    return base / "omarchy" / "quickfile" / "slow-git-scopes.json"
+
+
+def load_slow_git_scopes() -> dict[str, float]:
+    """Directories whose `git status` blew the deadline recently.
+
+    Navigation must never pay the same multi-second stall twice. A scope is
+    remembered only for GIT_SLOW_SCOPE_TTL so a repository that was mid-rebase,
+    cold, or momentarily huge starts reporting status again on its own.
+    """
+    path = git_slow_scope_file()
+    try:
+        if not path.exists() or path.stat().st_size > 65536:
+            return {}
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict) or not isinstance(payload.get("scopes"), dict):
+        return {}
+    now = time.time()
+    rows: dict[str, float] = {}
+    for scope, expires in payload["scopes"].items():
+        try:
+            deadline = float(expires)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(scope, str) and deadline > now:
+            rows[scope] = deadline
+    return rows
+
+
+def remember_slow_git_scope(scope: str) -> None:
+    rows = load_slow_git_scopes()
+    rows[scope] = time.time() + GIT_SLOW_SCOPE_TTL
+    # Keep the newest entries only; this file is a hint, never a source of truth.
+    trimmed = dict(sorted(rows.items(), key=lambda item: item[1], reverse=True)[:64])
+    path = git_slow_scope_file()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + ".tmp")
+        temporary.write_text(json.dumps({"scopes": trimmed}), encoding="utf-8")
+        os.replace(temporary, path)
+    except OSError:
+        pass
+
+
 def git_context(path: str) -> dict[str, Any]:
     probe = path if os.path.isdir(path) else os.path.dirname(path)
     code, out, _ = run_bounded(["git", "-C", probe, "rev-parse", "--show-toplevel"])
     if code != 0 or not out.strip():
-        return {"root": "", "branch": "", "statuses": {}}
+        return {"root": "", "branch": "", "statuses": {}, "degraded": False}
     root = normalized_path(out.splitlines()[0])
     _, branch, _ = run_bounded(["git", "-C", root, "branch", "--show-current"])
+    scope = normalized_path(probe)
+    if scope in load_slow_git_scopes():
+        return {
+            "root": display_text(root),
+            "rootToken": encode_path(root),
+            "branch": branch.strip(),
+            "statuses": {},
+            "degraded": True,
+        }
     code, porcelain, _ = run_bounded(
-        # Prevent git's optional index refresh write from feeding the watcher.
-        ["git", "--no-optional-locks", "-C", root, "status", "--porcelain=v1", "--untracked-files=all"],
-        timeout=5,
+        # Two bounds keep navigation responsive no matter what the repository
+        # looks like. `--no-optional-locks` stops git's index refresh write from
+        # feeding our own watcher, and the trailing pathspec limits the walk to
+        # the directory being displayed. Status for the whole repository root
+        # can take seconds on a large or damaged tree (a broken HEAD makes git
+        # scan the entire worktree before it fails), and every status we would
+        # ever render lives under this scope anyway.
+        ["git", "--no-optional-locks", "-C", root, "status", "--porcelain=v1",
+         "--untracked-files=all", "--", scope],
+        timeout=GIT_STATUS_TIMEOUT,
         limit=524288,
     )
+    if code == 127:
+        remember_slow_git_scope(scope)
     statuses: dict[str, str] = {}
     if code == 0:
         for line in porcelain.splitlines():
@@ -973,6 +1047,7 @@ def git_context(path: str) -> dict[str, Any]:
         "rootToken": encode_path(root),
         "branch": branch.strip(),
         "statuses": statuses,
+        "degraded": code != 0,
     }
 
 

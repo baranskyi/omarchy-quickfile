@@ -5,6 +5,8 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -919,6 +921,103 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(runner.call_args_list[1].args[0], [
             "git", "-C", str(repository), "worktree", "list", "--porcelain",
         ])
+
+    def make_repository(self) -> Path:
+        repository = self.root / "repo"
+        (repository / "shown" / "nested").mkdir(parents=True)
+        (repository / "elsewhere").mkdir()
+        for relative in ("shown/tracked.txt", "shown/nested/deep.txt", "elsewhere/other.txt"):
+            (repository / relative).write_text("committed\n", encoding="utf-8")
+        environment = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "Test", "GIT_AUTHOR_EMAIL": "test@example.com",
+            "GIT_COMMITTER_NAME": "Test", "GIT_COMMITTER_EMAIL": "test@example.com",
+        }
+        for argv in (
+            ["git", "init", "--quiet", "--initial-branch", "main", "."],
+            ["git", "add", "."],
+            ["git", "commit", "--quiet", "-m", "initial"],
+        ):
+            subprocess.run(argv, cwd=repository, check=True, env=environment,
+                           capture_output=True)
+        (repository / "shown" / "tracked.txt").write_text("changed\n", encoding="utf-8")
+        (repository / "shown" / "nested" / "fresh.txt").write_text("new\n", encoding="utf-8")
+        (repository / "elsewhere" / "other.txt").write_text("changed\n", encoding="utf-8")
+        return repository
+
+    def test_git_status_scope_matches_full_repository_for_the_displayed_subtree(self) -> None:
+        """Scoping status to the shown directory must not lose a single badge.
+
+        Navigation only ever renders paths below the directory it displays, so
+        the pathspec that keeps `git status` off the rest of the repository has
+        to produce exactly the statuses the unscoped command would.
+        """
+        if shutil.which("git") is None:
+            self.skipTest("git is not installed")
+        repository = self.make_repository()
+        shown = repository / "shown"
+        context = quickfile.git_context(str(shown))
+        self.assertEqual(context["root"], str(repository))
+        self.assertFalse(context["degraded"])
+
+        unscoped = subprocess.run(
+            ["git", "--no-optional-locks", "status", "--porcelain=v1",
+             "--untracked-files=all"],
+            cwd=repository, capture_output=True, text=True, check=True,
+        ).stdout.splitlines()
+        expected = {
+            str(repository / line[3:]): line[:2]
+            for line in unscoped if len(line) >= 4
+        }
+        within_scope = {
+            path: code for path, code in expected.items()
+            if path.startswith(str(shown) + os.sep)
+        }
+        self.assertEqual(context["statuses"], within_scope)
+        # The change outside the shown directory is real, and correctly absent.
+        self.assertIn(str(repository / "elsewhere" / "other.txt"), expected)
+        self.assertNotIn(str(repository / "elsewhere" / "other.txt"), context["statuses"])
+        self.assertEqual(
+            quickfile.status_for(str(shown / "nested"), context), "??",
+            "a directory must still inherit the status of a file below it",
+        )
+
+    def test_slow_git_status_is_recorded_once_and_skipped_afterwards(self) -> None:
+        """One stalled repository must not cost the deadline on every visit."""
+        repository = self.root / "slow"
+        repository.mkdir()
+        toplevel = (0, str(repository) + "\n", "")
+        branch = (0, "main\n", "")
+        timed_out = (127, "", "Command timed out after 2s")
+
+        with mock.patch.object(quickfile, "run_bounded",
+                               side_effect=[toplevel, branch, timed_out]) as runner:
+            first = quickfile.git_context(str(repository))
+        self.assertTrue(first["degraded"])
+        self.assertEqual(first["statuses"], {})
+        self.assertEqual(len(runner.call_args_list), 3)
+        self.assertEqual(runner.call_args_list[2].args[0][-2:], ["--", str(repository)])
+        self.assertEqual(runner.call_args_list[2].kwargs["timeout"],
+                         quickfile.GIT_STATUS_TIMEOUT)
+
+        with mock.patch.object(quickfile, "run_bounded",
+                               side_effect=[toplevel, branch]) as runner:
+            second = quickfile.git_context(str(repository))
+        self.assertTrue(second["degraded"])
+        self.assertEqual(second["branch"], "main",
+                         "the branch label must survive a skipped status")
+        self.assertEqual(len(runner.call_args_list), 2,
+                         "a scope known to be slow was asked for status again")
+
+    def test_slow_git_scope_is_forgotten_once_its_entry_expires(self) -> None:
+        repository = self.root / "recovered"
+        repository.mkdir()
+        quickfile.remember_slow_git_scope(str(repository))
+        self.assertIn(str(repository), quickfile.load_slow_git_scopes())
+        with mock.patch.object(quickfile.time, "time",
+                               return_value=quickfile.time.time()
+                               + quickfile.GIT_SLOW_SCOPE_TTL + 1):
+            self.assertEqual(quickfile.load_slow_git_scopes(), {})
 
     def test_inline_text_preview_is_bounded(self) -> None:
         document = self.root / "preview.txt"

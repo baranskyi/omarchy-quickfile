@@ -210,16 +210,12 @@ ShellRoot {
     check(!panel.inspectorOpen,
       "directory navigation left the inspector armed for the next click")
     var panelWindow = objectFinder.findChild(panel, "quickfilePanelWindow")
-    var bladeSlide = objectFinder.findChild(panel, "quickfileBladeSlide")
-    check(panelWindow !== null && panelWindow.width === panel.bladeWidth,
-      "panel animation resized its native surface instead of keeping stable geometry")
-    check(bladeSlide !== null && Math.abs(bladeSlide.x + panel.bladeWidth) < 0.01,
-      "closed panel blade was not translated fully outside its stable surface")
-    var moduleSettings = objectFinder.findChild(panel, "quickfileModuleSettings")
-    check(moduleSettings !== null, "module settings popup was not rendered")
-    moduleSettings.open()
-    check(moduleSettings.visible, "module settings popup did not open")
-    moduleSettings.close()
+    check(panelWindow !== null && !panelWindow.visible,
+      "a closed panel kept its application window mapped")
+    panel.open("{}")
+    check(panelWindow.visible, "opening the panel did not map its application window")
+    panel.close()
+    check(!panelWindow.visible, "closing the panel left its application window mapped")
     select(entry("navigation-draft", "stored"))
     panel.noteDraft = "keep my unsaved note"
     fixture.quickNavEntries = [
@@ -332,10 +328,19 @@ ShellRoot {
     check(fileView !== null, "could not find the rendered file list")
     var panelWindow = objectFinder.findChild(panel, "quickfilePanelWindow")
     var keyScope = objectFinder.findChild(panel, "quickfileKeyScope")
-    check(panelWindow !== null && panelWindow.keyboardFocusOnDemand,
-      "open panel did not settle on non-modal keyboard focus")
+    check(panelWindow !== null && panelWindow.visible,
+      "opening the panel did not map its application window")
     check(keyScope !== null && keyScope.activeFocus,
       "open panel did not activate its keyboard event scope")
+    var blade = objectFinder.findChild(panel, "quickfileBlade")
+    check(blade !== null && blade.width === panelWindow.width
+        && blade.height === panelWindow.height,
+      "panel content did not fill its application window")
+    var moduleSettings = objectFinder.findChild(panel, "quickfileModuleSettings")
+    check(moduleSettings !== null, "module settings popup was not rendered")
+    moduleSettings.open()
+    check(moduleSettings.visible, "module settings popup did not open")
+    moduleSettings.close()
     check(panel.keyboardIndex === 40,
       "opening the panel did not retain the selected file as the keyboard cursor")
     check(panel.handleVerticalNavigationKey(Qt.Key_Down, Qt.NoModifier)

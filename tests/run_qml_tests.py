@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Run QML regression harnesses in isolated, offscreen Quickshell processes.
 
-Panel tests replace only the native layer-shell window wrapper with a plain Qt
-Window in a temporary copy. The production Panel functions, models, controls,
-and delegates run unchanged; compositor placement is outside this test's scope.
+The plugin runs exactly as shipped; compositor placement is outside the scope
+of these tests.
 """
 
 from __future__ import annotations
@@ -23,52 +22,13 @@ DEFAULT_TESTS = ("test_service.qml", "test_panel_state.qml", "test_icon.qml")
 
 
 def prepare_plugin(config: Path, panel_test: bool) -> None:
+    """Mount the real plugin tree for the harness to import.
+
+    The panel is an ordinary application window, so it runs unmodified here —
+    no test-only window adapter, and nothing to keep in step with Panel.qml.
+    """
     plugin = config / "plugin"
-    if not panel_test:
-        plugin.symlink_to(ROOT, target_is_directory=True)
-        return
-
-    plugin.mkdir()
-    for name in ("Service.qml", "components", "bin", "quickfile"):
-        source = ROOT / name
-        if source.exists():
-            (plugin / name).symlink_to(source, target_is_directory=source.is_dir())
-
-    source = (ROOT / "Panel.qml").read_text(encoding="utf-8")
-    start_marker = "    PanelWindow {\n"
-    end_marker = "      onVisibleChanged: {\n"
-    if source.count(start_marker) != 1:
-        raise RuntimeError("PanelWindow test adapter must match exactly one window")
-    start = source.index(start_marker)
-    end = source.index(end_marker, start)
-    wrapper = """    Window {
-      id: window
-      objectName: "quickfilePanelWindow"
-      required property var modelData
-      visible: root.opened || root.revealProgress > 0.001
-      width: root.bladeWidth
-      height: 900
-      color: "transparent"
-      readonly property bool keyboardFocusOnDemand: root.opened && root.focusPrimed
-
-      function claimKeyboardFocus() {
-        if (!root.opened || !visible) return
-        Qt.callLater(function() { keyScope.forceActiveFocus() })
-      }
-
-      function beginFocusPrime() {
-        if (!root.opened || !visible) return
-        root.focusPrimed = false
-        focusPrimeTimer.restart()
-      }
-
-"""
-    adapted = source[:start] + wrapper + source[end:]
-    adapted = adapted.replace(
-        "      onBackingWindowVisibleChanged: beginFocusPrime()\n", "", 1
-    )
-    adapted = adapted.replace("import QtQuick\n", "import QtQuick\nimport QtQuick.Window\n", 1)
-    (plugin / "Panel.qml").write_text(adapted, encoding="utf-8")
+    plugin.symlink_to(ROOT, target_is_directory=True)
 
 
 def run_harness(executable: str, source: Path, timeout: float) -> bool:

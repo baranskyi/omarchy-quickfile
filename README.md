@@ -136,6 +136,29 @@ concept. It does not depend on or copy unreleased FileBlade source code.
 | Double click | Enter directory/open file |
 | Right click | Select and reveal color, note, path, and properties |
 
+The `FILES` strip carries three controls, all sharing one idiom: a left click
+rotates through the options, a right click opens the full list at the pointer.
+The sort chip orders the listing by name (either direction), modification time
+(either direction), size or file type, with folders above files in every
+order; `S` and `Shift+S` do the same from the keyboard. The date chip chooses
+how each row's timestamp reads:
+
+| Chip | Example | Reads |
+|---|---|---|
+| `FULL` | `2026-09-08 10:50` | The whole stamp, always |
+| `ADAPT` | `Sep  8 10:50` · `Nov  2  2025` | Clock time, the year once a file is old |
+| `SMART` | `10:50` · `Yesterday 10:50` · `Tue 13:49` · `8 Sep` | The nearest useful phrasing |
+| `REL` | `20h` · `3d` · `8mo` | Age only |
+| `OFF` | — | No timestamp column |
+
+Hovering a timestamp shows the whole stamp down to the second whatever the
+chip says, so a short format costs no information. Under `OFF` the modification
+time remains on the inspector's Properties tab. Both chips hide during a
+search, where results are ranked by relevance and the timestamp column gives
+way to the match badge. The item count sits in the centre of the bottom bar,
+where an operation's progress or the pending clipboard takes its place while
+there is something to report.
+
 Click the search-mode label to cycle between search modes. Folder chevrons
 expand in place; double-clicking the row changes the tree root. In the
 properties inspector, choose a color, enter a note (`Ctrl+Enter` saves it), or

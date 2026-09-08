@@ -79,6 +79,10 @@ INSPECTOR_TAB_KEYS = set(INSPECTOR_TAB_ORDER)
 # them. Directories stay above files in every one of them.
 SORT_ORDER = ("name", "name-desc", "modified", "modified-asc", "size", "type")
 SORT_ORDERS = set(SORT_ORDER)
+# How the panel renders a row's timestamp, in the order the chip cycles them.
+# Purely a presentation choice: the listing always carries the same mtime.
+DATE_FORMAT = ("full", "adaptive", "smart", "relative", "off")
+DATE_FORMATS = set(DATE_FORMAT)
 ACTIVE_SESSION_PROCESS_LIMIT = 4096
 ACTIVE_SESSION_LIMIT = 64
 ACTIVE_SESSION_AGENTS = {
@@ -523,6 +527,7 @@ def default_settings_store() -> dict[str, Any]:
         "activeSessionsEnabled": False,
         "inspectorTab": "properties",
         "sortOrder": "name",
+        "dateFormat": "full",
         "modules": default_module_layout(),
     }
 
@@ -550,11 +555,15 @@ def load_settings_store() -> dict[str, Any]:
     sort_order = parsed.get("sortOrder", "name")
     if not isinstance(sort_order, str) or sort_order not in SORT_ORDERS:
         raise QuickfileError("Sort order preference is invalid", "settings-invalid")
+    date_format = parsed.get("dateFormat", "full")
+    if not isinstance(date_format, str) or date_format not in DATE_FORMATS:
+        raise QuickfileError("Date format preference is invalid", "settings-invalid")
     return {
         "version": 2,
         "activeSessionsEnabled": active_sessions,
         "inspectorTab": inspector_tab,
         "sortOrder": sort_order,
+        "dateFormat": date_format,
         "modules": normalize_module_layout(parsed.get("modules", default_module_layout())),
     }
 
@@ -605,6 +614,12 @@ def settings_command(args: argparse.Namespace) -> dict[str, Any]:
             raise QuickfileError("Sort order preference is invalid", "settings-invalid")
         changed = changed or store["sortOrder"] != sort_order
         store["sortOrder"] = sort_order
+    date_format = getattr(args, "date_format", None)
+    if date_format is not None:
+        if date_format not in DATE_FORMATS:
+            raise QuickfileError("Date format preference is invalid", "settings-invalid")
+        changed = changed or store["dateFormat"] != date_format
+        store["dateFormat"] = date_format
     module_layout_json = getattr(args, "module_layout_json", None)
     if module_layout_json is not None:
         try:
@@ -4079,6 +4094,7 @@ def parser() -> argparse.ArgumentParser:
     settings.add_argument("--active-sessions", choices=("true", "false"))
     settings.add_argument("--inspector-tab", choices=INSPECTOR_TAB_ORDER)
     settings.add_argument("--sort-order", choices=SORT_ORDER)
+    settings.add_argument("--date-format", choices=DATE_FORMAT)
     settings.add_argument("--module-layout-json")
 
     knowledge_links = subcommands.add_parser(

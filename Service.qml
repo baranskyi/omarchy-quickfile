@@ -133,6 +133,10 @@ Item {
   readonly property var sortOrders: ["name", "name-desc", "modified",
     "modified-asc", "size", "type"]
   property string sortOrder: "name"
+  // How Panel renders a row's timestamp. Presentation only — unlike sortOrder
+  // this never re-runs the listing.
+  readonly property var dateFormats: ["full", "adaptive", "smart", "relative", "off"]
+  property string dateFormat: "full"
   property string query: ""
   property string searchMode: "fuzzy"
   property bool caseSensitive: false
@@ -364,6 +368,22 @@ Item {
     if (index < 0) index = 0
     var count = sortOrders.length
     return setSortOrder(sortOrders[((index + delta) % count + count) % count])
+  }
+
+  function setDateFormat(format) {
+    var value = String(format || "")
+    if (dateFormats.indexOf(value) < 0 || dateFormat === value) return false
+    dateFormat = value
+    if (settingsLoaded) persistSettings()
+    return true
+  }
+
+  function cycleDateFormat(step) {
+    var delta = Number(step) || 1
+    var index = dateFormats.indexOf(dateFormat)
+    if (index < 0) index = 0
+    var count = dateFormats.length
+    return setDateFormat(dateFormats[((index + delta) % count + count) % count])
   }
 
   function rowKey(row) {
@@ -679,6 +699,8 @@ Item {
       sortOrder = storedSort
       Qt.callLater(function() { root.reload() })
     }
+    var storedFormat = String(parsed.settings.dateFormat || "")
+    if (dateFormats.indexOf(storedFormat) >= 0) dateFormat = storedFormat
     applyModuleCollapseFlags()
     settingsLoaded = true
     settingsError = ""
@@ -700,6 +722,7 @@ Item {
       "--active-sessions", activeSessionsEnabled ? "true" : "false",
       "--inspector-tab", inspectorTab,
       "--sort-order", sortOrder,
+      "--date-format", dateFormat,
       "--module-layout-json", JSON.stringify(moduleLayout)]
     settingsSaveProcess.running = true
     return true
@@ -1835,6 +1858,7 @@ Item {
         activeSessions: root.activeSessions.length,
         inspectorTab: root.inspectorTab,
         sortOrder: root.sortOrder,
+        dateFormat: root.dateFormat,
         moduleLayout: root.moduleLayout
       })
     }

@@ -300,6 +300,31 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(reread["settings"]["sortOrder"], "size")
         self.assertFalse(reread["changed"])
 
+    def test_settings_persist_the_chosen_date_format(self) -> None:
+        saved = quickfile.settings_command(argparse.Namespace(
+            active_sessions=None, inspector_tab=None, sort_order=None,
+            date_format="relative", module_layout_json=None,
+        ))
+        self.assertEqual(saved["settings"]["dateFormat"], "relative")
+        reread = quickfile.settings_command(argparse.Namespace(
+            active_sessions=None, inspector_tab=None, sort_order=None,
+            date_format=None, module_layout_json=None,
+        ))
+        self.assertEqual(reread["settings"]["dateFormat"], "relative")
+        self.assertFalse(reread["changed"])
+
+    def test_settings_reject_an_unknown_date_format(self) -> None:
+        with self.assertRaises(quickfile.QuickfileError) as raised:
+            quickfile.settings_command(argparse.Namespace(
+                active_sessions=None, inspector_tab=None, sort_order=None,
+                date_format="whenever", module_layout_json=None,
+            ))
+        self.assertEqual(raised.exception.code, "settings-invalid")
+
+    def test_settings_default_the_date_format_when_absent(self) -> None:
+        store = quickfile.load_settings_store()
+        self.assertEqual(store["dateFormat"], "full")
+
     def test_tree_expands_only_requested_directory(self) -> None:
         token = quickfile.encode_path(str(self.root / "folder"))
         result = quickfile.tree_command(self.tree_args(expanded=[token]))

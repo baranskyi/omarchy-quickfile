@@ -620,15 +620,144 @@ Item {
     } else dismissEditor()
   }
 
-  function shortTime(value) {
-    var text = String(value || "")
-    if (text.length < 16) return text
-    return text.slice(0, 10) + " " + text.slice(11, 16)
-  }
-
   // A file's size rides above its name as a superscript, so the row keeps one
   // line and the eye reads "name^size" without a column of its own. Directories
   // are skipped: their `st_size` is allocation noise, not content.
+  // Bumped by a slow tick while the panel is open so that "5h" and "Yesterday"
+  // stop being lies. Read inside dateLabel purely so every delegate binding
+  // depends on it and re-evaluates when it changes.
+  property int dateTick: 0
+  // Ceiling, not truncation: an int cast loses the fractional pixel and the
+  // widest label in the mode would elide inside the column measured for it.
+  readonly property real dateColumnWidth: Math.ceil(dateWidthProbe.implicitWidth)
+
+  // Never drawn. It exists so every row's timestamp can share one width and
+  // the name column's ellipsis point stops moving from row to row.
+  // "5h" and "Yesterday" go stale on their own. A minute is fine for both:
+  // relative steps no faster than that, and smart only turns over at midnight.
+  Timer {
+    interval: 30000
+    repeat: true
+    triggeredOnStart: true
+    running: root.opened && root.service
+      && ["relative", "smart"].indexOf(String(root.service.dateFormat)) >= 0
+    onTriggered: root.dateTick++
+  }
+
+  Text {
+    id: dateWidthProbe
+    visible: false
+    textFormat: Text.PlainText
+    text: root.dateWidthSample(root.service ? root.service.dateFormat : "")
+    font.family: Style.font.family
+    font.pixelSize: Style.font.bodySmall
+    renderType: Text.NativeRendering
+  }
+
+  // Milliseconds for a row, or NaN. The backend always sends `modifiedEpoch`
+  // alongside the ISO string; the ISO string is the fallback for rows that
+  // predate it (and for test fixtures, whose stamps carry no UTC offset and so
+  // parse as local time — the same instant this panel would print anyway).
+  function entryTime(entry) {
+    if (!entry) return NaN
+    var epoch = Number(entry.modifiedEpoch)
+    if (isFinite(epoch) && epoch > 0) return epoch * 1000
+    // `iso_time` has already converted the components to local wall clock, so
+    // any trailing offset is this machine's own and the parts are read as-is.
+    var parts = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?/
+      .exec(String(entry.modified || ""))
+    if (!parts) return NaN
+    return new Date(Number(parts[1]), Number(parts[2]) - 1, Number(parts[3]),
+      Number(parts[4]), Number(parts[5]), Number(parts[6] || 0)).getTime()
+  }
+
+  function padZero(value) {
+    return (value < 10 ? "0" : "") + value
+  }
+
+  function clockText(date) {
+    return padZero(date.getHours()) + ":" + padZero(date.getMinutes())
+  }
+
+  function isoDateText(date) {
+    return date.getFullYear() + "-" + padZero(date.getMonth() + 1)
+      + "-" + padZero(date.getDate())
+  }
+
+  readonly property var monthNames: ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+  readonly property var dayNames: ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+
+  function startOfDay(date) {
+    return new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime()
+  }
+
+  // The row timestamp. `nowMs` is explicit so the modes can be tested against
+  // a fixed clock instead of whatever today happens to be.
+  function dateLabel(entry, nowMs) {
+    var tick = dateTick
+    var mode = service ? String(service.dateFormat) : "full"
+    if (mode === "off") return ""
+    var time = entryTime(entry)
+    if (!isFinite(time)) return ""
+    var date = new Date(time)
+    if (mode === "full") return isoDateText(date) + " " + clockText(date)
+
+    var clock = Number(nowMs)
+    var now = new Date(isFinite(clock) && clock > 0 ? clock : Date.now())
+    var elapsed = now.getTime() - time
+
+    if (mode === "adaptive") {
+      var stamp = monthNames[date.getMonth()] + " "
+        + (date.getDate() < 10 ? " " : "") + date.getDate() + " "
+      // Half a year is where a clock time stops telling you more than a year
+      // does — the rule `ls -l` has used for decades.
+      return stamp + (elapsed >= 0 && elapsed < 15552000000
+        ? clockText(date) : " " + date.getFullYear())
+    }
+
+    if (mode === "smart") {
+      var days = Math.round((startOfDay(now) - startOfDay(date)) / 86400000)
+      if (days === 0) return clockText(date)
+      if (days === 1) return "Yesterday " + clockText(date)
+      if (days > 1 && days < 7) return dayNames[date.getDay()] + " " + clockText(date)
+      if (date.getFullYear() === now.getFullYear())
+        return date.getDate() + " " + monthNames[date.getMonth()]
+      return monthNames[date.getMonth()] + " " + date.getFullYear()
+    }
+
+    // Relative. Anything still ahead of the clock reads as "now" rather than
+    // as a negative age.
+    if (elapsed < 60000) return "now"
+    var minutes = Math.floor(elapsed / 60000)
+    if (minutes < 60) return minutes + "m"
+    var hours = Math.floor(minutes / 60)
+    if (hours < 24) return hours + "h"
+    var dayCount = Math.floor(hours / 24)
+    if (dayCount < 7) return dayCount + "d"
+    if (dayCount < 30) return Math.floor(dayCount / 7) + "w"
+    if (dayCount < 365) return Math.floor(dayCount / 30) + "mo"
+    return Math.floor(dayCount / 365) + "y"
+  }
+
+  // Always the whole stamp, whatever the mode is showing.
+  function dateTooltip(entry) {
+    var time = entryTime(entry)
+    if (!isFinite(time)) return ""
+    var date = new Date(time)
+    return isoDateText(date) + " " + clockText(date) + ":" + padZero(date.getSeconds())
+  }
+
+  // The widest string the active mode can produce. One reference measurement
+  // for the whole list keeps the name column's ellipsis point still.
+  function dateWidthSample(mode) {
+    var samples = ({ "full": "8888-88-88 88:88", "adaptive": "Sep 88 88:88",
+      "smart": "Yesterday 88:88", "relative": "88mo", "off": "" })
+    var key = String(mode || "")
+    // "off" measures the empty string, so this cannot fall back on falsiness.
+    return samples.hasOwnProperty(key) ? samples[key] : samples["full"]
+  }
+
   function sizeBadge(entry) {
     if (!entry || entry.isDir === true) return ""
     var bytes = Number(entry.size)
@@ -903,6 +1032,28 @@ Item {
       { value: "type", label: "Type  folders first" }]
   }
 
+  function dateFormatOptions() {
+    return [{ value: "full", label: "Full  2026-09-08 10:50" },
+      { value: "adaptive", label: "Adaptive  Sep  8 10:50" },
+      { value: "smart", label: "Smart  Yesterday 10:50" },
+      { value: "relative", label: "Relative  20h" },
+      { value: "off", label: "Off  no column" }]
+  }
+
+  function dateChipLabel(mode) {
+    var labels = ({ "full": "FULL", "adaptive": "ADAPT", "smart": "SMART",
+      "relative": "REL", "off": "OFF" })
+    return labels[String(mode || "")] || "FULL"
+  }
+
+  function dateTooltipForChip(mode) {
+    var names = ({ "full": "Full date and time", "adaptive": "Date, year when old",
+      "smart": "Relative day, exact time", "relative": "Age only",
+      "off": "No timestamp column" })
+    return (names[String(mode || "")] || "Full date and time")
+      + "  ·  click to rotate, right click to pick"
+  }
+
   function cycleSearchMode(step) {
     if (!service) return false
     var options = searchModeOptions()
@@ -924,19 +1075,24 @@ Item {
 
   function choiceActiveValue() {
     if (!service) return ""
-    return choiceKind === "sort" ? String(service.sortOrder) : String(service.searchMode)
+    return choiceKind === "sort" ? String(service.sortOrder)
+      : choiceKind === "date-format" ? String(service.dateFormat)
+      : String(service.searchMode)
   }
 
   function applyChoice(value) {
     if (choiceKind === "sort") {
       if (service) service.setSortOrder(String(value))
+    } else if (choiceKind === "date-format") {
+      if (service) service.setDateFormat(String(value))
     } else applySearchMode(value)
   }
 
   function openChoiceMenu(kind, source, pointX, pointY) {
     if (!service || !source) return
     choiceKind = String(kind)
-    choiceOptions = choiceKind === "sort" ? sortOptions() : searchModeOptions()
+    choiceOptions = choiceKind === "sort" ? sortOptions()
+      : choiceKind === "date-format" ? dateFormatOptions() : searchModeOptions()
     var point = source.mapToItem(keyScope, pointX, pointY)
     choiceMenu.requestedX = point.x
     choiceMenu.requestedY = point.y
@@ -2964,21 +3120,49 @@ Item {
             font.bold: true
             renderType: Text.NativeRendering
           }
-          Text {
-            textFormat: Text.PlainText
-            id: contextCount
+          // The timestamp column is hidden during a search, so its format
+          // control goes with it — the same rule the sort chip follows.
+          Rectangle {
+            id: dateFormatButton
+            objectName: "quickfileDateFormatButton"
+            visible: root.service && root.service.query === ""
             anchors.right: parent.right
             anchors.rightMargin: Style.space(12)
             anchors.verticalCenter: parent.verticalCenter
-            text: !root.service ? ""
-              : root.service.selectedTokens.length > 1
-                ? root.service.selectedTokens.length + " selected"
-                : (root.service.entries.length + (root.service.truncated ? "+" : "") + " items")
-                  + (root.service.query !== "" && root.service.searchEngine === "rg" ? " · rg" : "")
-            color: root.muted
-            font.family: Style.font.family
-            font.pixelSize: Style.font.bodySmall
-            renderType: Text.NativeRendering
+            width: dateFormatText.implicitWidth + Style.space(12)
+            height: Style.space(19)
+            radius: Style.cornerRadius > 0 ? Style.space(4) : 0
+            color: dateFormatMouse.containsMouse ? Style.hoverFill : "transparent"
+
+            Text {
+              textFormat: Text.PlainText
+              id: dateFormatText
+              objectName: "quickfileDateFormatLabel"
+              anchors.centerIn: parent
+              text: "󰅐 " + root.dateChipLabel(root.service ? root.service.dateFormat : "")
+              color: dateFormatMouse.containsMouse ? root.accent : root.muted
+              font.family: Style.font.family
+              font.pixelSize: Style.font.bodySmall
+              renderType: Text.NativeRendering
+            }
+
+            MouseArea {
+              id: dateFormatMouse
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              acceptedButtons: Qt.LeftButton | Qt.RightButton
+              onClicked: function(event) {
+                if (!root.service) return
+                if (event.button === Qt.RightButton)
+                  root.openChoiceMenu("date-format", dateFormatMouse, event.x, event.y)
+                else root.service.cycleDateFormat(1)
+              }
+            }
+
+            ToolTip.visible: dateFormatMouse.containsMouse && !choiceMenu.visible
+            ToolTip.text: root.dateTooltipForChip(root.service ? root.service.dateFormat : "")
+            ToolTip.delay: 400
           }
 
           // Search results are ranked by relevance, so the order only means
@@ -2987,7 +3171,7 @@ Item {
             id: sortButton
             objectName: "quickfileSortButton"
             visible: root.service && root.service.query === ""
-            anchors.right: contextCount.left
+            anchors.right: dateFormatButton.left
             anchors.rightMargin: Style.space(10)
             anchors.verticalCenter: parent.verticalCenter
             width: sortText.implicitWidth + Style.space(12)
@@ -3085,21 +3269,36 @@ Item {
               ? moduleSettingsPopup.close() : moduleSettingsPopup.open()
           }
 
+          // One centred slot. What the folder holds is the resting state; an
+          // operation, a pending clipboard or the last action's message takes
+          // the slot while it has something to say, then hands it back.
           Text {
             textFormat: Text.PlainText
-            anchors.left: footerActions.right
-            anchors.right: footerSettings.left
-            anchors.leftMargin: Style.space(5)
-            anchors.rightMargin: Style.space(6)
-            anchors.verticalCenter: parent.verticalCenter
-            horizontalAlignment: Text.AlignRight
-            text: !root.service ? ""
+            objectName: "quickfileFooterStatus"
+            readonly property string activity: !root.service ? ""
               : root.service.operationBusy ? root.operationStatus()
               : root.service.actionBusy ? "Working…"
               : root.service.clipboardToken !== ""
                 ? ((root.service.clipboardMode === "cut" ? "Cut: " : "Copy: ")
                   + root.service.clipboardName)
-                : root.service.actionMessage
+                : String(root.service.actionMessage || "")
+            readonly property string tally: !root.service ? ""
+              : root.service.selectedTokens.length > 1
+                ? root.service.selectedTokens.length + " selected"
+                : (root.service.entries.length + (root.service.truncated ? "+" : "") + " items")
+                  + (root.service.query !== "" && root.service.searchEngine === "rg" ? " · rg" : "")
+            // Centred on the panel, not on the gap: the icon row grows and
+            // shrinks with the Undo button, and a label centred in the
+            // leftovers would drift with it. Width is capped by whichever
+            // side it would reach first, so it can never run under either.
+            readonly property real slot: Math.max(0, Math.min(
+              parent.width - 2 * (footerActions.x + footerActions.width + Style.space(8)),
+              2 * (footerSettings.x - Style.space(8)) - parent.width))
+            anchors.horizontalCenter: parent.horizontalCenter
+            anchors.verticalCenter: parent.verticalCenter
+            width: Math.min(implicitWidth, slot)
+            horizontalAlignment: Text.AlignHCenter
+            text: activity !== "" ? activity : tally
             color: root.muted
             elide: Text.ElideMiddle
             font.family: Style.font.family
@@ -4170,12 +4369,20 @@ Item {
               }
               Text {
                 textFormat: Text.PlainText
-                visible: !root.service || root.service.query === ""
-                text: root.shortTime(fileRow.modelData.modified)
+                id: rowTimestamp
+                objectName: "quickfileRowTimestamp"
+                visible: (!root.service || root.service.query === "")
+                  && root.dateColumnWidth > 0
+                width: root.dateColumnWidth
+                horizontalAlignment: Text.AlignRight
+                text: root.dateLabel(fileRow.modelData)
                 color: root.muted
                 font.family: Style.font.family
                 font.pixelSize: Style.font.bodySmall
                 renderType: Text.NativeRendering
+                // A label wider than the reserved column elides into itself
+                // rather than painting out over the git letter beside it.
+                elide: Text.ElideLeft
               }
             }
 
@@ -4207,10 +4414,19 @@ Item {
               // The name is elided in the middle to keep the row compact, which
               // hides exactly the part that distinguishes one build artefact
               // from the next. Reveal the whole name on hover, but only when it
-              // does not already fit.
-              ToolTip.visible: containsMouse && fileNameLabel.truncated
+              // does not already fit. Over the timestamp it shows the whole
+              // stamp instead: the short formats drop precision from the row,
+              // not from the panel. Both hang off this one hover-accepting
+              // item — a second one inside `fileMeta` would paint above it and
+              // take the row's own hover with it.
+              readonly property bool overTimestamp: rowTimestamp.visible
+                && mouseX >= fileMeta.x + rowTimestamp.x
+              readonly property string stampTooltip:
+                root.dateTooltip(fileRow.modelData)
+              ToolTip.visible: containsMouse && (overTimestamp
+                ? stampTooltip !== "" : fileNameLabel.truncated)
               ToolTip.delay: 450
-              ToolTip.text: fileNameLabel.hoverTooltip
+              ToolTip.text: overTimestamp ? stampTooltip : fileNameLabel.hoverTooltip
             }
 
             DragHandler {

@@ -46,6 +46,12 @@ ShellRoot {
       modelChanged()
       return true
     }
+    function setDateFormat(format) {
+      if (dateFormats.indexOf(String(format)) < 0 || dateFormat === String(format))
+        return false
+      dateFormat = String(format)
+      return true
+    }
     function setSortOrder(order) {
       if (sortOrders.indexOf(String(order)) < 0 || sortOrder === String(order))
         return false
@@ -436,6 +442,209 @@ ShellRoot {
       "rotating backwards through the search modes did not wrap")
     fixture.searchMode = "fuzzy"
     fixture.setSortOrder("name")
+  }
+
+  function dateFormatChecks() {
+    // A fixed clock: 2026-09-09 14:00 local. Every expectation below is an
+    // offset from it, so the assertions do not rot with the calendar.
+    var now = new Date(2026, 8, 9, 14, 0, 0).getTime()
+    function at(msAgo) { return ({ modifiedEpoch: (now - msAgo) / 1000 }) }
+    var minute = 60000, hour = 3600000, day = 86400000
+
+    fixture.dateFormat = "full"
+    check(panel.dateLabel(at(0), now) === "2026-09-09 14:00",
+      "the full format stopped producing the stamp it always has")
+    check(panel.dateLabel(at(300 * day), now) === "2025-11-13 14:00",
+      "the full format changed shape for an old file")
+
+    fixture.dateFormat = "adaptive"
+    check(panel.dateLabel(at(0), now) === "Sep  9 14:00",
+      "adaptive did not pad a single-digit day to a fixed width")
+    check(panel.dateLabel(at(2 * day), now) === "Sep  7 14:00",
+      "adaptive dropped the clock time from a recent file")
+    check(panel.dateLabel(at(300 * day), now) === "Nov 13  2025",
+      "adaptive did not swap the clock for the year past six months")
+
+    fixture.dateFormat = "smart"
+    check(panel.dateLabel(at(3 * hour), now) === "11:00",
+      "smart showed more than the clock for a file touched today")
+    check(panel.dateLabel(at(28 * hour), now) === "Yesterday 10:00",
+      "smart did not name yesterday")
+    check(panel.dateLabel(at(3 * day), now) === "Sun 14:00",
+      "smart did not name the weekday inside the last week")
+    check(panel.dateLabel(at(30 * day), now) === "10 Aug",
+      "smart kept a weekday past the week, or dropped the day of the month")
+    check(panel.dateLabel(at(300 * day), now) === "Nov 2025",
+      "smart did not fall back to month and year for another year")
+
+    fixture.dateFormat = "relative"
+    check(panel.dateLabel(at(0), now) === "now"
+        && panel.dateLabel(at(-hour), now) === "now",
+      "relative did not collapse the present, or read a future file as negative")
+    check(panel.dateLabel(at(12 * minute), now) === "12m"
+        && panel.dateLabel(at(5 * hour), now) === "5h"
+        && panel.dateLabel(at(3 * day), now) === "3d"
+        && panel.dateLabel(at(14 * day), now) === "2w"
+        && panel.dateLabel(at(240 * day), now) === "8mo"
+        && panel.dateLabel(at(800 * day), now) === "2y",
+      "a relative step did not produce its unit")
+
+    // Unit boundaries: each step must flip exactly where it claims to.
+    check(panel.dateLabel(at(24 * hour), now) === "1d"
+        && panel.dateLabel(at(24 * hour - minute), now) === "23h",
+      "the hour-to-day boundary is off")
+    check(panel.dateLabel(at(7 * day), now) === "1w"
+        && panel.dateLabel(at(7 * day - minute), now) === "6d",
+      "the day-to-week boundary is off")
+    check(panel.dateLabel(at(30 * day), now) === "1mo"
+        && panel.dateLabel(at(30 * day - minute), now) === "4w",
+      "the week-to-month boundary is off")
+    check(panel.dateLabel(at(365 * day), now) === "1y"
+        && panel.dateLabel(at(365 * day - minute), now) === "12mo",
+      "the month-to-year boundary is off")
+
+    fixture.dateFormat = "adaptive"
+    check(panel.dateLabel(at(179 * day), now).indexOf(":") > 0,
+      "adaptive dropped the clock time inside six months")
+    check(panel.dateLabel(at(181 * day), now).indexOf(":") < 0,
+      "adaptive kept the clock time past six months")
+
+    fixture.dateFormat = "smart"
+    check(panel.dateLabel(at(6 * day), now).indexOf(":") > 0
+        && panel.dateLabel(at(6 * day), now).length <= 9,
+      "smart lost the weekday form on the sixth day")
+    check(panel.dateLabel(at(7 * day), now) === "2 Sep",
+      "smart kept a weekday on the seventh day")
+
+    // Files dated in the future must not read as negative ages.
+    fixture.dateFormat = "relative"
+    check(panel.dateLabel(at(-30 * day), now) === "now",
+      "a file dated in the future produced a negative age")
+    fixture.dateFormat = "adaptive"
+    check(panel.dateLabel(at(-30 * day), now).indexOf(":") < 0,
+      "adaptive gave a future file a clock time it cannot mean")
+
+    fixture.dateFormat = "off"
+    check(panel.dateLabel(at(hour), now) === "",
+      "the off format still produced a label")
+
+    // Rows that carry no usable time must not print one, in any mode.
+    for (var i = 0; i < fixture.dateFormats.length; i++) {
+      fixture.dateFormat = fixture.dateFormats[i]
+      check(panel.dateLabel({}, now) === "" && panel.dateLabel(null, now) === ""
+          && panel.dateLabel({ modified: "not a date" }, now) === "",
+        fixture.dateFormats[i] + " invented a timestamp for a row that has none")
+    }
+
+    // The ISO string is the fallback for rows without an epoch — the shape
+    // every test fixture in this file uses.
+    fixture.dateFormat = "full"
+    check(panel.dateLabel({ modified: "2026-09-05T09:00:00" }, now) === "2026-09-05 09:00",
+      "a row with only an ISO stamp lost its timestamp")
+    check(panel.dateTooltip({ modified: "2026-09-05T09:00:33" }) === "2026-09-05 09:00:33",
+      "the hover tooltip did not carry the whole stamp")
+    check(panel.dateTooltip({}) === "", "the tooltip invented a stamp")
+
+    // Epoch and ISO must name the same instant, or the same file would read
+    // differently depending on which field survived.
+    var moment = new Date(2026, 8, 5, 9, 0, 0)
+    var formats = fixture.dateFormats
+    for (var m = 0; m < formats.length; m++) {
+      fixture.dateFormat = formats[m]
+      check(panel.dateLabel({ modifiedEpoch: moment.getTime() / 1000 }, now)
+          === panel.dateLabel({ modified: "2026-09-05T09:00:00+04:00" }, now),
+        formats[m] + " read the epoch and the ISO stamp as different instants")
+    }
+
+    // The column is measured once for the whole list, so the name column's
+    // ellipsis point cannot move from row to row.
+    var widths = ({})
+    for (var f = 0; f < fixture.dateFormats.length; f++) {
+      fixture.dateFormat = fixture.dateFormats[f]
+      widths[fixture.dateFormats[f]] = panel.dateColumnWidth
+    }
+    check(widths["off"] === 0, "the off format still reserved column width")
+    check(widths["relative"] < widths["smart"]
+        && widths["smart"] < widths["full"],
+      "the reserved column width did not follow the length of the format")
+    fixture.dateFormat = "full"
+  }
+
+  function dateChipChecks() {
+    var chip = objectFinder.findChild(panel, "quickfileDateFormatButton")
+    var label = objectFinder.findChild(panel, "quickfileDateFormatLabel")
+    check(chip !== null && label !== null, "could not find the date format chip")
+    check(chip.visible && label.text.indexOf("FULL") >= 0,
+      "the chip did not show the active format")
+
+    fixture.cycleDateFormat(1)
+    check(fixture.dateFormat === "adaptive" && label.text.indexOf("ADAPT") >= 0,
+      "clicking the chip did not advance the format or its label")
+    fixture.cycleDateFormat(-1)
+    check(fixture.dateFormat === "full", "cycling back did not return the format")
+    fixture.cycleDateFormat(-1)
+    check(fixture.dateFormat === "off", "cycling back from the first did not wrap")
+
+    panel.openChoiceMenu("date-format", chip, 4, 4)
+    check(panel.choiceOptions.length === fixture.dateFormats.length,
+      "the picker did not offer every date format")
+    check(panel.choiceActiveValue() === "off",
+      "the picker did not mark the format that is in force")
+    panel.applyChoice("smart")
+    check(fixture.dateFormat === "smart",
+      "picking a format from the list did not apply it")
+    objectFinder.findChild(panel, "quickfileChoiceMenu").close()
+
+    var timestamp = objectFinder.findChild(fileView.itemAtIndex(0), "quickfileRowTimestamp")
+    var second = objectFinder.findChild(fileView.itemAtIndex(1), "quickfileRowTimestamp")
+    check(timestamp !== null && timestamp.visible,
+      "the row lost its timestamp while a format was active")
+
+    // The whole point of the reserved column: two rows in the same mode must
+    // reserve the same width, or the name's ellipsis point moves row to row.
+    fixture.dateFormat = "smart"
+    check(second !== null && timestamp.width === second.width,
+      "two rows reserved different widths for the same format")
+    var wide = timestamp.width
+    fixture.dateFormat = "relative"
+    check(timestamp.width < wide,
+      "the reserved width did not shrink with a shorter format")
+
+    // The row keeps its own hover: a hover-accepting item over the timestamp
+    // would take the row fill, the star and the hovered token with it.
+    check(objectFinder.findChild(timestamp, "quickfileRowTimestampMouse") === null,
+      "the timestamp grew its own hover target and stole the row's")
+
+    fixture.dateFormat = "full"
+    fixture.dateFormat = "off"
+    check(!timestamp.visible, "the off format left the column drawn")
+
+    fixture.dateFormat = "full"
+    fixture.query = "row"
+    check(!chip.visible,
+      "the chip stayed visible over a search, where the column is hidden")
+    check(!timestamp.visible,
+      "the row timestamp reappeared during a search")
+    fixture.query = ""
+  }
+
+  function footerChecks() {
+    var footer = objectFinder.findChild(panel, "quickfileFooterStatus")
+    check(footer !== null, "could not find the footer status label")
+    check(footer.text.indexOf("items") >= 0,
+      "the footer did not take over the item count")
+
+    fixture.selectedTokens = [fixture.entries[0].token, fixture.entries[1].token]
+    check(footer.text === "2 selected",
+      "the footer did not report a multi-selection")
+    fixture.selectedTokens = [fixture.entries[0].token]
+
+    fixture.actionMessage = "Renamed"
+    check(footer.text === "Renamed",
+      "an action message did not take the centre slot from the count")
+    fixture.actionMessage = ""
+    check(footer.text.indexOf("items") >= 0,
+      "the count did not come back when the message cleared")
   }
 
   function sizeBadgeChecks() {
@@ -859,7 +1068,20 @@ ShellRoot {
   function captureIfRequested() {
     if (!Quickshell.env("QUICKFILE_PANEL_SCREENSHOT")) return false
     var mode = String(Quickshell.env("QUICKFILE_PANEL_SCREENSHOT_MODE") || "preview")
-    if (mode === "quick-nav") panel.openQuickNav()
+    if (mode.indexOf("date-") === 0) {
+      fixture.dateFormat = mode.substring(5)
+      var spread = fixture.entries.slice()
+      // Spread the rows across today, this week, this year and last year so a
+      // screenshot shows every branch of the format at once.
+      var steps = [0, 3600000, 28 * 3600000, 3 * 86400000, 30 * 86400000,
+        300 * 86400000]
+      for (var i = 0; i < spread.length; i++) {
+        spread[i] = Object.assign({}, spread[i], {
+          modifiedEpoch: (Date.now() - steps[i % steps.length]) / 1000 })
+        fixture.entriesModel.set(i, { rowData: spread[i], scope: "" })
+      }
+      fixture.entries = spread
+    } else if (mode === "quick-nav") panel.openQuickNav()
     else if (mode === "conflict" || mode === "conflict-replace") {
       fixture.pendingOperation = { kind: "copy", tokens: ["source"] }
       fixture.conflictRequested([{ name: "report.txt", sourceKind: "file", targetKind: "file",
@@ -881,6 +1103,9 @@ ShellRoot {
         testRoot.searchFocusChecks()
         testRoot.sortChecks()
         testRoot.choiceMenuChecks()
+        testRoot.dateFormatChecks()
+        testRoot.dateChipChecks()
+        testRoot.footerChecks()
         if (testRoot.captureIfRequested()) return
         console.log("QUICKFILE_TESTS_PASSED panel-state " + testRoot.assertions + " assertions")
       } catch (error) {

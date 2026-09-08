@@ -128,6 +128,11 @@ Item {
   property string clipboardName: ""
   property var expandedTokens: []
   property bool showHidden: false
+  // Listing order, persisted with the other panel preferences. Search results
+  // keep their relevance ranking, so this only shapes the folder tree.
+  readonly property var sortOrders: ["name", "name-desc", "modified",
+    "modified-asc", "size", "type"]
+  property string sortOrder: "name"
   property string query: ""
   property string searchMode: "fuzzy"
   property bool caseSensitive: false
@@ -344,6 +349,23 @@ Item {
     return true
   }
 
+  function setSortOrder(order) {
+    var value = String(order || "")
+    if (sortOrders.indexOf(value) < 0 || sortOrder === value) return false
+    sortOrder = value
+    if (settingsLoaded) persistSettings()
+    reload()
+    return true
+  }
+
+  function cycleSortOrder(step) {
+    var delta = Number(step) || 1
+    var index = sortOrders.indexOf(sortOrder)
+    if (index < 0) index = 0
+    var count = sortOrders.length
+    return setSortOrder(sortOrders[((index + delta) % count + count) % count])
+  }
+
   function rowKey(row) {
     return String(row.token || row.device || row.sessionKey || "")
   }
@@ -494,6 +516,8 @@ Item {
     rootArgument(command)
     if (showHidden) command.push("--show-hidden")
     if (trimmed === "") {
+      command.push("--sort")
+      command.push(sortOrder)
       for (var i = 0; i < expandedTokens.length; i++) {
         command.push("--expanded")
         command.push(String(expandedTokens[i]))
@@ -650,6 +674,11 @@ Item {
     inspectorTab = ["properties", "notes", "git"].indexOf(
       String(parsed.settings.inspectorTab || "")) >= 0
       ? String(parsed.settings.inspectorTab) : "properties"
+    var storedSort = String(parsed.settings.sortOrder || "")
+    if (sortOrders.indexOf(storedSort) >= 0 && storedSort !== sortOrder) {
+      sortOrder = storedSort
+      Qt.callLater(function() { root.reload() })
+    }
     applyModuleCollapseFlags()
     settingsLoaded = true
     settingsError = ""
@@ -670,6 +699,7 @@ Item {
     settingsSaveProcess.command = ["/usr/bin/env", "python3", cliPath, "settings",
       "--active-sessions", activeSessionsEnabled ? "true" : "false",
       "--inspector-tab", inspectorTab,
+      "--sort-order", sortOrder,
       "--module-layout-json", JSON.stringify(moduleLayout)]
     settingsSaveProcess.running = true
     return true
@@ -1804,6 +1834,7 @@ Item {
         activeSessionsEnabled: root.activeSessionsEnabled,
         activeSessions: root.activeSessions.length,
         inspectorTab: root.inspectorTab,
+        sortOrder: root.sortOrder,
         moduleLayout: root.moduleLayout
       })
     }

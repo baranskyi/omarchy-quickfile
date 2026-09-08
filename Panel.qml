@@ -47,6 +47,11 @@ Item {
   property var knowledgeAgentsBaseline: []
   property var metadataSavePending: null
   property var keyboardSnapshot: null
+  // Where the cursor sat when the user pressed "/". Escape puts it back there
+  // rather than leaving them wherever the search results happened to land.
+  property string searchReturnToken: ""
+  property string pendingCursorToken: ""
+  property bool pendingCursorRequested: false
   readonly property bool noteDirty: noteDraft !== noteBaseline
   readonly property bool colorDirty: colorDraft !== colorBaseline
   readonly property bool knowledgeRegistrationDirty:
@@ -614,7 +619,25 @@ Item {
   function shortTime(value) {
     var text = String(value || "")
     if (text.length < 16) return text
-    return text.slice(5, 10) + " " + text.slice(11, 16)
+    return text.slice(0, 10) + " " + text.slice(11, 16)
+  }
+
+  // A file's size rides above its name as a superscript, so the row keeps one
+  // line and the eye reads "name^size" without a column of its own. Directories
+  // are skipped: their `st_size` is allocation noise, not content.
+  function sizeBadge(entry) {
+    if (!entry || entry.isDir === true) return ""
+    var bytes = Number(entry.size)
+    if (!isFinite(bytes) || bytes < 0) return ""
+    var units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    var index = 0
+    while (bytes >= 1024 && index < units.length - 1) {
+      bytes /= 1024
+      index++
+    }
+    var amount = index === 0 || bytes >= 10
+      ? String(Math.round(bytes)) : bytes.toFixed(1)
+    return amount + units[index]
   }
 
   function compactTokens(value) {
@@ -847,6 +870,79 @@ Item {
     return true
   }
 
+  // Every "give the keyboard back to the list" path goes through here so the
+  // focus lands on the sink rather than on the scope's remembered text child.
+  function focusList() {
+    listFocus.forceActiveFocus()
+  }
+
+  function sortLabel(order) {
+    var labels = ({ "name": "A→Z", "name-desc": "Z→A", "modified": "NEW",
+      "modified-asc": "OLD", "size": "SIZE", "type": "TYPE" })
+    return labels[String(order || "")] || "A→Z"
+  }
+
+  function sortTooltip(order) {
+    var names = ({ "name": "Name A→Z", "name-desc": "Name Z→A",
+      "modified": "Newest first", "modified-asc": "Oldest first",
+      "size": "Largest first", "type": "File type, folders first" })
+    return (names[String(order || "")] || "Name A→Z")
+      + "  ·  S next, Shift+S previous"
+  }
+
+  function isTypingKey(event) {
+    if (!event) return false
+    if ((event.modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier)) !== 0)
+      return false
+    var text = String(event.text || "")
+    return text.length > 0 && text.charCodeAt(0) >= 0x20 && text !== "\u007f"
+  }
+
+  function beginSearch() {
+    searchReturnToken = service ? String(service.selectedToken || "") : ""
+    searchField.forceActiveFocus()
+    searchField.selectAll()
+  }
+
+  // Leaves search and asks for the pre-search row back. The listing reloads
+  // asynchronously, so the cursor is parked and applied when rows arrive.
+  function endSearch() {
+    var hadQuery = searchField.text !== ""
+      || (service && String(service.query || "") !== "")
+    searchField.clear()
+    // Park the cursor before the reload starts: the listing can come back
+    // before this function returns.
+    pendingCursorToken = searchReturnToken
+    pendingCursorRequested = true
+    searchReturnToken = ""
+    focusList()
+    if (service && hadQuery) service.setSearch("", service.searchMode)
+    else applyPendingCursor()
+  }
+
+  function applyPendingCursor() {
+    if (!pendingCursorRequested || !service) return
+    pendingCursorRequested = false
+    var wanted = pendingCursorToken
+    pendingCursorToken = ""
+    if (service.entries.length === 0) {
+      keyboardIndex = -1
+      return
+    }
+    var index = 0
+    if (wanted !== "") {
+      for (var i = 0; i < service.entries.length; i++) {
+        if (String(service.entries[i].token || "") === wanted) {
+          index = i
+          break
+        }
+      }
+    }
+    keyboardIndex = index
+    service.selectIndex(index)
+    keyboardNavigationRequested(index)
+  }
+
   function rememberKeyboardCursor() {
     keyboardSnapshot = service && keyboardIndex >= 0
       && keyboardIndex < service.entries.length
@@ -910,6 +1006,19 @@ Item {
     return label
   }
 
+  // The confirmation dialogs that carry no text field used to be reachable
+  // only with the mouse: the dialog swallowed every key but Escape, so a
+  // Delete that raised "Move to Trash?" could not be finished from the
+  // keyboard. Mirrors the confirm button's own visibility and enabled state.
+  function editorConfirmEnabled() {
+    if (!service || service.actionBusy) return false
+    if (["", "trash-browser", "quick-nav", "drop-choice", "conflict"]
+      .indexOf(editorMode) >= 0) return false
+    if (editorMode === "knowledge-links")
+      return !!service.knowledgeLinkPlan && service.knowledgeLinkPlan.createCount > 0
+    return true
+  }
+
   function commitEditor() {
     if (!service) return
     if (editorMode === "conflict-replace") {
@@ -957,6 +1066,7 @@ Item {
     }
     function onModelChanged() {
       root.restoreKeyboardCursor()
+      root.applyPendingCursor()
       if (root.hoveredToken !== ""
           && !root.service.visibleEntryForToken(root.hoveredToken))
         root.hoveredToken = ""
@@ -1295,7 +1405,7 @@ Item {
         // The surface is mapped but its children have not finished layout;
         // give Qt an active-focus target inside the window on the next tick so
         // the key handlers below receive the very first keystroke.
-        Qt.callLater(function() { keyScope.forceActiveFocus() })
+        Qt.callLater(function() { root.focusList() })
         activationTimer.restart()
         return
       }
@@ -1343,6 +1453,12 @@ Item {
           favorites: favoritesModule.height,
           knowledge: knowledgeModule.height
         })
+        // Focusing the scope itself hands focus back to whichever child it
+        // delegated to last — after one visit to the search field that meant
+        // every later keystroke landed in search. This sink is the scope's
+        // focus child instead, so the list keeps a target that eats no text.
+        Item { id: listFocus; objectName: "quickfileListFocus"; focus: true }
+
         Keys.priority: Keys.BeforeItem
         Keys.onPressed: function(event) {
           if (root.editorMode !== "") return
@@ -1354,8 +1470,7 @@ Item {
           if (noteEditor.activeFocus || pathField.activeFocus || previewText.activeFocus) return
           if (searchField.activeFocus) {
             if (event.key === Qt.Key_Escape) {
-              if (searchField.text !== "") searchField.clear()
-              else keyScope.forceActiveFocus()
+              root.endSearch()
               event.accepted = true
             } else if ((event.key === Qt.Key_Up || event.key === Qt.Key_Down)
                 && root.handleVerticalNavigationKey(event.key, event.modifiers)) {
@@ -1416,8 +1531,13 @@ Item {
             event.accepted = true
           } else if (event.key === Qt.Key_Slash
               || (event.key === Qt.Key_F && event.modifiers & Qt.ControlModifier)) {
-            searchField.forceActiveFocus()
-            searchField.selectAll()
+            root.beginSearch()
+            event.accepted = true
+          } else if (event.key === Qt.Key_S && root.service
+              && (event.modifiers
+                & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier)) === 0) {
+            root.service.cycleSortOrder(
+              (event.modifiers & Qt.ShiftModifier) !== 0 ? -1 : 1)
             event.accepted = true
           } else if (event.key === Qt.Key_Period) {
             root.service.setShowHidden(!root.service.showHidden)
@@ -1432,6 +1552,11 @@ Item {
             // to Delete/Backspace; the browser itself is still the only way back
             // from a mistaken delete, so it keeps a key of its own.
             root.openTrashBrowser()
+            event.accepted = true
+          } else if (root.isTypingKey(event)) {
+            // "/" is the only way into search. Swallow the rest of the
+            // printable keys so a stray keystroke cannot land in a text field,
+            // and so plain letters stay available as future shortcuts.
             event.accepted = true
           }
         }
@@ -1798,6 +1923,7 @@ Item {
 
           TextField {
             id: searchField
+            objectName: "quickfileSearchField"
             anchors.left: parent.left
             anchors.leftMargin: Style.space(29)
             anchors.right: searchModeButton.left
@@ -1805,13 +1931,54 @@ Item {
             anchors.verticalCenter: parent.verticalCenter
             height: parent.height
             color: root.foreground
-            placeholderText: "Search files…"
-            placeholderTextColor: Qt.alpha(root.muted, 0.78)
+            // The hint below replaces the placeholder: it has to show the key
+            // that opens search, which plain placeholder text cannot draw.
+            placeholderText: ""
             selectByMouse: true
             font.family: Style.font.family
             font.pixelSize: root.primaryFontSize
             background: Item {}
             onTextEdited: searchDebounce.restart()
+          }
+
+          Row {
+            id: searchHint
+            visible: searchField.text === "" && !searchField.activeFocus
+            anchors.left: parent.left
+            anchors.leftMargin: Style.space(29)
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.space(6)
+
+            Rectangle {
+              id: searchHintKey
+              width: Math.max(Style.space(18), hintKeyText.implicitWidth + Style.space(9))
+              height: Style.space(18)
+              anchors.verticalCenter: parent.verticalCenter
+              radius: Style.space(4)
+              color: Qt.alpha(root.foreground, 0.06)
+              border.width: Math.max(1, Style.normalBorderWidth)
+              border.color: Qt.alpha(root.muted, 0.5)
+              Text {
+                textFormat: Text.PlainText
+                id: hintKeyText
+                anchors.centerIn: parent
+                text: "/"
+                color: root.muted
+                font.family: Style.font.family
+                font.pixelSize: Style.font.bodySmall
+                renderType: Text.NativeRendering
+              }
+            }
+
+            Text {
+              textFormat: Text.PlainText
+              anchors.verticalCenter: parent.verticalCenter
+              text: "to search"
+              color: Qt.alpha(root.muted, 0.78)
+              font.family: Style.font.family
+              font.pixelSize: root.primaryFontSize
+              renderType: Text.NativeRendering
+            }
           }
 
           Rectangle {
@@ -2186,7 +2353,7 @@ Item {
               onClicked: {
                 root.keyboardIndex = -1
                 root.service.openVolume(deviceRow.modelData)
-                keyScope.forceActiveFocus()
+                root.focusList()
               }
             }
             Components.IconButton {
@@ -2372,7 +2539,7 @@ Item {
                 root.service.selectFavorite(favoriteRow.modelData,
                   event.button === Qt.RightButton && favoriteRow.persistentSelected
                     ? "focus" : root.pointerSelectionMode(event.modifiers))
-                keyScope.forceActiveFocus()
+                root.focusList()
                 if (event.button === Qt.RightButton) root.inspectorOpen = true
               }
               onDoubleClicked: root.service.enterEntry(favoriteRow.modelData)
@@ -2607,7 +2774,7 @@ Item {
                 root.service.selectKnowledge(knowledgeRow.modelData,
                   event.button === Qt.RightButton && knowledgeRow.persistentSelected
                     ? "focus" : root.pointerSelectionMode(event.modifiers))
-                keyScope.forceActiveFocus()
+                root.focusList()
                 if (event.button === Qt.RightButton) root.inspectorOpen = true
               }
               onDoubleClicked: root.service.enterEntry(knowledgeRow.modelData)
@@ -2660,6 +2827,7 @@ Item {
           }
           Text {
             textFormat: Text.PlainText
+            id: contextCount
             anchors.right: parent.right
             anchors.rightMargin: Style.space(12)
             anchors.verticalCenter: parent.verticalCenter
@@ -2672,6 +2840,49 @@ Item {
             font.family: Style.font.family
             font.pixelSize: Style.font.bodySmall
             renderType: Text.NativeRendering
+          }
+
+          // Search results are ranked by relevance, so the order only means
+          // something while the folder tree is what is on screen.
+          Rectangle {
+            id: sortButton
+            objectName: "quickfileSortButton"
+            visible: root.service && root.service.query === ""
+            anchors.right: contextCount.left
+            anchors.rightMargin: Style.space(10)
+            anchors.verticalCenter: parent.verticalCenter
+            width: sortText.implicitWidth + Style.space(12)
+            height: Style.space(19)
+            radius: Style.cornerRadius > 0 ? Style.space(4) : 0
+            color: sortMouse.containsMouse ? Style.hoverFill : "transparent"
+
+            Text {
+              textFormat: Text.PlainText
+              id: sortText
+              objectName: "quickfileSortLabel"
+              anchors.centerIn: parent
+              text: "󰒺 " + root.sortLabel(root.service ? root.service.sortOrder : "")
+              color: sortMouse.containsMouse ? root.accent : root.muted
+              font.family: Style.font.family
+              font.pixelSize: Style.font.bodySmall
+              renderType: Text.NativeRendering
+            }
+
+            MouseArea {
+              id: sortMouse
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              acceptedButtons: Qt.LeftButton | Qt.RightButton
+              onClicked: function(event) {
+                if (!root.service) return
+                root.service.cycleSortOrder(event.button === Qt.RightButton ? -1 : 1)
+              }
+            }
+
+            ToolTip.visible: sortMouse.containsMouse
+            ToolTip.text: root.sortTooltip(root.service ? root.service.sortOrder : "")
+            ToolTip.delay: 400
           }
         }
 
@@ -3183,7 +3394,7 @@ Item {
                 if (event.key === Qt.Key_Return
                     && (event.modifiers & Qt.ControlModifier) !== 0) {
                   root.saveMetadata()
-                  keyScope.forceActiveFocus()
+                  root.focusList()
                   event.accepted = true
                 }
               }
@@ -3571,7 +3782,7 @@ Item {
                 font.pixelSize: Style.font.caption
                 Keys.onEscapePressed: function(event) {
                   root.closeInlinePreview()
-                  keyScope.forceActiveFocus()
+                  root.focusList()
                   event.accepted = true
                 }
               }
@@ -3678,21 +3889,50 @@ Item {
               anchors.verticalCenter: parent.verticalCenter
               spacing: Style.space(1)
 
-              Text {
-                id: fileNameLabel
-                objectName: "quickfileFileNameLabel"
-                // Escaped once here so the shared ToolTip sink, which is not
-                // ours to pin to plain text, shows a markup-like name literally.
-                readonly property string hoverTooltip: PlainText.tooltip(text)
+              Item {
+                id: fileNameLine
                 width: parent.width
-                text: fileRow.modelData.relativePath || fileRow.modelData.name
-                textFormat: Text.PlainText
-                color: root.entryColor(fileRow.modelData)
-                opacity: fileRow.modelData.isHidden ? 0.58 : 1
-                elide: Text.ElideMiddle
-                font.family: Style.font.family
-                font.pixelSize: root.primaryFontSize
-                renderType: Text.NativeRendering
+                height: fileNameLabel.height
+
+                Text {
+                  id: fileNameLabel
+                  objectName: "quickfileFileNameLabel"
+                  // Escaped once here so the shared ToolTip sink, which is not
+                  // ours to pin to plain text, shows a markup-like name literally.
+                  readonly property string hoverTooltip: PlainText.tooltip(text)
+                  anchors.left: parent.left
+                  anchors.top: parent.top
+                  width: Math.max(0, parent.width
+                    - (fileSizeBadge.visible
+                      ? fileSizeBadge.width + Style.space(3) : 0))
+                  text: fileRow.modelData.relativePath || fileRow.modelData.name
+                  textFormat: Text.PlainText
+                  color: root.entryColor(fileRow.modelData)
+                  opacity: fileRow.modelData.isHidden ? 0.58 : 1
+                  elide: Text.ElideMiddle
+                  font.family: Style.font.family
+                  font.pixelSize: root.primaryFontSize
+                  renderType: Text.NativeRendering
+                }
+
+                // Rides on the name's own cap line rather than a fixed offset,
+                // so it stays a superscript when the theme changes font size.
+                Text {
+                  id: fileSizeBadge
+                  objectName: "quickfileFileSizeBadge"
+                  visible: text !== ""
+                  text: root.sizeBadge(fileRow.modelData)
+                  textFormat: Text.PlainText
+                  anchors.left: fileNameLabel.left
+                  anchors.leftMargin: Math.min(fileNameLabel.contentWidth,
+                    fileNameLabel.width) + Style.space(3)
+                  anchors.top: fileNameLabel.top
+                  color: root.muted
+                  opacity: fileRow.modelData.isHidden ? 0.58 : 0.85
+                  font.family: Style.font.family
+                  font.pixelSize: Math.max(7, Math.round(root.primaryFontSize * 0.6))
+                  renderType: Text.NativeRendering
+                }
               }
 
               Text {
@@ -3801,7 +4041,7 @@ Item {
                 root.service.selectIndex(fileRow.index,
                   event.button === Qt.RightButton && fileRow.persistentSelected
                     ? "focus" : root.pointerSelectionMode(event.modifiers))
-                keyScope.forceActiveFocus()
+                root.focusList()
                 if (event.button === Qt.RightButton) root.inspectorOpen = true
               }
               onDoubleClicked: function(event) {
@@ -3893,7 +4133,15 @@ Item {
           MouseArea { anchors.fill: parent; onClicked: {} }
           Keys.onEscapePressed: function(event) {
             root.cancelEditor()
-            if (root.editorMode === "") keyScope.forceActiveFocus()
+            if (root.editorMode === "") root.focusList()
+            event.accepted = true
+          }
+          Keys.onReturnPressed: function(event) {
+            if (root.editorConfirmEnabled()) root.commitEditor()
+            event.accepted = true
+          }
+          Keys.onEnterPressed: function(event) {
+            if (root.editorConfirmEnabled()) root.commitEditor()
             event.accepted = true
           }
           Connections {
@@ -3979,11 +4227,11 @@ Item {
                     quickNavList.positionViewAtIndex(root.quickNavIndex, ListView.Contain)
                     event.accepted = true
                   } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-                    if (root.activateQuickLocation(root.quickNavIndex)) keyScope.forceActiveFocus()
+                    if (root.activateQuickLocation(root.quickNavIndex)) root.focusList()
                     event.accepted = true
                   } else if (event.key === Qt.Key_Escape) {
                     root.dismissEditor()
-                    keyScope.forceActiveFocus()
+                    root.focusList()
                     event.accepted = true
                   }
                 }
@@ -4053,7 +4301,7 @@ Item {
                     hoverEnabled: true
                     cursorShape: Qt.PointingHandCursor
                     onClicked: {
-                      if (root.activateQuickLocation(locationRow.index)) keyScope.forceActiveFocus()
+                      if (root.activateQuickLocation(locationRow.index)) root.focusList()
                     }
                     ToolTip.visible: containsMouse
                     ToolTip.delay: 650
@@ -4496,7 +4744,7 @@ Item {
                 onTextEdited: root.editorValue = text
                 Keys.onEscapePressed: function(event) {
                   root.editorMode = ""
-                  keyScope.forceActiveFocus()
+                  root.focusList()
                   event.accepted = true
                 }
                 Keys.onReturnPressed: function(event) {
@@ -4526,7 +4774,7 @@ Item {
                     : root.editorMode === "conflict-replace" ? "Back" : "Cancel"
                   onClicked: {
                     root.cancelEditor()
-                    if (root.editorMode === "") keyScope.forceActiveFocus()
+                    if (root.editorMode === "") root.focusList()
                   }
                 }
                 ActionButton {

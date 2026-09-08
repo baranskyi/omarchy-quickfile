@@ -36,6 +36,23 @@ ShellRoot {
     }
     function reloadTrash() { return true }
     function permanentlyDeleteTrash(uri) { return true }
+    property string lastSearchQuery: "unset"
+    property var sortCalls: []
+    function setSearch(text, mode) {
+      lastSearchQuery = String(text || "")
+      query = lastSearchQuery
+      // The real service reloads and republishes the model; the panel parks
+      // its pending cursor until that lands, so the stub must land it too.
+      modelChanged()
+      return true
+    }
+    function setSortOrder(order) {
+      if (sortOrders.indexOf(String(order)) < 0 || sortOrder === String(order))
+        return false
+      sortOrder = String(order)
+      sortCalls.push(sortOrder)
+      return true
+    }
     function reloadQuickNav() { return true }
     function navigateQuickNav(location) { navigatedLocation = location; return true }
     function loadPreview(value) {
@@ -175,9 +192,28 @@ ShellRoot {
     check(panel.handleTrashShortcut(Qt.Key_Backspace) && panel.editorMode === "trash"
         && fixture.selectedTokens.length === 2,
       "Backspace did not preserve a multi-selection for Trash confirmation")
+    check(panel.editorConfirmEnabled(),
+      "the Trash confirmation refused the keyboard, leaving the mouse as the "
+        + "only way to finish a deletion")
     panel.commitEditor()
     check(panel.editorMode === "" && fixture.lastTrashedTokens.length === 2,
       "Backspace confirmation did not send the full selection to Trash")
+    check(!panel.editorConfirmEnabled(),
+      "Return would still commit an editor that is no longer open")
+
+    // Files and folders travel the same route to Trash; a mixed selection must
+    // arrive whole rather than collapsing to the anchor row.
+    select(entry("mixed-file", ""))
+    var folderRow = entry("mixed-folder", "")
+    folderRow.isDir = true
+    fixture.selectedTokens = ["mixed-file", "mixed-folder"]
+    check(panel.handleTrashShortcut(Qt.Key_Delete) && panel.editorMode === "trash",
+      "Delete did not confirm a selection holding both a file and a folder")
+    panel.commitEditor()
+    check(fixture.lastTrashedTokens.length === 2
+        && fixture.lastTrashedTokens.indexOf("mixed-folder") >= 0,
+      "a folder in a mixed selection was dropped before Trash")
+
     fixture.clearSelection()
     check(panel.handleTrashShortcut(Qt.Key_Delete) && panel.editorMode === "",
       "Delete without a selection opened a destructive action")
@@ -189,9 +225,14 @@ ShellRoot {
     panel.confirmTrashDelete(fixture.trashEntries[0])
     check(panel.editorMode === "trash-delete" && panel.pendingTrashEntry.name === "old.txt",
       "Permanent delete did not require a separate confirmation state")
+    check(panel.editorConfirmEnabled(),
+      "permanent deletion could not be confirmed from the keyboard")
     panel.commitEditor()
     check(panel.editorMode === "trash-browser" && panel.pendingTrashEntry === null,
       "Confirmed permanent delete did not return to Trash")
+    check(!panel.editorConfirmEnabled(),
+      "Return in the Trash browser would fire the confirm action of a dialog "
+        + "that shows no confirm button")
   }
 
   function dropEvent(formats, values) {
@@ -269,6 +310,132 @@ ShellRoot {
 
     fixture.entriesModel.remove(longIndex)
     fixture.entries = rows.slice(0, longIndex)
+    fileView.forceLayout()
+  }
+
+  function searchFocusChecks() {
+    var searchField = objectFinder.findChild(panel, "quickfileSearchField")
+    var listFocus = objectFinder.findChild(panel, "quickfileListFocus")
+    check(searchField !== null && listFocus !== null,
+      "could not find the search field and the list focus sink")
+
+    // A printable key that no shortcut claims must not reach a text sink:
+    // that is what used to drop the user into search mid-navigation.
+    check(panel.isTypingKey({ key: Qt.Key_G, text: "g", modifiers: Qt.NoModifier }),
+      "a plain letter was not recognised as typing to swallow")
+    check(panel.isTypingKey({ key: Qt.Key_G, text: "G", modifiers: Qt.ShiftModifier }),
+      "a shifted letter was not recognised as typing to swallow")
+    check(!panel.isTypingKey({ key: Qt.Key_C, text: "\u0003", modifiers: Qt.ControlModifier }),
+      "a Control chord was mistaken for typing and would lose its shortcut")
+    check(!panel.isTypingKey({ key: Qt.Key_Down, text: "", modifiers: Qt.NoModifier }),
+      "an arrow key was mistaken for typing")
+
+    var before = fixture.entries[3]
+    select(before)
+    panel.keyboardIndex = 3
+    panel.beginSearch()
+    check(searchField.activeFocus, "the slash key did not move focus into search")
+    check(panel.searchReturnToken === before.token,
+      "entering search did not remember the row to come back to")
+
+    searchField.text = "row-1"
+    fixture.query = "row-1"
+    fixture.lastSearchQuery = "unset"
+    // Land the cursor somewhere else, the way picking through results does.
+    fixture.selectIndex(11)
+    panel.keyboardIndex = 11
+    panel.endSearch()
+    check(fixture.lastSearchQuery === "",
+      "leaving search kept the query alive behind an empty field")
+    check(searchField.text === "", "leaving search left text in the field")
+    check(listFocus.activeFocus,
+      "leaving search did not hand the keyboard back to the list")
+    check(panel.keyboardIndex === 3 && fixture.selectedToken === before.token,
+      "Escape did not restore the row that was selected before the search")
+
+    // Nothing selected before the search means the first row, not nowhere.
+    fixture.clearSelection()
+    panel.keyboardIndex = -1
+    panel.beginSearch()
+    check(panel.searchReturnToken === "",
+      "entering search from an empty selection invented a row to return to")
+    searchField.text = "row-2"
+    fixture.query = "row-2"
+    panel.endSearch()
+    check(panel.keyboardIndex === 0
+        && fixture.selectedToken === fixture.entries[0].token,
+      "Escape from a search started without a selection did not land on the "
+        + "first row")
+  }
+
+  function sortChecks() {
+    var label = objectFinder.findChild(panel, "quickfileSortLabel")
+    check(label !== null, "could not find the sort control")
+    check(fixture.sortOrder === "name" && label.text.indexOf("A→Z") >= 0,
+      "the sort control did not show the active order")
+    check(panel.sortLabel("modified") === "NEW"
+        && panel.sortLabel("size") === "SIZE"
+        && panel.sortLabel("type") === "TYPE",
+      "a sort order was missing its label")
+
+    fixture.cycleSortOrder(1)
+    check(fixture.sortOrder === "name-desc" && label.text.indexOf("Z→A") >= 0,
+      "cycling forward did not advance the order or its label")
+    fixture.cycleSortOrder(-1)
+    check(fixture.sortOrder === "name", "cycling back did not return the order")
+    fixture.cycleSortOrder(-1)
+    check(fixture.sortOrder === "type",
+      "cycling back from the first order did not wrap to the last")
+    fixture.setSortOrder("name")
+
+    var sortButton = objectFinder.findChild(panel, "quickfileSortButton")
+    check(sortButton !== null && sortButton.visible,
+      "the sort control was hidden while the folder tree was on screen")
+    fixture.query = "row"
+    check(!sortButton.visible,
+      "the sort control stayed visible over relevance-ranked search results")
+    fixture.query = ""
+  }
+
+  function sizeBadgeChecks() {
+    check(panel.sizeBadge({ size: 0 }) === "0B", "an empty file lost its size")
+    check(panel.sizeBadge({ size: 512 }) === "512B",
+      "a sub-kilobyte file was not reported in bytes")
+    check(panel.sizeBadge({ size: 4200 }) === "4.1KB",
+      "a kilobyte-scale file lost its fractional precision")
+    check(panel.sizeBadge({ size: 45 * 1024 }) === "45KB",
+      "a size past ten units kept a decimal the superscript has no room for")
+    check(panel.sizeBadge({ size: 3 * 1024 * 1024 }) === "3.0MB",
+      "a megabyte-scale file was not reported in megabytes")
+    check(panel.sizeBadge({ size: 1024, isDir: true }) === "",
+      "a directory showed its allocation size as if it were content")
+    check(panel.sizeBadge({}) === "" && panel.sizeBadge(null) === "",
+      "a row without a size still claimed one")
+
+    var sized = entry("sized-file", "")
+    sized.size = 2048
+    var rows = fixture.entries.slice()
+    rows.push(sized)
+    fixture.entries = rows
+    fixture.entriesModel.append({ rowData: sized, scope: "" })
+    var index = rows.length - 1
+    fileView.forceLayout()
+    fileView.positionViewAtIndex(index, ListView.Beginning)
+    fileView.forceLayout()
+
+    var item = fileView.itemAtIndex(index)
+    check(item !== null, "could not realise the row carrying a size")
+    var badge = objectFinder.findChild(item, "quickfileFileSizeBadge")
+    var label = objectFinder.findChild(item, "quickfileFileNameLabel")
+    check(badge !== null && badge.visible && badge.text === "2.0KB",
+      "the size superscript did not reach the row beside its name")
+    check(badge.font.pixelSize < label.font.pixelSize,
+      "the size was not drawn smaller than the name it annotates")
+    check(badge.y <= label.y + 1,
+      "the size sat on the name's baseline instead of above it")
+
+    fixture.entriesModel.remove(index)
+    fixture.entries = rows.slice(0, index)
     fileView.forceLayout()
   }
 
@@ -388,7 +555,13 @@ ShellRoot {
 
   function prepareViewport() {
     var rows = []
-    for (var i = 0; i < 80; i++) rows.push(entry("row-" + i, ""))
+    for (var i = 0; i < 80; i++) {
+      var row = entry("row-" + i, "")
+      // Spread across bytes, kilobytes and megabytes so the rendered viewport
+      // — and the screenshot taken from it — exercises every size superscript.
+      row.size = Math.round(Math.pow(1024, i % 3) * (1 + (i % 7)))
+      rows.push(row)
+    }
     fixture.entries = rows
     fixture.entriesModel.clear()
     for (var index = 0; index < rows.length; index++)
@@ -660,6 +833,9 @@ ShellRoot {
       try {
         testRoot.viewportChecks()
         testRoot.elidedNameTooltipChecks()
+        testRoot.sizeBadgeChecks()
+        testRoot.searchFocusChecks()
+        testRoot.sortChecks()
         if (testRoot.captureIfRequested()) return
         console.log("QUICKFILE_TESTS_PASSED panel-state " + testRoot.assertions + " assertions")
       } catch (error) {

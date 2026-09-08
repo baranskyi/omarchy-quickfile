@@ -61,6 +61,7 @@ class BackendTests(unittest.TestCase):
             "no_git": True,
             "max_depth": 12,
             "limit": 100,
+            "sort": "name",
         }
         values.update(overrides)
         return argparse.Namespace(**values)
@@ -245,6 +246,59 @@ class BackendTests(unittest.TestCase):
         names = [row["name"] for row in result["entries"]]
         self.assertEqual(names[0], "folder")
         self.assertNotIn(".hidden", names)
+
+    def test_tree_sort_orders_keep_directories_first(self) -> None:
+        (self.root / "zebra").mkdir()
+        (self.root / "big.bin").write_bytes(b"x" * 4096)
+        (self.root / "tiny.bin").write_bytes(b"x")
+        os.utime(self.root / "big.bin", (0, 0))
+        os.utime(self.root / "tiny.bin", (2_000_000_000, 2_000_000_000))
+
+        def names(order: str) -> list[str]:
+            result = quickfile.tree_command(self.tree_args(sort=order))
+            return [row["name"] for row in result["entries"] if row["depth"] == 0]
+
+        for order in quickfile.SORT_ORDER:
+            listed = names(order)
+            self.assertEqual(
+                set(listed[:2]), {"folder", "zebra"},
+                f"{order} did not keep directories above files",
+            )
+
+        self.assertEqual(names("name")[:2], ["folder", "zebra"])
+        self.assertEqual(names("name-desc")[:2], ["zebra", "folder"])
+        self.assertEqual(names("name")[2:], sorted(names("name")[2:], key=str.casefold))
+        self.assertEqual(names("name-desc")[2:], names("name")[2:][::-1])
+        self.assertEqual(names("modified")[2], "tiny.bin")
+        self.assertEqual(names("modified-asc")[2], "big.bin")
+        self.assertEqual(names("size")[2], "big.bin")
+        self.assertEqual(
+            [name for name in names("type") if name.endswith(".bin")],
+            ["big.bin", "tiny.bin"],
+        )
+        self.assertTrue(names("type").index("big.bin") < names("type").index("notes.txt"))
+
+    def test_tree_rejects_an_unknown_sort_order(self) -> None:
+        with self.assertRaises(quickfile.QuickfileError) as raised:
+            quickfile.tree_command(self.tree_args(sort="whatever"))
+        self.assertEqual(raised.exception.code, "invalid-sort-order")
+
+    def test_settings_persist_the_chosen_sort_order(self) -> None:
+        saved = quickfile.settings_command(argparse.Namespace(
+            active_sessions=None,
+            inspector_tab=None,
+            sort_order="size",
+            module_layout_json=None,
+        ))
+        self.assertEqual(saved["settings"]["sortOrder"], "size")
+        reread = quickfile.settings_command(argparse.Namespace(
+            active_sessions=None,
+            inspector_tab=None,
+            sort_order=None,
+            module_layout_json=None,
+        ))
+        self.assertEqual(reread["settings"]["sortOrder"], "size")
+        self.assertFalse(reread["changed"])
 
     def test_tree_expands_only_requested_directory(self) -> None:
         token = quickfile.encode_path(str(self.root / "folder"))

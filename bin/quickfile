@@ -75,6 +75,10 @@ MODULE_ORDER = ("sessions", "devices", "favorites", "knowledge")
 MODULE_KEYS = set(MODULE_ORDER)
 INSPECTOR_TAB_ORDER = ("properties", "notes", "git")
 INSPECTOR_TAB_KEYS = set(INSPECTOR_TAB_ORDER)
+# Listing orders offered in the panel, in the order the sort control cycles
+# them. Directories stay above files in every one of them.
+SORT_ORDER = ("name", "name-desc", "modified", "modified-asc", "size", "type")
+SORT_ORDERS = set(SORT_ORDER)
 ACTIVE_SESSION_PROCESS_LIMIT = 4096
 ACTIVE_SESSION_LIMIT = 64
 ACTIVE_SESSION_AGENTS = {
@@ -518,6 +522,7 @@ def default_settings_store() -> dict[str, Any]:
         "version": 2,
         "activeSessionsEnabled": False,
         "inspectorTab": "properties",
+        "sortOrder": "name",
         "modules": default_module_layout(),
     }
 
@@ -542,10 +547,14 @@ def load_settings_store() -> dict[str, Any]:
     inspector_tab = parsed.get("inspectorTab", "properties")
     if not isinstance(inspector_tab, str) or inspector_tab not in INSPECTOR_TAB_KEYS:
         raise QuickfileError("Inspector tab preference is invalid", "settings-invalid")
+    sort_order = parsed.get("sortOrder", "name")
+    if not isinstance(sort_order, str) or sort_order not in SORT_ORDERS:
+        raise QuickfileError("Sort order preference is invalid", "settings-invalid")
     return {
         "version": 2,
         "activeSessionsEnabled": active_sessions,
         "inspectorTab": inspector_tab,
+        "sortOrder": sort_order,
         "modules": normalize_module_layout(parsed.get("modules", default_module_layout())),
     }
 
@@ -590,6 +599,12 @@ def settings_command(args: argparse.Namespace) -> dict[str, Any]:
             raise QuickfileError("Inspector tab preference is invalid", "settings-invalid")
         changed = changed or store["inspectorTab"] != inspector_tab
         store["inspectorTab"] = inspector_tab
+    sort_order = getattr(args, "sort_order", None)
+    if sort_order is not None:
+        if sort_order not in SORT_ORDERS:
+            raise QuickfileError("Sort order preference is invalid", "settings-invalid")
+        changed = changed or store["sortOrder"] != sort_order
+        store["sortOrder"] = sort_order
     module_layout_json = getattr(args, "module_layout_json", None)
     if module_layout_json is not None:
         try:
@@ -1646,22 +1661,58 @@ def knowledge_links_command(args: argparse.Namespace) -> dict[str, Any]:
     return result
 
 
-def scandir_sorted(path: str, show_hidden: bool) -> list[os.DirEntry[str]]:
+def scandir_sorted(path: str, show_hidden: bool, order: str = "name") -> list[os.DirEntry[str]]:
     try:
         entries = list(os.scandir(path))
     except OSError as exc:
         raise QuickfileError(str(exc), "read-directory-failed") from exc
     if not show_hidden:
         entries = [entry for entry in entries if not entry.name.startswith(".")]
+    if order not in SORT_ORDERS:
+        raise QuickfileError("Sort order is invalid", "invalid-sort-order")
 
-    def sort_key(entry: os.DirEntry[str]) -> tuple[int, str]:
+    def is_directory(entry: os.DirEntry[str]) -> bool:
         try:
-            directory = entry.is_dir(follow_symlinks=True)
+            return entry.is_dir(follow_symlinks=True)
         except OSError:
-            directory = False
-        return (0 if directory else 1, display_text(entry.name).casefold())
+            return False
 
-    entries.sort(key=sort_key)
+    def details(entry: os.DirEntry[str]) -> os.stat_result | None:
+        try:
+            return entry.stat(follow_symlinks=False)
+        except OSError:
+            return None
+
+    def name_of(entry: os.DirEntry[str]) -> str:
+        return display_text(entry.name).casefold()
+
+    def modified_of(entry: os.DirEntry[str]) -> float:
+        info = details(entry)
+        return info.st_mtime if info else 0.0
+
+    def size_of(entry: os.DirEntry[str]) -> int:
+        if is_directory(entry):
+            return 0
+        info = details(entry)
+        return info.st_size if info else 0
+
+    def suffix_of(entry: os.DirEntry[str]) -> str:
+        return os.path.splitext(display_text(entry.name))[1].casefold()
+
+    # Three stable passes: name breaks every tie, the chosen order rules, and
+    # directories float to the top of whatever the order produced.
+    entries.sort(key=name_of)
+    if order == "name-desc":
+        entries.sort(key=name_of, reverse=True)
+    elif order == "modified":
+        entries.sort(key=modified_of, reverse=True)
+    elif order == "modified-asc":
+        entries.sort(key=modified_of)
+    elif order == "size":
+        entries.sort(key=size_of, reverse=True)
+    elif order == "type":
+        entries.sort(key=suffix_of)
+    entries.sort(key=lambda entry: 0 if is_directory(entry) else 1)
     return entries
 
 
@@ -1670,6 +1721,9 @@ def tree_command(args: argparse.Namespace) -> dict[str, Any]:
     if not os.path.isdir(root):
         raise QuickfileError(f"Not a directory: {display_text(root)}", "not-a-directory")
     expanded = set(args.expanded or [])
+    sort_order = str(getattr(args, "sort", "") or "name")
+    if sort_order not in SORT_ORDERS:
+        raise QuickfileError("Sort order is invalid", "invalid-sort-order")
     git = git_context(root) if not args.no_git else {"root": "", "branch": "", "statuses": {}}
     rows: list[dict[str, Any]] = []
     truncated = False
@@ -1680,7 +1734,7 @@ def tree_command(args: argparse.Namespace) -> dict[str, Any]:
         nonlocal truncated
         watch.add_directory(directory)
         try:
-            children = scandir_sorted(directory, args.show_hidden)
+            children = scandir_sorted(directory, args.show_hidden, sort_order)
         except QuickfileError:
             return
         for child in children:
@@ -3969,6 +4023,7 @@ def parser() -> argparse.ArgumentParser:
     tree.add_argument("--no-git", action="store_true")
     tree.add_argument("--max-depth", type=int, default=12)
     tree.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
+    tree.add_argument("--sort", choices=SORT_ORDER, default="name")
 
     search = subcommands.add_parser("search", help="Recursively search below a root")
     add_path_arguments(search)
@@ -4023,6 +4078,7 @@ def parser() -> argparse.ArgumentParser:
     )
     settings.add_argument("--active-sessions", choices=("true", "false"))
     settings.add_argument("--inspector-tab", choices=INSPECTOR_TAB_ORDER)
+    settings.add_argument("--sort-order", choices=SORT_ORDER)
     settings.add_argument("--module-layout-json")
 
     knowledge_links = subcommands.add_parser(

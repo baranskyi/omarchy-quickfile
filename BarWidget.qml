@@ -36,7 +36,9 @@ BarWidget {
       Item {
         QuickFileIcon {
           anchors.centerIn: parent
-          iconSize: Math.round(Style.bar.iconFont * 0.82)
+          // Tuned so the painted glyph is 26px tall -- the shared optical
+          // height of the bar's icons -- and sits on their 29.5px centre.
+          iconSize: 16
           color: button.foreground
           active: button.active
           activeBackgroundColor: button.foreground

@@ -21,7 +21,6 @@ Item {
   // Selection alone must not resize the file list. The inspector opens only
   // through its toolbar button or an explicit context action.
   property bool inspectorOpen: false
-  property bool inspectorDetailsVisible: false
   property string editorMode: ""
   property string editorValue: ""
   property string editorError: ""
@@ -3313,8 +3312,7 @@ Item {
           anchors.right: parent.right
           anchors.bottom: footer.top
           height: !visible ? 0 : Math.min(
-            root.inspectorDetailsVisible ? Style.space(468) : Style.space(266),
-            blade.height * (root.inspectorDetailsVisible ? 0.48 : 0.34))
+            Style.space(266), blade.height * 0.34)
           visible: root.inspectorOpen && root.service
             && root.service.selectedEntry !== null
           color: Qt.alpha(root.foreground, 0.018)
@@ -3356,35 +3354,6 @@ Item {
               font.pixelSize: Style.font.bodySmall
               font.bold: true
               renderType: Text.NativeRendering
-            }
-            Components.IconButton {
-              anchors.right: inspectorDetailsButton.left
-              anchors.rightMargin: Style.space(2)
-              anchors.top: parent.top
-              anchors.topMargin: Style.space(5)
-              glyph: root.service && root.service.selectedEntry
-                && root.service.selectedEntry.starred === true ? "󰓎" : "󰓒"
-              tooltip: root.service && root.service.selectedEntry
-                && root.service.selectedEntry.starred === true ? "Unpin favorite" : "Pin favorite"
-              active: root.service && root.service.selectedEntry
-                && root.service.selectedEntry.starred === true
-              buttonSize: Style.space(25)
-              available: root.service && root.service.selectedEntry && !root.service.actionBusy
-              onClicked: root.saveMetadata(!(root.service.selectedEntry.starred === true))
-            }
-            Components.IconButton {
-              id: inspectorDetailsButton
-              anchors.right: closeInspectorButton.left
-              anchors.rightMargin: Style.space(2)
-              anchors.top: parent.top
-              anchors.topMargin: Style.space(5)
-              glyph: "󰒓"
-              tooltip: root.inspectorDetailsVisible
-                ? "Compact inspector"
-                : "Expand inspector"
-              active: root.inspectorDetailsVisible
-              buttonSize: Style.space(25)
-              onClicked: root.inspectorDetailsVisible = !root.inspectorDetailsVisible
             }
             Components.IconButton {
               id: closeInspectorButton
@@ -3778,7 +3747,7 @@ Item {
             anchors.right: parent.right
             anchors.leftMargin: Style.space(10)
             anchors.rightMargin: Style.space(8)
-            height: root.inspectorDetailsVisible ? Style.space(78) : Style.space(40)
+            height: Style.space(40)
             visible: root.service && root.service.inspectorTab === "notes"
             color: "transparent"
 
@@ -3836,82 +3805,6 @@ Item {
               }
             }
 
-            Text {
-              textFormat: Text.PlainText
-              id: knowledgeAgentsLabel
-              visible: root.inspectorDetailsVisible
-              anchors.left: parent.left
-              anchors.bottom: parent.bottom
-              anchors.bottomMargin: Style.space(12)
-              width: Style.space(48)
-              text: "Agents"
-              color: root.muted
-              font.family: Style.font.family
-              font.pixelSize: root.secondaryFontSize
-              renderType: Text.NativeRendering
-            }
-
-            Row {
-              visible: root.inspectorDetailsVisible
-              anchors.left: knowledgeAgentsLabel.right
-              anchors.leftMargin: Style.space(6)
-              anchors.verticalCenter: knowledgeAgentsLabel.verticalCenter
-              spacing: Style.space(6)
-
-              Repeater {
-                model: root.knowledgeAgentChoices
-                delegate: Rectangle {
-                  id: knowledgeAgentChip
-                  required property var modelData
-                  readonly property bool chosen:
-                    root.knowledgeAgentSelected(String(modelData.key))
-                  width: Style.space(34)
-                  height: Style.space(23)
-                  radius: Style.cornerRadius > 0 ? Style.space(4) : 0
-                  enabled: root.service && root.service.selectedEntry
-                    && root.service.selectedEntry.isDir !== true
-                    && !root.service.actionBusy
-                  opacity: enabled ? 1 : 0.35
-                  color: chosen ? Qt.alpha(root.accent, 0.16) : Style.normalFill
-                  border.width: chosen ? 2 : Style.normalBorderWidth
-                  border.color: chosen ? root.accent : Style.normalBorderColor
-
-                  Text {
-                    textFormat: Text.PlainText
-                    anchors.centerIn: parent
-                    text: String(knowledgeAgentChip.modelData.label)
-                    color: knowledgeAgentChip.chosen ? root.accent : root.foreground
-                    font.family: Style.font.family
-                    font.pixelSize: Style.font.caption
-                    font.bold: knowledgeAgentChip.chosen
-                    renderType: Text.NativeRendering
-                  }
-                  MouseArea {
-                    anchors.fill: parent
-                    hoverEnabled: true
-                    enabled: knowledgeAgentChip.enabled
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: root.toggleKnowledgeAgent(
-                      String(knowledgeAgentChip.modelData.key))
-                    ToolTip.visible: containsMouse
-                    ToolTip.delay: 500
-                    ToolTip.text: PlainText.tooltip(knowledgeAgentChip.modelData.name)
-                  }
-                }
-              }
-            }
-
-            ActionButton {
-              visible: root.inspectorDetailsVisible
-              anchors.right: parent.right
-              anchors.verticalCenter: knowledgeAgentsLabel.verticalCenter
-              glyph: "󰌷"
-              label: "Preview"
-              enabled: root.service && root.service.selectedEntry
-                && root.knowledgeRegisteredDraft
-                && !root.service.actionBusy
-              onClicked: root.beginKnowledgeLinks()
-            }
           }
 
           ListView {

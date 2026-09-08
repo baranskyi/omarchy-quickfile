@@ -161,12 +161,11 @@ there is something to report.
 
 Click the search-mode label to cycle between search modes. Folder chevrons
 expand in place; double-clicking the row changes the tree root. In the
-properties inspector, choose a color, enter a note (`Ctrl+Enter` saves it), or
-toggle the star. File actions are available as an icon strip directly below
-the selected name; delayed tooltips explain each action. The details icon in
-the title toggles Agents and the extended filesystem-property table. Starred
-items appear as indented children of the `FAVORITES`
-module and have a remove control there, without a redundant second star.
+properties inspector, choose a color or enter a note (`Ctrl+Enter` saves it).
+File actions are available as an icon strip directly below the selected name;
+delayed tooltips explain each action. Starring is done from the file row
+itself; starred items appear as indented children of the `FAVORITES` module
+and have a remove control there.
 The palette button in the top-right corner reopens this inspector after it has
 been collapsed. Hover is only a preview highlight; selection remains on the
 item you clicked.

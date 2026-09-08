@@ -3439,7 +3439,7 @@ Item {
                 onClicked: root.service.pasteHere()
               }
               Components.IconButton {
-                glyph: "󰆴"
+                glyph: "󰆑"
                 tooltip: "Duplicate  ·  Ctrl+D"
                 framed: true
                 buttonSize: Style.space(27)
@@ -3504,11 +3504,16 @@ Item {
                   border.width: selected ? 1 : 0
                   border.color: selected ? Qt.alpha(root.accent, 0.65) : "transparent"
 
+                  // A Row positions on x only, so two Texts of different font
+                  // sizes would both sit on its top edge and read as
+                  // misaligned. Each child centres itself on the Row instead.
                   Row {
+                    id: inspectorTabContent
                     anchors.centerIn: parent
                     spacing: Style.space(5)
                     Text {
                       textFormat: Text.PlainText
+                      anchors.verticalCenter: parent.verticalCenter
                       text: String(inspectorTabButton.modelData.glyph)
                       color: inspectorTabButton.selected ? root.accent : root.muted
                       font.family: Style.font.family
@@ -3517,6 +3522,7 @@ Item {
                     }
                     Text {
                       textFormat: Text.PlainText
+                      anchors.verticalCenter: parent.verticalCenter
                       text: String(inspectorTabButton.modelData.label)
                       color: inspectorTabButton.selected ? root.foreground : root.muted
                       font.family: Style.font.family
@@ -4312,6 +4318,7 @@ Item {
               spacing: Style.space(6)
               Text {
                 textFormat: Text.PlainText
+                anchors.verticalCenter: parent.verticalCenter
                 visible: String(fileRow.modelData.note || "") !== ""
                 text: "󰍩"
                 color: root.muted
@@ -4322,6 +4329,7 @@ Item {
               Text {
                 textFormat: Text.PlainText
                 id: rowStar
+                anchors.verticalCenter: parent.verticalCenter
                 visible: fileRow.modelData.starred === true || rowMouse.containsMouse
                 text: fileRow.modelData.starred === true ? "󰓎" : "󰓒"
                 color: fileRow.modelData.starred === true
@@ -4339,6 +4347,7 @@ Item {
               }
               Rectangle {
                 id: matchBadge
+                anchors.verticalCenter: parent.verticalCenter
                 visible: root.service && root.service.query !== ""
                   && root.matchLabel(fileRow.modelData.matchKind) !== ""
                 width: matchBadgeText.implicitWidth + Style.space(8)
@@ -4359,6 +4368,7 @@ Item {
               }
               Text {
                 textFormat: Text.PlainText
+                anchors.verticalCenter: parent.verticalCenter
                 text: root.gitLabel(fileRow.modelData.git)
                 color: text === "D" ? Color.urgent : root.accent
                 visible: text !== ""
@@ -4371,6 +4381,7 @@ Item {
                 textFormat: Text.PlainText
                 id: rowTimestamp
                 objectName: "quickfileRowTimestamp"
+                anchors.verticalCenter: parent.verticalCenter
                 visible: (!root.service || root.service.query === "")
                   && root.dateColumnWidth > 0
                 width: root.dateColumnWidth

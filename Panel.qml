@@ -2056,23 +2056,11 @@ Item {
             onClicked: searchField.forceActiveFocus()
           }
 
-          Text {
-            textFormat: Text.PlainText
-            anchors.left: parent.left
-            anchors.leftMargin: Style.space(9)
-            anchors.verticalCenter: parent.verticalCenter
-            text: "󰍉"
-            color: root.muted
-            font.family: Style.font.family
-            font.pixelSize: Style.font.body
-            renderType: Text.NativeRendering
-          }
-
           TextField {
             id: searchField
             objectName: "quickfileSearchField"
             anchors.left: parent.left
-            anchors.leftMargin: Style.space(29)
+            anchors.leftMargin: Style.space(11)
             anchors.right: searchModeButton.left
             anchors.rightMargin: Style.space(6)
             anchors.verticalCenter: parent.verticalCenter
@@ -2092,7 +2080,7 @@ Item {
             id: searchHint
             visible: searchField.text === "" && !searchField.activeFocus
             anchors.left: parent.left
-            anchors.leftMargin: Style.space(29)
+            anchors.leftMargin: Style.space(11)
             anchors.verticalCenter: parent.verticalCenter
             spacing: Style.space(6)
 

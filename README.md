@@ -159,6 +159,12 @@ way to the match badge. The item count sits in the centre of the bottom bar,
 where an operation's progress or the pending clipboard takes its place while
 there is something to report.
 
+Wherever the keyboard lands, the place it landed marks itself with a thin
+outline that brightens and fades in about half a second: the search field when
+`/` opens it, the row that takes the cursor back when Escape leaves it, and the
+inspector when a right click opens it on an item. It is a flash, not a state —
+nothing stays lit, and the outline never takes a click from what it marks.
+
 Click the search-mode label to cycle between search modes. Folder chevrons
 expand in place; double-clicking the row changes the tree root. In the
 properties inspector, choose a color or enter a note (`Ctrl+Enter` saves it).

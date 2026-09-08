@@ -1004,8 +1004,31 @@ Item {
 
   // Every "give the keyboard back to the list" path goes through here so the
   // focus lands on the sink rather than on the scope's remembered text child.
+  // Attention follows the keyboard: each place the cursor can land marks
+  // itself once and fades. Rows are addressed by token because the list
+  // recycles its delegates.
+  signal rowPulseRequested(string token)
+
   function focusList() {
     listFocus.forceActiveFocus()
+  }
+
+  function pulseSearch() {
+    searchPulse.pulse()
+  }
+
+  function pulseRow(token) {
+    var value = String(token || "")
+    if (value !== "") rowPulseRequested(value)
+  }
+
+  function pulseInspector() {
+    inspectorPulse.pulse()
+  }
+
+  function revealInspector() {
+    inspectorOpen = true
+    pulseInspector()
   }
 
   // Both cycling controls share one picker: left click rotates, right click
@@ -1124,6 +1147,7 @@ Item {
     searchReturnToken = service ? String(service.selectedToken || "") : ""
     searchField.forceActiveFocus()
     searchField.selectAll()
+    pulseSearch()
   }
 
   // Leaves search and asks for the pre-search row back. The listing reloads
@@ -1163,6 +1187,9 @@ Item {
     keyboardIndex = index
     service.selectIndex(index)
     keyboardNavigationRequested(index)
+    // After the view has scrolled the row into place, not before.
+    var token = String(service.entries[index].token || "")
+    Qt.callLater(function() { root.pulseRow(token) })
   }
 
   function rememberKeyboardCursor() {
@@ -2271,6 +2298,13 @@ Item {
             }
           }
 
+          Components.FocusPulse {
+            id: searchPulse
+            objectName: "quickfileSearchPulse"
+            anchors.fill: parent
+            radius: parent.radius
+          }
+
           Rectangle {
             id: searchModeButton
             objectName: "quickfileSearchModeButton"
@@ -2834,7 +2868,7 @@ Item {
                   event.button === Qt.RightButton && favoriteRow.persistentSelected
                     ? "focus" : root.pointerSelectionMode(event.modifiers))
                 root.focusList()
-                if (event.button === Qt.RightButton) root.inspectorOpen = true
+                if (event.button === Qt.RightButton) root.revealInspector()
               }
               onDoubleClicked: root.service.enterEntry(favoriteRow.modelData)
             }
@@ -3069,7 +3103,7 @@ Item {
                   event.button === Qt.RightButton && knowledgeRow.persistentSelected
                     ? "focus" : root.pointerSelectionMode(event.modifiers))
                 root.focusList()
-                if (event.button === Qt.RightButton) root.inspectorOpen = true
+                if (event.button === Qt.RightButton) root.revealInspector()
               }
               onDoubleClicked: root.service.enterEntry(knowledgeRow.modelData)
               ToolTip.visible: containsMouse && root.knowledgeTooltip(knowledgeRow.modelData) !== ""
@@ -3317,6 +3351,14 @@ Item {
             && root.service.selectedEntry !== null
           color: Qt.alpha(root.foreground, 0.018)
           clip: true
+
+          Components.FocusPulse {
+            id: inspectorPulse
+            objectName: "quickfileInspectorPulse"
+            anchors.fill: parent
+            radius: 0
+            z: 30
+          }
 
           Behavior on height {
             NumberAnimation {
@@ -4093,6 +4135,20 @@ Item {
               : (rowMouse.containsMouse ? Style.hoverFill : "transparent")
             DirectoryDropTarget { destinationEntry: fileRow.modelData }
 
+            Components.FocusPulse {
+              id: rowPulse
+              objectName: "quickfileRowPulse"
+              anchors.fill: parent
+              radius: 0
+              z: 4
+              Connections {
+                target: root
+                function onRowPulseRequested(token) {
+                  if (token === String(fileRow.modelData.token || "")) rowPulse.pulse()
+                }
+              }
+            }
+
             Rectangle {
               visible: root.keyboardIndex === fileRow.index
               width: Style.space(2)
@@ -4307,7 +4363,7 @@ Item {
                   event.button === Qt.RightButton && fileRow.persistentSelected
                     ? "focus" : root.pointerSelectionMode(event.modifiers))
                 root.focusList()
-                if (event.button === Qt.RightButton) root.inspectorOpen = true
+                if (event.button === Qt.RightButton) root.revealInspector()
               }
               onDoubleClicked: function(event) {
                 root.keyboardIndex = fileRow.index

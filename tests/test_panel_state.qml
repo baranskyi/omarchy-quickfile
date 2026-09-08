@@ -628,6 +628,51 @@ ShellRoot {
     fixture.query = ""
   }
 
+  function focusPulseChecks() {
+    var searchPulse = objectFinder.findChild(panel, "quickfileSearchPulse")
+    var inspectorPulse = objectFinder.findChild(panel, "quickfileInspectorPulse")
+    check(searchPulse !== null && inspectorPulse !== null,
+      "could not find the focus outlines")
+
+    // Nothing is drawn until something asks for attention. The search outline
+    // has legitimately run by now — the search checks above used it — so the
+    // untouched one is the inspector's.
+    check(!inspectorPulse.active && inspectorPulse.opacity === 0
+        && !inspectorPulse.visible,
+      "the inspector outline was drawn before anything landed there")
+
+    panel.beginSearch()
+    check(searchPulse.active && searchPulse.visible,
+      "entering search did not mark the field the cursor moved to")
+    check(!searchPulse.enabled,
+      "the outline accepts input and could swallow a click on what it marks")
+
+    panel.revealInspector()
+    check(panel.inspectorOpen && inspectorPulse.active,
+      "opening the inspector did not mark it")
+
+    // Leaving search hands the cursor back to a row, and that row marks itself.
+    var pulsed = []
+    var handler = function(token) { pulsed.push(token) }
+    panel.rowPulseRequested.connect(handler)
+    panel.pulseRow(fixture.entries[2].token)
+    check(pulsed.length === 1 && pulsed[0] === fixture.entries[2].token,
+      "the row outline was not addressed to the row that took the cursor")
+    panel.pulseRow("")
+    check(pulsed.length === 1,
+      "an empty token still asked some row to mark itself")
+    panel.rowPulseRequested.disconnect(handler)
+
+    var row = objectFinder.findChild(fileView.itemAtIndex(0), "quickfileRowPulse")
+    check(row !== null && !row.active,
+      "a row outline was drawn without being asked")
+    panel.pulseRow(fixture.entries[0].token)
+    check(row.active,
+      "the row that took the cursor did not mark itself")
+
+    panel.inspectorOpen = false
+  }
+
   function footerChecks() {
     var footer = objectFinder.findChild(panel, "quickfileFooterStatus")
     check(footer !== null, "could not find the footer status label")
@@ -1053,8 +1098,21 @@ ShellRoot {
   }
 
   Timer {
+    id: pulseTimer
+    interval: 140
+    onTriggered: {
+      var which = String(Quickshell.env("QUICKFILE_PANEL_SCREENSHOT_MODE") || "")
+        .substring(6)
+      if (which === "search") panel.beginSearch()
+      else if (which === "inspector") panel.revealInspector()
+      else panel.pulseRow(testRoot.fileView.itemAtIndex(52).modelData.token)
+      captureTimer.restart()
+    }
+  }
+
+  Timer {
     id: captureTimer
-    interval: 100
+    interval: 160
     onTriggered: {
       testRoot.fileView.parent.parent.grabToImage(function(result) {
         if (result.saveToFile(String(Quickshell.env("QUICKFILE_PANEL_SCREENSHOT"))))
@@ -1068,7 +1126,9 @@ ShellRoot {
   function captureIfRequested() {
     if (!Quickshell.env("QUICKFILE_PANEL_SCREENSHOT")) return false
     var mode = String(Quickshell.env("QUICKFILE_PANEL_SCREENSHOT_MODE") || "preview")
-    if (mode.indexOf("date-") === 0) {
+    if (mode.indexOf("pulse-") === 0) {
+      // Fired from the capture timer, once the layout has settled.
+    } else if (mode.indexOf("date-") === 0) {
       fixture.dateFormat = mode.substring(5)
       var spread = fixture.entries.slice()
       // Spread the rows across today, this week, this year and last year so a
@@ -1088,7 +1148,8 @@ ShellRoot {
         sourcePath: "/home/test/Downloads/report.txt", targetPath: "/home/test/Reports/report.txt" }])
       if (mode === "conflict-replace") panel.chooseConflictPolicy("replace")
     } else panel.showInlinePreview(fixture.selectedEntry)
-    captureTimer.start()
+    if (mode.indexOf("pulse-") === 0) pulseTimer.start()
+    else captureTimer.start()
     return true
   }
 
@@ -1106,6 +1167,7 @@ ShellRoot {
         testRoot.dateFormatChecks()
         testRoot.dateChipChecks()
         testRoot.footerChecks()
+        testRoot.focusPulseChecks()
         if (testRoot.captureIfRequested()) return
         console.log("QUICKFILE_TESTS_PASSED panel-state " + testRoot.assertions + " assertions")
       } catch (error) {

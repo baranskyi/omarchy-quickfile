@@ -76,8 +76,11 @@ Item {
   readonly property color accent: Color.accent
   readonly property int primaryFontSize: Style.font.subtitle
   readonly property int secondaryFontSize: Style.font.body
+  // Brown is no longer offered. It stays in the palette resolver and in the
+  // backend's accepted keys so a file tagged with it before still renders and
+  // still saves; it just cannot be chosen any more.
   readonly property var colorChoices: [
-    "red", "yellow", "orange", "green", "cyan", "blue", "magenta", "brown"
+    "red", "yellow", "orange", "green", "cyan", "blue", "magenta"
   ]
   readonly property var knowledgeAgentChoices: [
     { key: "codex", label: "CX", name: "Codex" },
@@ -3656,20 +3659,44 @@ Item {
               anchors.verticalCenter: parent.verticalCenter
               spacing: Style.space(7)
 
+              // "No color" is one of the swatches, so it wears the same ring
+              // and the same selected state as the colors beside it.
               Rectangle {
+                id: clearColorSwatch
+                readonly property bool chosen: root.colorDraft === ""
                 width: Style.space(20)
                 height: width
                 radius: width / 2
                 color: "transparent"
-                border.width: root.colorDraft === "" ? 2 : 1
-                border.color: root.colorDraft === "" ? root.accent : root.muted
-                Text {
-                  textFormat: Text.PlainText
+                border.width: chosen ? 3 : 1
+                border.color: chosen ? root.foreground
+                  : Qt.alpha(root.foreground, 0.32)
+                antialiasing: true
+
+                // Two crossed bars rather than a "×" glyph: the multiplication
+                // sign sits on the font's math axis, so centring its box still
+                // leaves it riding high, and it comes from a fallback family
+                // with metrics of its own.
+                Item {
                   anchors.centerIn: parent
-                  text: "×"
-                  color: root.muted
-                  font.pixelSize: Style.font.bodySmall
+                  width: Math.round(parent.width * 0.42)
+                  height: width
+                  Repeater {
+                    model: [45, -45]
+                    delegate: Rectangle {
+                      required property var modelData
+                      anchors.centerIn: parent
+                      width: parent.width
+                      height: Math.max(1, Math.round(parent.width / 6))
+                      radius: height / 2
+                      rotation: modelData
+                      antialiasing: true
+                      color: clearColorSwatch.chosen ? root.foreground
+                        : Qt.alpha(root.foreground, 0.55)
+                    }
+                  }
                 }
+
                 MouseArea {
                   anchors.fill: parent
                   anchors.margins: -Style.space(2)

@@ -1126,7 +1126,10 @@ ShellRoot {
   function captureIfRequested() {
     if (!Quickshell.env("QUICKFILE_PANEL_SCREENSHOT")) return false
     var mode = String(Quickshell.env("QUICKFILE_PANEL_SCREENSHOT_MODE") || "preview")
-    if (mode.indexOf("pulse-") === 0) {
+    if (mode === "inspector") {
+      fixture.inspectorTab = "notes"
+      panel.inspectorOpen = true
+    } else if (mode.indexOf("pulse-") === 0) {
       // Fired from the capture timer, once the layout has settled.
     } else if (mode.indexOf("date-") === 0) {
       fixture.dateFormat = mode.substring(5)

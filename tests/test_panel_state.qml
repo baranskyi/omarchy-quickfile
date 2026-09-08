@@ -225,6 +225,53 @@ ShellRoot {
     select(entry("plain-name", ""))
   }
 
+  // A build artefact's version lives in the middle of its name, exactly where
+  // an elided row hides it. Hovering a row that does not fit must reveal the
+  // whole name, and the reveal must not resurrect the rich-text hazard: the
+  // shared ToolTip sink parses AutoText, so the name reaches it escaped.
+  function elidedNameTooltipChecks() {
+    var hostile = '<img src="https://attacker.invalid/pixel.png">'
+    var longName = "apollo-alarm-1.0.4-" + hostile + "-configured-release-bundle"
+      + "-with-a-very-long-tail-that-cannot-possibly-fit-in-one-row.zip.sha256"
+    var rows = fixture.entries.slice()
+    var longRow = entry(longName, "")
+    rows.push(longRow)
+    fixture.entries = rows
+    fixture.entriesModel.append({ rowData: longRow, scope: "" })
+    var longIndex = rows.length - 1
+    fileView.forceLayout()
+    fileView.positionViewAtIndex(longIndex, ListView.Beginning)
+    fileView.forceLayout()
+
+    var longItem = fileView.itemAtIndex(longIndex)
+    check(longItem !== null, "could not realise the row with the long name")
+    var longLabel = objectFinder.findChild(longItem, "quickfileFileNameLabel")
+    check(longLabel !== null, "could not find the file name sink of the long row")
+    check(longLabel.text === longName,
+      "the row did not carry the whole name behind its elision")
+    check(longLabel.truncated,
+      "a name far wider than the row was not reported as truncated")
+    check(longLabel.hoverTooltip.indexOf(longName.substring(0, 19)) !== -1
+        && longLabel.hoverTooltip.indexOf("zip.sha256") !== -1,
+      "the hover tooltip did not carry the full name")
+    check(longLabel.hoverTooltip.indexOf("<img") === -1
+        && longLabel.hoverTooltip.indexOf("&lt;img") !== -1,
+      "a markup-like name reached the hover tooltip with its tag intact")
+
+    fileView.positionViewAtIndex(0, ListView.Beginning)
+    fileView.forceLayout()
+    var shortItem = fileView.itemAtIndex(0)
+    var shortLabel = shortItem === null
+      ? null : objectFinder.findChild(shortItem, "quickfileFileNameLabel")
+    check(shortLabel !== null && !shortLabel.truncated,
+      "a name that fits its row was reported as truncated, so it would raise a "
+        + "tooltip over information the user can already read")
+
+    fixture.entriesModel.remove(longIndex)
+    fixture.entries = rows.slice(0, longIndex)
+    fileView.forceLayout()
+  }
+
   function newFeatureChecks() {
     panel.dismissEditor()
     check(!panel.inspectorOpen,
@@ -612,6 +659,7 @@ ShellRoot {
     onTriggered: {
       try {
         testRoot.viewportChecks()
+        testRoot.elidedNameTooltipChecks()
         if (testRoot.captureIfRequested()) return
         console.log("QUICKFILE_TESTS_PASSED panel-state " + testRoot.assertions + " assertions")
       } catch (error) {

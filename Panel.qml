@@ -3679,6 +3679,11 @@ Item {
               spacing: Style.space(1)
 
               Text {
+                id: fileNameLabel
+                objectName: "quickfileFileNameLabel"
+                // Escaped once here so the shared ToolTip sink, which is not
+                // ours to pin to plain text, shows a markup-like name literally.
+                readonly property string hoverTooltip: PlainText.tooltip(text)
                 width: parent.width
                 text: fileRow.modelData.relativePath || fileRow.modelData.name
                 textFormat: Text.PlainText
@@ -3805,6 +3810,13 @@ Item {
                 root.service.enterIndex(fileRow.index)
                 event.accepted = true
               }
+              // The name is elided in the middle to keep the row compact, which
+              // hides exactly the part that distinguishes one build artefact
+              // from the next. Reveal the whole name on hover, but only when it
+              // does not already fit.
+              ToolTip.visible: containsMouse && fileNameLabel.truncated
+              ToolTip.delay: 450
+              ToolTip.text: fileNameLabel.hoverTooltip
             }
 
             DragHandler {

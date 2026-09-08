@@ -876,6 +876,69 @@ Item {
     listFocus.forceActiveFocus()
   }
 
+  // Both cycling controls share one picker: left click rotates, right click
+  // opens this list at the pointer so a mode can be chosen outright.
+  property string choiceKind: ""
+  property var choiceOptions: []
+
+  function searchModeOptions() {
+    return [{ value: "fuzzy", label: "Fuzzy" },
+      { value: "contains", label: "Contains" },
+      { value: "exact", label: "Exact" },
+      { value: "prefix", label: "Starts with" },
+      { value: "suffix", label: "Ends with" },
+      { value: "regex", label: "Regex" }]
+  }
+
+  function sortOptions() {
+    return [{ value: "name", label: "Name  A→Z" },
+      { value: "name-desc", label: "Name  Z→A" },
+      { value: "modified", label: "Modified  newest" },
+      { value: "modified-asc", label: "Modified  oldest" },
+      { value: "size", label: "Size  largest" },
+      { value: "type", label: "Type  folders first" }]
+  }
+
+  function cycleSearchMode(step) {
+    if (!service) return false
+    var options = searchModeOptions()
+    var index = -1
+    for (var i = 0; i < options.length; i++)
+      if (options[i].value === service.searchMode) index = i
+    if (index < 0) index = 0
+    var count = options.length
+    var next = ((index + (Number(step) || 1)) % count + count) % count
+    return applySearchMode(options[next].value)
+  }
+
+  function applySearchMode(value) {
+    if (!service || String(service.searchMode) === String(value)) return false
+    service.searchMode = String(value)
+    searchDebounce.restart()
+    return true
+  }
+
+  function choiceActiveValue() {
+    if (!service) return ""
+    return choiceKind === "sort" ? String(service.sortOrder) : String(service.searchMode)
+  }
+
+  function applyChoice(value) {
+    if (choiceKind === "sort") {
+      if (service) service.setSortOrder(String(value))
+    } else applySearchMode(value)
+  }
+
+  function openChoiceMenu(kind, source, pointX, pointY) {
+    if (!service || !source) return
+    choiceKind = String(kind)
+    choiceOptions = choiceKind === "sort" ? sortOptions() : searchModeOptions()
+    var point = source.mapToItem(keyScope, pointX, pointY)
+    choiceMenu.requestedX = point.x
+    choiceMenu.requestedY = point.y
+    choiceMenu.open()
+  }
+
   function sortLabel(order) {
     var labels = ({ "name": "A→Z", "name-desc": "Z→A", "modified": "NEW",
       "modified-asc": "OLD", "size": "SIZE", "type": "TYPE" })
@@ -887,7 +950,7 @@ Item {
       "modified": "Newest first", "modified-asc": "Oldest first",
       "size": "Largest first", "type": "File type, folders first" })
     return (names[String(order || "")] || "Name A→Z")
-      + "  ·  S next, Shift+S previous"
+      + "  ·  click to rotate, right click to pick, S / Shift+S"
   }
 
   function isTypingKey(event) {
@@ -1615,16 +1678,93 @@ Item {
               }
             }
             Components.IconButton {
-              glyph: "󰒓"
-              tooltip: "Arrange modules"
-              active: moduleSettingsPopup.visible
-              onClicked: moduleSettingsPopup.visible
-                ? moduleSettingsPopup.close() : moduleSettingsPopup.open()
-            }
-            Components.IconButton {
               glyph: "󰅖"
               tooltip: "Close"
               onClicked: root.requestClose()
+            }
+          }
+        }
+
+        // Opens at the pointer, sized by its longest label, and closes on the
+        // first press outside. Nothing here is a mode of its own: it shows the
+        // same list the left click rotates through.
+        Popup {
+          id: choiceMenu
+          objectName: "quickfileChoiceMenu"
+          parent: keyScope
+          property real requestedX: 0
+          property real requestedY: 0
+          x: Math.max(Style.space(6),
+            Math.min(requestedX, blade.width - width - Style.space(6)))
+          y: Math.max(Style.space(6),
+            Math.min(requestedY, blade.height - height - Style.space(6)))
+          width: choiceColumn.implicitWidth + padding * 2
+          height: choiceColumn.implicitHeight + padding * 2
+          padding: Style.space(4)
+          modal: false
+          closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+          onClosed: root.choiceKind = ""
+          background: Rectangle {
+            color: root.background
+            radius: Style.cornerRadius
+            border.width: Math.max(1, Style.normalBorderWidth)
+            border.color: root.borderColor
+          }
+          contentItem: Column {
+            id: choiceColumn
+            spacing: 0
+            Repeater {
+              model: root.choiceOptions
+              delegate: Rectangle {
+                id: choiceRow
+                required property int index
+                required property var modelData
+                readonly property bool current:
+                  String(modelData.value) === root.choiceActiveValue()
+                width: Math.max(Style.space(150),
+                  choiceLabel.implicitWidth + Style.space(34))
+                height: Style.space(24)
+                radius: Style.cornerRadius > 0 ? Style.space(4) : 0
+                color: choiceMouse.containsMouse ? Style.hoverFill
+                  : (current ? Style.selectedFill : "transparent")
+
+                Text {
+                  textFormat: Text.PlainText
+                  id: choiceLabel
+                  anchors.left: parent.left
+                  anchors.leftMargin: Style.space(9)
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: String(choiceRow.modelData.label)
+                  color: choiceRow.current ? root.accent : root.foreground
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.bodySmall
+                  renderType: Text.NativeRendering
+                }
+
+                Text {
+                  textFormat: Text.PlainText
+                  visible: choiceRow.current
+                  anchors.right: parent.right
+                  anchors.rightMargin: Style.space(9)
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: "󰄬"
+                  color: root.accent
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                  renderType: Text.NativeRendering
+                }
+
+                MouseArea {
+                  id: choiceMouse
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: {
+                    root.applyChoice(choiceRow.modelData.value)
+                    choiceMenu.close()
+                  }
+                }
+              }
             }
           }
         }
@@ -1634,7 +1774,8 @@ Item {
           objectName: "quickfileModuleSettings"
           parent: keyScope
           x: blade.width - width - Style.space(8)
-          y: header.height + Style.space(5)
+          y: Math.max(header.height + Style.space(5),
+            blade.height - footer.height - height - Style.space(5))
           width: Style.space(302)
           // Sized by its content: the module list grows with the AI Sessions
           // opt-in and shrinks again when the settings error clears.
@@ -1983,6 +2124,7 @@ Item {
 
           Rectangle {
             id: searchModeButton
+            objectName: "quickfileSearchModeButton"
             anchors.right: parent.right
             anchors.rightMargin: Style.space(4)
             anchors.verticalCenter: parent.verticalCenter
@@ -2005,14 +2147,17 @@ Item {
               anchors.fill: parent
               hoverEnabled: true
               cursorShape: Qt.PointingHandCursor
-              onClicked: {
-                if (!root.service) return
-                var modes = ["fuzzy", "contains", "exact", "prefix", "suffix", "regex"]
-                var next = (modes.indexOf(root.service.searchMode) + 1) % modes.length
-                root.service.searchMode = modes[next]
-                searchDebounce.restart()
+              acceptedButtons: Qt.LeftButton | Qt.RightButton
+              onClicked: function(event) {
+                if (event.button === Qt.RightButton)
+                  root.openChoiceMenu("search-mode", modeMouse, event.x, event.y)
+                else root.cycleSearchMode(1)
               }
             }
+
+            ToolTip.visible: modeMouse.containsMouse && !choiceMenu.visible
+            ToolTip.text: "Search mode  ·  click to rotate, right click to pick"
+            ToolTip.delay: 400
           }
 
           Timer {
@@ -2876,11 +3021,13 @@ Item {
               acceptedButtons: Qt.LeftButton | Qt.RightButton
               onClicked: function(event) {
                 if (!root.service) return
-                root.service.cycleSortOrder(event.button === Qt.RightButton ? -1 : 1)
+                if (event.button === Qt.RightButton)
+                  root.openChoiceMenu("sort", sortMouse, event.x, event.y)
+                else root.service.cycleSortOrder(1)
               }
             }
 
-            ToolTip.visible: sortMouse.containsMouse
+            ToolTip.visible: sortMouse.containsMouse && !choiceMenu.visible
             ToolTip.text: root.sortTooltip(root.service ? root.service.sortOrder : "")
             ToolTip.delay: 400
           }
@@ -2931,12 +3078,25 @@ Item {
             }
           }
 
+          Components.IconButton {
+            id: footerSettings
+            anchors.right: parent.right
+            anchors.rightMargin: Style.space(5)
+            anchors.verticalCenter: parent.verticalCenter
+            glyph: "󰒓"
+            tooltip: "Arrange modules"
+            buttonSize: Style.space(23)
+            active: moduleSettingsPopup.visible
+            onClicked: moduleSettingsPopup.visible
+              ? moduleSettingsPopup.close() : moduleSettingsPopup.open()
+          }
+
           Text {
             textFormat: Text.PlainText
             anchors.left: footerActions.right
-            anchors.right: parent.right
+            anchors.right: footerSettings.left
             anchors.leftMargin: Style.space(5)
-            anchors.rightMargin: Style.space(10)
+            anchors.rightMargin: Style.space(6)
             anchors.verticalCenter: parent.verticalCenter
             horizontalAlignment: Text.AlignRight
             text: !root.service ? ""

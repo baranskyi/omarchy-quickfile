@@ -397,6 +397,47 @@ ShellRoot {
     fixture.query = ""
   }
 
+  function choiceMenuChecks() {
+    var menu = objectFinder.findChild(panel, "quickfileChoiceMenu")
+    var sortButton = objectFinder.findChild(panel, "quickfileSortButton")
+    var modeButton = objectFinder.findChild(panel, "quickfileSearchModeButton")
+    check(menu !== null && sortButton !== null && modeButton !== null,
+      "could not find the picker and the two controls that open it")
+    check(!menu.visible, "the picker was open before anything asked for it")
+
+    fixture.setSortOrder("size")
+    panel.openChoiceMenu("sort", sortButton, 4, 4)
+    check(menu.visible, "right-clicking the sort control did not open the picker")
+    check(panel.choiceOptions.length === fixture.sortOrders.length,
+      "the picker did not offer every sort order")
+    check(panel.choiceActiveValue() === "size",
+      "the picker did not mark the order that is actually in force")
+    panel.applyChoice("type")
+    check(fixture.sortOrder === "type",
+      "picking an order from the list did not apply it")
+    menu.close()
+    check(panel.choiceKind === "", "closing the picker left it pointed at a control")
+
+    fixture.searchMode = "fuzzy"
+    panel.openChoiceMenu("search-mode", modeButton, 4, 4)
+    check(panel.choiceOptions.length === 6 && panel.choiceActiveValue() === "fuzzy",
+      "the picker did not offer the search modes with the active one marked")
+    panel.applyChoice("regex")
+    check(fixture.searchMode === "regex",
+      "picking a search mode from the list did not apply it")
+    menu.close()
+
+    // Left click keeps rotating; the list is only the second way in.
+    panel.cycleSearchMode(1)
+    check(fixture.searchMode === "fuzzy",
+      "rotating past the last search mode did not wrap to the first")
+    panel.cycleSearchMode(-1)
+    check(fixture.searchMode === "regex",
+      "rotating backwards through the search modes did not wrap")
+    fixture.searchMode = "fuzzy"
+    fixture.setSortOrder("name")
+  }
+
   function sizeBadgeChecks() {
     check(panel.sizeBadge({ size: 0 }) === "0B", "an empty file lost its size")
     check(panel.sizeBadge({ size: 512 }) === "512B",
@@ -836,6 +877,7 @@ ShellRoot {
         testRoot.sizeBadgeChecks()
         testRoot.searchFocusChecks()
         testRoot.sortChecks()
+        testRoot.choiceMenuChecks()
         if (testRoot.captureIfRequested()) return
         console.log("QUICKFILE_TESTS_PASSED panel-state " + testRoot.assertions + " assertions")
       } catch (error) {

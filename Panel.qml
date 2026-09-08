@@ -28,6 +28,10 @@ Item {
   property var pendingTrashEntry: null
   property var pendingDrop: null
   property var conflictRows: []
+  // Quick Nav is switched off pending a reason to keep it: the location bar,
+  // Favorites and the tree already cover getting somewhere. The implementation
+  // stays in place behind this flag; set it true to bring the feature back.
+  readonly property bool quickNavEnabled: false
   property string quickNavQuery: ""
   property int quickNavIndex: 0
   property bool inlinePreviewOpen: false
@@ -214,7 +218,7 @@ Item {
   }
 
   function moduleGlyph(moduleId) {
-    return ({ sessions: "󰚩", devices: "󰋊", favorites: "★",
+    return ({ sessions: "󰚩", devices: "󰋊", favorites: "󰓎",
       knowledge: "󰧑" })[moduleId] || "󰘦"
   }
 
@@ -456,7 +460,7 @@ Item {
   }
 
   function openQuickNav() {
-    if (!service) return false
+    if (!service || !quickNavEnabled) return false
     editorError = ""
     quickNavQuery = ""
     quickNavIndex = 0
@@ -1525,7 +1529,8 @@ Item {
         Keys.priority: Keys.BeforeItem
         Keys.onPressed: function(event) {
           if (root.editorMode !== "") return
-          if (event.key === Qt.Key_P && (event.modifiers & Qt.ControlModifier) !== 0) {
+          if (root.quickNavEnabled && event.key === Qt.Key_P
+              && (event.modifiers & Qt.ControlModifier) !== 0) {
             root.openQuickNav()
             event.accepted = true
             return
@@ -1999,6 +2004,7 @@ Item {
               onClicked: if (root.service) root.service.goHome()
             }
             Components.IconButton {
+              visible: root.quickNavEnabled
               glyph: "󰍉"
               tooltip: "Quick Nav · Ctrl+P"
               buttonSize: Style.space(26)
@@ -2551,7 +2557,7 @@ Item {
             anchors.leftMargin: Style.space(12)
             anchors.verticalCenter: parent.verticalCenter
             text: (root.service && root.service.favoritesCollapsed ? "󰅂" : "󰅀")
-              + "  ★  FAVORITES"
+              + "  󰓎  FAVORITES"
             color: root.accent
             font.family: Style.font.family
             font.pixelSize: Style.font.bodySmall
@@ -2838,7 +2844,7 @@ Item {
               Text {
                 textFormat: Text.PlainText
                 width: parent.width
-                text: (knowledgeRow.modelData.starred === true ? "★  " : "")
+                text: (knowledgeRow.modelData.starred === true ? "󰓎  " : "")
                   + String(knowledgeRow.modelData.name || "")
                   + (knowledgeRow.modelData.hasSymlinkBinding === true ? "  󰌷" : "")
                 color: root.entryColor(knowledgeRow.modelData)
@@ -3170,7 +3176,7 @@ Item {
               anchors.top: parent.top
               anchors.topMargin: Style.space(5)
               glyph: root.service && root.service.selectedEntry
-                && root.service.selectedEntry.starred === true ? "★" : "☆"
+                && root.service.selectedEntry.starred === true ? "󰓎" : "󰓒"
               tooltip: root.service && root.service.selectedEntry
                 && root.service.selectedEntry.starred === true ? "Unpin favorite" : "Pin favorite"
               active: root.service && root.service.selectedEntry
@@ -4130,7 +4136,7 @@ Item {
                 textFormat: Text.PlainText
                 id: rowStar
                 visible: fileRow.modelData.starred === true || rowMouse.containsMouse
-                text: fileRow.modelData.starred === true ? "★" : "☆"
+                text: fileRow.modelData.starred === true ? "󰓎" : "󰓒"
                 color: fileRow.modelData.starred === true
                   ? root.entryColor(fileRow.modelData) : root.muted
                 font.family: Style.font.family

@@ -505,7 +505,10 @@ ShellRoot {
       { name: "Project with spaces", path: "/work/project with spaces", token: "project", kind: "worktree" },
       { name: "Downloads", path: "/home/test/Downloads", token: "downloads", kind: "xdg" }
     ]
-    check(panel.openQuickNav() && panel.editorMode === "quick-nav", "Quick Nav did not open")
+    // Quick Nav is switched off. Its filtering and navigation are still
+    // covered so the flag is all that has to change to bring it back.
+    check(!panel.quickNavEnabled && !panel.openQuickNav() && panel.editorMode === "",
+      "the disabled Quick Nav still opened its dialog")
     panel.quickNavQuery = "worktree spaces"
     check(panel.quickNavResults.length === 1 && panel.quickNavResults[0].token === "project",
       "Quick Nav did not filter names, paths, and source labels together")

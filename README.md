@@ -34,8 +34,6 @@ concept. It does not depend on or copy unreleased FileBlade source code.
   content hits include the matching line number and a short snippet. When
   ripgrep (`rg`) is available it safely prefilters content candidates, with a
   transparent bounded Python fallback.
-- Quick Nav (`Ctrl+P`) combines XDG folders, recent locations, Git roots and
-  worktrees, plus zoxide history when zoxide is installed.
 - Back, Forward and Parent navigation remember each directory's exact top row,
   pixel offset and selected entry. Returning to a long directory therefore
   resumes where it was left instead of jumping to the beginning.
@@ -118,11 +116,17 @@ concept. It does not depend on or copy unreleased FileBlade source code.
 | `Ctrl+A` | Select all currently visible file rows |
 | `Enter` | Expand a directory or open a file |
 | `→` / `L` | Enter a directory or open a file |
-| `←` / `H` | Parent directory |
+| `←` | Parent directory |
 | `Delete` / `Backspace` | Move selected files and folders to Trash |
 | `/`, `Ctrl+F` | Focus search |
-| `Ctrl+P` | Open Quick Nav |
-| `.` | Toggle hidden files |
+| `H`, `.` | Toggle hidden files |
+| `P` | Properties for the selected item |
+| `N` / `Shift+N` | New file / new folder |
+| `F` | Star or unstar the selected item |
+| `R` | Rename the selected item |
+| `C` | Copy the selection |
+| `S` / `Shift+S` | Next / previous sort order |
+| `T` / `Shift+T` | Next / previous timestamp format |
 | `Ctrl+R` | Refresh (listings also refresh themselves on filesystem events) |
 | `Ctrl+Shift+T` | Open the Trash browser to restore or permanently delete |
 | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy / cut / paste selected items |
@@ -158,6 +162,9 @@ search, where results are ranked by relevance and the timestamp column gives
 way to the match badge. The item count sits in the centre of the bottom bar,
 where an operation's progress or the pending clipboard takes its place while
 there is something to report.
+
+The `?` button beside the settings gear opens the same list in a sheet, so the
+keys are reachable without leaving the panel.
 
 Wherever the keyboard lands, the place it landed marks itself with a thin
 outline that brightens and fades in about half a second: the search field when

@@ -996,6 +996,98 @@ Item {
     return false
   }
 
+  // The sheet the "?" button shows. Kept beside handleLetterShortcut so a key
+  // cannot be added to one without the other going stale in review.
+  function shortcutGroups() {
+    return [
+      { title: "Move", rows: [
+        ["↑ ↓ · J K", "Move the cursor"],
+        ["→ · L", "Enter the folder"],
+        ["←", "Go to the parent"],
+        ["Enter", "Open file or folder"],
+        ["Ctrl+Space", "Add to the selection"],
+        ["Shift+click", "Select a range"],
+        ["Ctrl+A", "Select all listed"],
+        ["Esc", "Clear, then close"]
+      ] },
+      { title: "Find", rows: [
+        ["/", "Search here"],
+        ["Esc", "Leave search"],
+        ["H", "Show or hide dotfiles"],
+        ["S · Shift+S", "Cycle sort order"],
+        ["T · Shift+T", "Cycle time format"]
+      ] },
+      { title: "Act on the selection", rows: [
+        ["Space", "Quick view"],
+        ["Shift+Space", "Open in Sushi"],
+        ["P", "Properties"],
+        ["F", "Star or unstar"],
+        ["R", "Rename"],
+        ["C · Ctrl+C", "Copy"],
+        ["Ctrl+X · Ctrl+V", "Cut and paste"],
+        ["Ctrl+D", "Duplicate"],
+        ["Del · Backspace", "Move to Trash"]
+      ] },
+      { title: "Make and undo", rows: [
+        ["N", "New file"],
+        ["Shift+N", "New folder"],
+        ["Ctrl+Z", "Undo the last change"],
+        ["Ctrl+Shift+T", "Open Trash"],
+        ["Ctrl+R", "Reload everything"]
+      ] }
+    ]
+  }
+
+  // The list swallows plain printable keys — only "/" opens search — so single
+  // letters are free to name the actions the toolbar shows. Every entry here
+  // is also a row in the shortcut sheet, so the two cannot drift.
+  function handleLetterShortcut(key, modifiers) {
+    if (!service) return false
+    if ((modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier)) !== 0)
+      return false
+    var shifted = (modifiers & Qt.ShiftModifier) !== 0
+    var selected = service.selectedToken !== "" && service.selectedEntry !== null
+    var idle = !service.actionBusy
+
+    if (key === Qt.Key_P) {
+      if (selected) {
+        service.setInspectorTab("properties")
+        revealInspector()
+      }
+      return true
+    }
+    if (key === Qt.Key_N) {
+      beginEditor(shifted ? "new-folder" : "new-file")
+      return true
+    }
+    if (key === Qt.Key_F) {
+      if (selected && idle) service.toggleFavoriteEntry(service.selectedEntry)
+      return true
+    }
+    if (key === Qt.Key_R) {
+      if (selected && idle && service.selectedTokens.length <= 1)
+        beginEditor("rename")
+      return true
+    }
+    if (key === Qt.Key_C) {
+      if (selected) service.copySelected()
+      return true
+    }
+    if (key === Qt.Key_H) {
+      service.setShowHidden(!service.showHidden)
+      return true
+    }
+    if (key === Qt.Key_S) {
+      service.cycleSortOrder(shifted ? -1 : 1)
+      return true
+    }
+    if (key === Qt.Key_T) {
+      service.cycleDateFormat(shifted ? -1 : 1)
+      return true
+    }
+    return false
+  }
+
   function handleTrashShortcut(key) {
     if (key !== Qt.Key_Delete && key !== Qt.Key_Backspace) return false
     if (service && service.selectedToken !== "" && !service.actionBusy)
@@ -1264,7 +1356,7 @@ Item {
   // keyboard. Mirrors the confirm button's own visibility and enabled state.
   function editorConfirmEnabled() {
     if (!service || service.actionBusy) return false
-    if (["", "trash-browser", "quick-nav", "drop-choice", "conflict"]
+    if (["", "trash-browser", "quick-nav", "drop-choice", "conflict", "shortcuts"]
       .indexOf(editorMode) >= 0) return false
     if (editorMode === "knowledge-links")
       return !!service.knowledgeLinkPlan && service.knowledgeLinkPlan.createCount > 0
@@ -1779,18 +1871,12 @@ Item {
             event.accepted = true
           } else if (root.handleTrashShortcut(event.key)) {
             event.accepted = true
-          } else if (event.key === Qt.Key_Left || event.key === Qt.Key_H) {
+          } else if (event.key === Qt.Key_Left) {
             root.service.goParent()
             event.accepted = true
           } else if (event.key === Qt.Key_Slash
               || (event.key === Qt.Key_F && event.modifiers & Qt.ControlModifier)) {
             root.beginSearch()
-            event.accepted = true
-          } else if (event.key === Qt.Key_S && root.service
-              && (event.modifiers
-                & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier)) === 0) {
-            root.service.cycleSortOrder(
-              (event.modifiers & Qt.ShiftModifier) !== 0 ? -1 : 1)
             event.accepted = true
           } else if (event.key === Qt.Key_Period) {
             root.service.setShowHidden(!root.service.showHidden)
@@ -1805,6 +1891,8 @@ Item {
             // to Delete/Backspace; the browser itself is still the only way back
             // from a mistaken delete, so it keeps a key of its own.
             root.openTrashBrowser()
+            event.accepted = true
+          } else if (root.handleLetterShortcut(event.key, event.modifiers)) {
             event.accepted = true
           } else if (root.isTypingKey(event)) {
             // "/" is the only way into search. Swallow the rest of the
@@ -3307,6 +3395,19 @@ Item {
           }
 
           Components.IconButton {
+            id: footerHelp
+            objectName: "quickfileHelpButton"
+            anchors.right: footerSettings.left
+            anchors.rightMargin: Style.space(1)
+            anchors.verticalCenter: parent.verticalCenter
+            glyph: "󰘥"
+            tooltip: "Keyboard shortcuts"
+            buttonSize: Style.space(23)
+            active: root.editorMode === "shortcuts"
+            onClicked: root.beginEditor("shortcuts")
+          }
+
+          Components.IconButton {
             id: footerSettings
             anchors.right: parent.right
             anchors.rightMargin: Style.space(5)
@@ -3343,7 +3444,7 @@ Item {
             // side it would reach first, so it can never run under either.
             readonly property real slot: Math.max(0, Math.min(
               parent.width - 2 * (footerActions.x + footerActions.width + Style.space(8)),
-              2 * (footerSettings.x - Style.space(8)) - parent.width))
+              2 * (footerHelp.x - Style.space(8)) - parent.width))
             anchors.horizontalCenter: parent.horizontalCenter
             anchors.verticalCenter: parent.verticalCenter
             width: Math.min(implicitWidth, slot)
@@ -4554,6 +4655,7 @@ Item {
                   : root.editorMode === "rename" ? "Rename item"
                   : root.editorMode === "trash-browser" ? "Trash"
                   : root.editorMode === "trash-delete" ? "Delete permanently?"
+                  : root.editorMode === "shortcuts" ? "Keyboard shortcuts"
                   : root.editorMode === "quick-nav" ? "Quick Nav"
                   : root.editorMode === "drop-choice" ? "Copy or move here?"
                   : root.editorMode === "conflict" ? "Files already exist"
@@ -4850,6 +4952,79 @@ Item {
                 }
               }
 
+              // Read-only sheet: the dialog's Close is the only control, so
+              // the whole thing is a column of key/meaning pairs.
+              Flickable {
+                visible: root.editorMode === "shortcuts"
+                width: parent.width
+                height: visible
+                  ? Math.min(shortcutSheet.implicitHeight, root.bladeHeight * 0.52) : 0
+                contentHeight: shortcutSheet.implicitHeight
+                clip: true
+                boundsBehavior: Flickable.StopAtBounds
+                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
+                Column {
+                  id: shortcutSheet
+                  width: parent.width
+                  spacing: Style.space(10)
+
+                  Repeater {
+                    model: root.shortcutGroups()
+                    delegate: Column {
+                      required property var modelData
+                      id: shortcutGroup
+                      width: shortcutSheet.width
+                      spacing: Style.space(2)
+
+                      Text {
+                        textFormat: Text.PlainText
+                        text: String(shortcutGroup.modelData.title).toUpperCase()
+                        color: root.muted
+                        font.family: Style.font.family
+                        font.pixelSize: Style.font.caption
+                        font.bold: true
+                        font.letterSpacing: 1.1
+                        renderType: Text.NativeRendering
+                        bottomPadding: Style.space(3)
+                      }
+
+                      Repeater {
+                        model: shortcutGroup.modelData.rows
+                        delegate: Row {
+                          required property var modelData
+                          id: shortcutRow
+                          width: shortcutGroup.width
+                          spacing: Style.space(10)
+                          Text {
+                            textFormat: Text.PlainText
+                            anchors.verticalCenter: parent.verticalCenter
+                            width: Style.space(118)
+                            text: String(shortcutRow.modelData[0])
+                            color: root.accent
+                            elide: Text.ElideRight
+                            font.family: Style.font.family
+                            font.pixelSize: Style.font.bodySmall
+                            renderType: Text.NativeRendering
+                          }
+                          Text {
+                            textFormat: Text.PlainText
+                            anchors.verticalCenter: parent.verticalCenter
+                            width: shortcutRow.width - Style.space(128)
+                            text: String(shortcutRow.modelData[1])
+                            color: root.foreground
+                            elide: Text.ElideRight
+                            font.family: Style.font.family
+                            font.pixelSize: Style.font.bodySmall
+                            renderType: Text.NativeRendering
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+
               Text {
                 textFormat: Text.PlainText
                 visible: root.editorMode === "trash" || root.editorMode === "trash-delete"
@@ -5141,7 +5316,8 @@ Item {
                 spacing: Style.space(7)
                 ActionButton {
                   glyph: "󰅖"
-                  label: root.editorMode === "trash-browser" ? "Close"
+                  label: ["trash-browser", "shortcuts"].indexOf(root.editorMode) >= 0
+                    ? "Close"
                     : root.editorMode === "conflict-replace" ? "Back" : "Cancel"
                   onClicked: {
                     root.cancelEditor()
@@ -5149,7 +5325,8 @@ Item {
                   }
                 }
                 ActionButton {
-                  visible: ["trash-browser", "quick-nav", "drop-choice", "conflict"].indexOf(root.editorMode) < 0
+                  visible: ["trash-browser", "quick-nav", "drop-choice", "conflict",
+                    "shortcuts"].indexOf(root.editorMode) < 0
                   glyph: root.editorMode === "trash" ? "󰩺"
                     : root.editorMode === "trash-delete" ? "󰆴"
                     : root.editorMode === "conflict-replace" ? "󰁯"

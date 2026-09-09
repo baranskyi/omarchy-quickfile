@@ -673,6 +673,91 @@ ShellRoot {
     panel.inspectorOpen = false
   }
 
+  function shortcutChecks() {
+    var mods = Qt.NoModifier
+    select(entry("shortcut-target", ""))
+    panel.editorMode = ""
+    panel.inspectorOpen = false
+
+    check(panel.handleLetterShortcut(Qt.Key_P, mods) && panel.inspectorOpen
+        && fixture.inspectorTab === "properties",
+      "P did not open the inspector on Properties")
+    panel.inspectorOpen = false
+
+    check(panel.handleLetterShortcut(Qt.Key_N, mods)
+        && panel.editorMode === "new-file",
+      "N did not open the new file dialog")
+    panel.editorMode = ""
+    check(panel.handleLetterShortcut(Qt.Key_N, Qt.ShiftModifier)
+        && panel.editorMode === "new-folder",
+      "Shift+N did not open the new folder dialog")
+    panel.editorMode = ""
+    check(panel.handleLetterShortcut(Qt.Key_R, mods)
+        && panel.editorMode === "rename",
+      "R did not open the rename dialog")
+    panel.editorMode = ""
+
+    var hidden = fixture.showHidden
+    check(panel.handleLetterShortcut(Qt.Key_H, mods)
+        && fixture.showHidden !== hidden,
+      "H did not toggle hidden files")
+    fixture.setShowHidden(hidden)
+
+    fixture.setSortOrder("name")
+    check(panel.handleLetterShortcut(Qt.Key_S, mods)
+        && fixture.sortOrder === "name-desc",
+      "S did not advance the sort order")
+    check(panel.handleLetterShortcut(Qt.Key_S, Qt.ShiftModifier)
+        && fixture.sortOrder === "name",
+      "Shift+S did not walk the sort order back")
+
+    fixture.setDateFormat("full")
+    check(panel.handleLetterShortcut(Qt.Key_T, mods)
+        && fixture.dateFormat === "adaptive",
+      "T did not advance the time format")
+    check(panel.handleLetterShortcut(Qt.Key_T, Qt.ShiftModifier)
+        && fixture.dateFormat === "full",
+      "Shift+T did not walk the time format back")
+
+    // A chord must still reach the branch that owns it.
+    check(!panel.handleLetterShortcut(Qt.Key_R, Qt.ControlModifier),
+      "Ctrl+R was swallowed by the plain-letter shortcuts, losing Reload")
+    check(!panel.handleLetterShortcut(Qt.Key_C, Qt.ControlModifier)
+        && !panel.handleLetterShortcut(Qt.Key_T,
+          Qt.ControlModifier | Qt.ShiftModifier),
+      "a Control chord was claimed by the plain-letter shortcuts")
+    check(!panel.handleLetterShortcut(Qt.Key_G, mods),
+      "an unbound letter reported itself as handled")
+
+    // The sheet and the handler have to name the same keys.
+    var groups = panel.shortcutGroups()
+    var listed = ""
+    for (var g = 0; g < groups.length; g++) {
+      check(String(groups[g].title) !== "" && groups[g].rows.length > 0,
+        "a shortcut group was empty")
+      for (var r = 0; r < groups[g].rows.length; r++) {
+        var row = groups[g].rows[r]
+        check(row.length === 2 && String(row[0]) !== "" && String(row[1]) !== "",
+          "a shortcut row was missing its key or its meaning")
+        listed += row[0] + "\n"
+      }
+    }
+    var claimed = ["P", "F", "R", "H", "N", "Shift+N", "S · Shift+S",
+      "T · Shift+T", "Space", "/"]
+    for (var c = 0; c < claimed.length; c++)
+      check(listed.indexOf(claimed[c]) >= 0,
+        "the shortcut sheet does not mention " + claimed[c])
+
+    var help = objectFinder.findChild(panel, "quickfileHelpButton")
+    check(help !== null, "could not find the shortcuts button")
+    check(!panel.editorConfirmEnabled(),
+      "the shortcut sheet offered a confirm action it has nothing to confirm")
+    panel.beginEditor("shortcuts")
+    check(panel.editorMode === "shortcuts" && !panel.editorConfirmEnabled(),
+      "the shortcut sheet opened with a confirm button")
+    panel.editorMode = ""
+  }
+
   function footerChecks() {
     var footer = objectFinder.findChild(panel, "quickfileFooterStatus")
     check(footer !== null, "could not find the footer status label")
@@ -1126,7 +1211,9 @@ ShellRoot {
   function captureIfRequested() {
     if (!Quickshell.env("QUICKFILE_PANEL_SCREENSHOT")) return false
     var mode = String(Quickshell.env("QUICKFILE_PANEL_SCREENSHOT_MODE") || "preview")
-    if (mode === "inspector") {
+    if (mode === "shortcuts") {
+      panel.beginEditor("shortcuts")
+    } else if (mode === "inspector") {
       fixture.inspectorTab = "notes"
       panel.inspectorOpen = true
     } else if (mode.indexOf("pulse-") === 0) {
@@ -1170,7 +1257,10 @@ ShellRoot {
         testRoot.dateFormatChecks()
         testRoot.dateChipChecks()
         testRoot.footerChecks()
+        // After the pulse checks: P opens the inspector, and they assert on an
+        // inspector outline that nothing has asked for yet.
         testRoot.focusPulseChecks()
+        testRoot.shortcutChecks()
         if (testRoot.captureIfRequested()) return
         console.log("QUICKFILE_TESTS_PASSED panel-state " + testRoot.assertions + " assertions")
       } catch (error) {

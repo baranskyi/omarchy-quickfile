@@ -1822,18 +1822,32 @@ Item {
           height: Style.space(46)
           color: Qt.alpha(root.foreground, 0.025)
 
-          Text {
-            textFormat: Text.PlainText
+          Row {
             anchors.left: parent.left
-            anchors.leftMargin: Style.space(14)
+            anchors.leftMargin: Style.space(12)
             anchors.verticalCenter: parent.verticalCenter
-            text: "QUICKFILE"
-            color: root.foreground
-            font.family: Style.font.family
-            font.pixelSize: root.secondaryFontSize
-            font.bold: true
-            font.letterSpacing: 1.2
-            renderType: Text.NativeRendering
+            spacing: Style.space(7)
+
+            QuickFileIcon {
+              anchors.verticalCenter: parent.verticalCenter
+              // The mark is drawn inside 60% of its box, so the box has to be
+              // taller than the type for the two to read at the same size.
+              iconSize: Math.round(headerTitle.font.pixelSize * 1.3)
+              color: root.foreground
+            }
+
+            Text {
+              textFormat: Text.PlainText
+              id: headerTitle
+              anchors.verticalCenter: parent.verticalCenter
+              text: "QUICKFILE"
+              color: root.foreground
+              font.family: Style.font.family
+              font.pixelSize: root.secondaryFontSize
+              font.bold: true
+              font.letterSpacing: 1.2
+              renderType: Text.NativeRendering
+            }
           }
 
           Row {

@@ -973,10 +973,12 @@ Item {
     if (service.folderSizeError !== "") return plain + "  ·  " + service.folderSizeError
     if (!service.folderSizeResult) return counted + "  ·  stopped"
     var done = service.folderSizeResult
-    return String(done.sizeText || counted)
-      + "  ·  " + service.folderSizeFiles + " files in "
-      + service.folderSizeDirectories + " folders"
-      + (done.truncated === true ? "  ·  partial" : "")
+    // The caveat belongs on the number, not in a word after it: a walk that
+    // stopped early has measured a floor, and "42.6 GiB+" says so where the
+    // eye already is. Counts are abbreviated so the row never elides.
+    return String(done.sizeText || counted) + (done.truncated === true ? "+" : "")
+      + "  ·  " + compactTokens(service.folderSizeFiles) + " files"
+      + "  ·  " + compactTokens(service.folderSizeDirectories) + " folders"
   }
 
   function sizeText(bytes) {

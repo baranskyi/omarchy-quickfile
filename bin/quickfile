@@ -53,6 +53,11 @@ COLOR_KEYS = {"red", "yellow", "orange", "green", "cyan", "blue", "magenta", "br
 KNOWLEDGE_LIMIT = 128
 WATCH_PATH_LIMIT = 4096
 OPERATION_ENTRY_LIMIT = 250000
+# Measuring only reads: it journals nothing and holds no per-entry state, so
+# the copy scanner's ceiling — sized for what undo has to record — would stop
+# it far short of an ordinary home directory. It stays bounded, just at a
+# height a real tree fits under, and remains cancellable throughout.
+MEASURE_ENTRY_LIMIT = 20000000
 OPERATION_DEPTH_LIMIT = 128
 OPERATION_HISTORY_LIMIT = 50
 OPERATION_HISTORY_SIZE_LIMIT = 2 * 1024 * 1024
@@ -2955,7 +2960,7 @@ def directory_size_command(args: argparse.Namespace) -> dict[str, Any]:
             continue
         for child in children:
             check_operation_cancelled()
-            if files + directories + links >= OPERATION_ENTRY_LIMIT:
+            if files + directories + links >= MEASURE_ENTRY_LIMIT:
                 truncated = True
                 pending = []
                 break

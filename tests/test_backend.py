@@ -354,6 +354,17 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(result["size"], 4096)
         self.assertEqual(result["files"], 2)
 
+    def test_directory_size_marks_a_walk_that_hit_its_ceiling(self) -> None:
+        with mock.patch.object(quickfile, "MEASURE_ENTRY_LIMIT", 2):
+            result = quickfile.directory_size_command(argparse.Namespace(
+                path=str(self.root), path_token=None,
+            ))
+        self.assertTrue(result["truncated"])
+        # The copy scanner's ceiling is sized for what undo has to journal and
+        # would stop a measurement far short of an ordinary home directory.
+        self.assertGreater(quickfile.MEASURE_ENTRY_LIMIT,
+                           quickfile.OPERATION_ENTRY_LIMIT)
+
     def test_directory_size_refuses_a_file(self) -> None:
         with self.assertRaises(quickfile.QuickfileError) as raised:
             quickfile.directory_size_command(argparse.Namespace(

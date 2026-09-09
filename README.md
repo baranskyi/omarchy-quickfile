@@ -183,7 +183,8 @@ symlink targets, the way `du` does. Small folders resolve before you notice.
 Past a second the panel raises a sheet with the running total, the files and
 folders counted so far, and the folder being walked; closing it stops the walk
 and the row keeps the partial total, marked as stopped rather than passed off
-as final. The walk follows the inspector — change the selection or close the
+as final. A walk that hits its own bound marks the total with a `+` instead of
+presenting a floor as an answer. The walk follows the inspector — change the selection or close the
 panel and it stops.
 
 In the properties inspector, choose a color or enter a note (`Ctrl+Enter` saves it).

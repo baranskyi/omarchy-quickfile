@@ -820,12 +820,23 @@ ShellRoot {
     fixture.folderSizeResult = ({ sizeText: "5.0 MiB", truncated: false })
     fixture.folderSizeFiles = 120
     fixture.folderSizeDirectories = 8
-    check(panel.folderSizeText(folder) === "5.0 MiB  ·  120 files in 8 folders",
+    check(panel.folderSizeText(folder) === "5.0 MiB  ·  120 files  ·  8 folders",
       "a finished walk did not report the total and what it counted")
 
+    // Counts abbreviate so the row cannot outgrow its column and elide into
+    // something unreadable.
+    fixture.folderSizeFiles = 211625
+    fixture.folderSizeDirectories = 33067
+    check(panel.folderSizeText(folder) === "5.0 MiB  ·  211.6k files  ·  33.1k folders",
+      "large counts were not abbreviated to fit the row")
+    check(panel.folderSizeText(folder).length <= 44,
+      "the size row is long enough to elide in the properties column")
+
     fixture.folderSizeResult = ({ sizeText: "5.0 MiB", truncated: true })
-    check(panel.folderSizeText(folder).indexOf("partial") > 0,
-      "a walk stopped at the entry limit did not say it was partial")
+    check(panel.folderSizeText(folder).indexOf("5.0 MiB+") === 0,
+      "a walk that stopped early did not mark its total as a floor")
+    fixture.folderSizeFiles = 120
+    fixture.folderSizeDirectories = 8
 
     // A stopped walk must not pass its partial total off as the answer.
     fixture.folderSizeResult = null

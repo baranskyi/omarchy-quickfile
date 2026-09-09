@@ -119,6 +119,8 @@ concept. It does not depend on or copy unreleased FileBlade source code.
 | `←` | Parent directory |
 | `Delete` / `Backspace` | Move selected files and folders to Trash |
 | `/`, `Ctrl+F` | Focus search |
+| `?` | Open the keyboard shortcut sheet |
+| `Enter` | Confirm the open dialog (Trash, replace, rename) |
 | `H`, `.` | Toggle hidden files |
 | `P` | Properties for the selected item |
 | `N` / `Shift+N` | New file / new folder |
@@ -163,8 +165,8 @@ way to the match badge. The item count sits in the centre of the bottom bar,
 where an operation's progress or the pending clipboard takes its place while
 there is something to report.
 
-The `?` button beside the settings gear opens the same list in a sheet, so the
-keys are reachable without leaving the panel.
+The `?` key, or the button beside the settings gear, opens the same list in a
+sheet, so the keys are reachable without leaving the panel.
 
 Wherever the keyboard lands, the place it landed marks itself with a thin
 outline that brightens and fades in about half a second: the search field when

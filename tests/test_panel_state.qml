@@ -82,7 +82,7 @@ ShellRoot {
   Quickfile.Panel {
     id: panel
     service: fixture
-    manifest: ({ id: "m0sthatedman.quickfile" })
+    manifest: ({ id: "m0sthatedman.quickfile", version: "9.9.9" })
   }
 
   function check(condition, message) {
@@ -201,6 +201,9 @@ ShellRoot {
     check(panel.editorConfirmEnabled(),
       "the Trash confirmation refused the keyboard, leaving the mouse as the "
         + "only way to finish a deletion")
+    var dialog = objectFinder.findChild(panel, "quickfileEditorDialog")
+    check(dialog !== null && dialog.visible,
+      "the Trash confirmation did not raise its dialog")
     panel.commitEditor()
     check(panel.editorMode === "" && fixture.lastTrashedTokens.length === 2,
       "Backspace confirmation did not send the full selection to Trash")
@@ -747,6 +750,20 @@ ShellRoot {
     for (var c = 0; c < claimed.length; c++)
       check(listed.indexOf(claimed[c]) >= 0,
         "the shortcut sheet does not mention " + claimed[c])
+
+    var version = objectFinder.findChild(panel, "quickfileHeaderVersion")
+    check(version !== null && version.visible && version.text === "9.9.9",
+      "the header did not carry the version the host read from the manifest")
+    var wordmark = objectFinder.findChild(panel, "quickfileHeaderTitle")
+    check(wordmark !== null && version.font.pixelSize < wordmark.font.pixelSize,
+      "the version was not drawn smaller than the wordmark it annotates")
+    check(version.y <= wordmark.y + 1,
+      "the version sat on the wordmark's baseline instead of above it")
+    check(panel.pluginVersion === "9.9.9", "the version did not reach the panel")
+
+    var link = objectFinder.findChild(panel, "quickfileAuthorLink")
+    check(link !== null && link.url === "https://retless-brain.com",
+      "the shortcut sheet lost its author link")
 
     var help = objectFinder.findChild(panel, "quickfileHelpButton")
     check(help !== null, "could not find the shortcuts button")

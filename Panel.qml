@@ -65,6 +65,10 @@ Item {
   signal keyboardNavigationRequested(int index)
   readonly property string pluginId: manifest && manifest.id
     ? String(manifest.id) : "m0sthatedman.quickfile"
+  // Whatever the host read out of manifest.json. Deliberately no fallback
+  // literal: a hardcoded number here would go stale against the real one.
+  readonly property string pluginVersion: manifest && manifest.version
+    ? String(manifest.version) : ""
   readonly property string windowTitle: "QuickFile"
   readonly property int bladeWidth: Style.space(410)
   // Only the initial size; the compositor owns the window from then on.
@@ -1012,6 +1016,7 @@ Item {
       ] },
       { title: "Find", rows: [
         ["/", "Search here"],
+        ["?", "This list"],
         ["Esc", "Leave search"],
         ["H", "Show or hide dotfiles"],
         ["S · Shift+S", "Cycle sort order"],
@@ -1805,7 +1810,17 @@ Item {
 
         Keys.priority: Keys.BeforeItem
         Keys.onPressed: function(event) {
-          if (root.editorMode !== "") return
+          if (root.editorMode !== "") {
+            // A dialog with a text field consumes Return before the event
+            // reaches this scope, so this only fires for the ones without one
+            // — where the confirm button was otherwise the only way to say yes.
+            if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter)
+                && root.editorConfirmEnabled()) {
+              root.commitEditor()
+              event.accepted = true
+            }
+            return
+          }
           if (root.quickNavEnabled && event.key === Qt.Key_P
               && (event.modifiers & Qt.ControlModifier) !== 0) {
             root.openQuickNav()
@@ -1874,6 +1889,11 @@ Item {
           } else if (event.key === Qt.Key_Left) {
             root.service.goParent()
             event.accepted = true
+          } else if (event.key === Qt.Key_Question
+              || (event.key === Qt.Key_Slash
+                && (event.modifiers & Qt.ShiftModifier) !== 0)) {
+            root.beginEditor("shortcuts")
+            event.accepted = true
           } else if (event.key === Qt.Key_Slash
               || (event.key === Qt.Key_F && event.modifiers & Qt.ControlModifier)) {
             root.beginSearch()
@@ -1924,17 +1944,44 @@ Item {
               color: root.foreground
             }
 
-            Text {
-              textFormat: Text.PlainText
-              id: headerTitle
+            Item {
               anchors.verticalCenter: parent.verticalCenter
-              text: "QUICKFILE"
-              color: root.foreground
-              font.family: Style.font.family
-              font.pixelSize: root.secondaryFontSize
-              font.bold: true
-              font.letterSpacing: 1.2
-              renderType: Text.NativeRendering
+              width: headerTitle.width
+                + (headerVersion.visible ? headerVersion.width + Style.space(3) : 0)
+              height: headerTitle.height
+
+              Text {
+                textFormat: Text.PlainText
+                id: headerTitle
+                objectName: "quickfileHeaderTitle"
+                anchors.left: parent.left
+                anchors.top: parent.top
+                text: "QUICKFILE"
+                color: root.foreground
+                font.family: Style.font.family
+                font.pixelSize: root.secondaryFontSize
+                font.bold: true
+                font.letterSpacing: 1.2
+                renderType: Text.NativeRendering
+              }
+
+              // Rides the wordmark's cap line, the way a file's size rides its
+              // name — small enough to read as an annotation, not a second word.
+              Text {
+                textFormat: Text.PlainText
+                id: headerVersion
+                objectName: "quickfileHeaderVersion"
+                visible: text !== ""
+                text: root.pluginVersion
+                anchors.left: headerTitle.right
+                anchors.leftMargin: Style.space(3)
+                anchors.top: headerTitle.top
+                color: root.muted
+                font.family: Style.font.family
+                font.pixelSize: Math.max(7,
+                  Math.round(root.secondaryFontSize * 0.62))
+                renderType: Text.NativeRendering
+              }
             }
           }
 
@@ -4598,6 +4645,7 @@ Item {
 
         Rectangle {
           id: editorDialog
+          objectName: "quickfileEditorDialog"
           anchors.fill: parent
           visible: root.editorMode !== ""
           color: Qt.rgba(root.background.r, root.background.g, root.background.b, 0.84)
@@ -5021,6 +5069,47 @@ Item {
                         }
                       }
                     }
+                  }
+                }
+              }
+
+              Row {
+                visible: root.editorMode === "shortcuts"
+                width: parent.width
+                spacing: Style.space(5)
+
+                Text {
+                  textFormat: Text.PlainText
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: "Created by Slava Baranskyi"
+                  color: root.muted
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                  renderType: Text.NativeRendering
+                }
+
+                // Plain text with a click, not StyledText: this panel keeps
+                // every sink on PlainText and the destination is fixed here.
+                Text {
+                  textFormat: Text.PlainText
+                  id: authorLink
+                  objectName: "quickfileAuthorLink"
+                  readonly property string url: "https://retless-brain.com"
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: "retless-brain.com"
+                  color: root.accent
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                  font.underline: authorLinkMouse.containsMouse
+                  renderType: Text.NativeRendering
+
+                  MouseArea {
+                    id: authorLinkMouse
+                    anchors.fill: parent
+                    anchors.margins: -Style.space(3)
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: Qt.openUrlExternally(authorLink.url)
                   }
                 }
               }

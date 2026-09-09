@@ -325,6 +325,52 @@ class BackendTests(unittest.TestCase):
         store = quickfile.load_settings_store()
         self.assertEqual(store["dateFormat"], "full")
 
+    def test_directory_size_sums_the_tree_like_du(self) -> None:
+        (self.root / "folder" / "deep").mkdir()
+        (self.root / "folder" / "deep" / "payload.bin").write_bytes(b"x" * 5000)
+        result = quickfile.directory_size_command(argparse.Namespace(
+            path=str(self.root), path_token=None,
+        ))
+        expected = 0
+        for base, _, names in os.walk(self.root):
+            for name in names:
+                target = os.path.join(base, name)
+                if not os.path.islink(target):
+                    expected += os.lstat(target).st_size
+        self.assertEqual(result["size"], expected)
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["truncated"])
+        self.assertGreaterEqual(result["directories"], 2)
+        self.assertEqual(result["links"], 1)
+
+    def test_directory_size_counts_a_hard_link_once(self) -> None:
+        room = self.root / "links"
+        room.mkdir()
+        (room / "original.bin").write_bytes(b"y" * 4096)
+        os.link(room / "original.bin", room / "same.bin")
+        result = quickfile.directory_size_command(argparse.Namespace(
+            path=str(room), path_token=None,
+        ))
+        self.assertEqual(result["size"], 4096)
+        self.assertEqual(result["files"], 2)
+
+    def test_directory_size_refuses_a_file(self) -> None:
+        with self.assertRaises(quickfile.QuickfileError) as raised:
+            quickfile.directory_size_command(argparse.Namespace(
+                path=str(self.root / "notes.txt"), path_token=None,
+            ))
+        self.assertEqual(raised.exception.code, "not-a-directory")
+
+    def test_directory_size_stops_when_cancelled(self) -> None:
+        quickfile.request_operation_cancel(0, None)
+        try:
+            with self.assertRaises(quickfile.OperationCancelled):
+                quickfile.directory_size_command(argparse.Namespace(
+                    path=str(self.root), path_token=None,
+                ))
+        finally:
+            quickfile._operation_cancelled = False
+
     def test_tree_expands_only_requested_directory(self) -> None:
         token = quickfile.encode_path(str(self.root / "folder"))
         result = quickfile.tree_command(self.tree_args(expanded=[token]))

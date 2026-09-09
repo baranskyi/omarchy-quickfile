@@ -2918,6 +2918,82 @@ def discard_history_referencing_trash(uris: set[str]) -> None:
 _operation_cancelled = False
 
 
+def directory_size_command(args: argparse.Namespace) -> dict[str, Any]:
+    """Walk a directory and stream its apparent and allocated size.
+
+    The panel cannot show a real total for a tree without walking it, and a
+    deep tree takes long enough that the walk has to be interruptible and has
+    to say what it is doing while it runs. Progress goes out as NDJSON on the
+    same contract the file operations use; SIGTERM stops it between entries.
+    """
+    root = path_from_args(args, required=True)
+    if not os.path.isdir(root) or os.path.islink(root):
+        raise QuickfileError("Not a directory", "not-a-directory")
+
+    reporter = OperationReporter()
+    total = 0
+    allocated = 0
+    files = 0
+    directories = 0
+    links = 0
+    unreadable = 0
+    truncated = False
+    seen: set[tuple[int, int]] = set()
+    pending: list[tuple[str, int]] = [(normalized_path(root), 0)]
+
+    while pending:
+        check_operation_cancelled()
+        current, depth = pending.pop()
+        if depth > OPERATION_DEPTH_LIMIT:
+            truncated = True
+            continue
+        try:
+            with os.scandir(current) as iterator:
+                children = list(iterator)
+        except OSError:
+            unreadable += 1
+            continue
+        for child in children:
+            check_operation_cancelled()
+            if files + directories + links >= OPERATION_ENTRY_LIMIT:
+                truncated = True
+                pending = []
+                break
+            try:
+                details = child.stat(follow_symlinks=False)
+            except OSError:
+                unreadable += 1
+                continue
+            if stat.S_ISLNK(details.st_mode):
+                links += 1
+                continue
+            if child.is_dir(follow_symlinks=False):
+                directories += 1
+                pending.append((os.path.join(current, child.name), depth + 1))
+                continue
+            files += 1
+            # A hard link counts once: the bytes exist once on disk, and
+            # counting them twice would overstate what deleting the tree frees.
+            identity = (details.st_dev, details.st_ino)
+            if details.st_nlink > 1:
+                if identity in seen:
+                    continue
+                seen.add(identity)
+            total += details.st_size
+            allocated += getattr(details, "st_blocks", 0) * 512
+        reporter.emit("measuring", bytesDone=total, allocated=allocated,
+                      files=files, directories=directories,
+                      path=display_text(current))
+
+    return {
+        "ok": True, "path": display_text(root), "token": encode_path(root),
+        "size": total, "sizeText": human_size(total),
+        "allocatedSize": allocated, "allocatedSizeText": human_size(allocated),
+        "files": files, "directories": directories, "links": links,
+        "unreadable": unreadable, "truncated": truncated,
+    }
+
+
 def request_operation_cancel(_signum: int, _frame: Any) -> None:
     global _operation_cancelled
     _operation_cancelled = True
@@ -4149,6 +4225,11 @@ def parser() -> argparse.ArgumentParser:
     operation.add_argument("--trash-uris-json")
     operation.add_argument("--conflict-policy", choices=CONFLICT_POLICIES, default="ask")
 
+    directory_size = subcommands.add_parser(
+        "directory-size", help="Walk a directory and stream its total size"
+    )
+    add_path_arguments(directory_size)
+
     subcommands.add_parser("trash-list", help="List bounded Trash entries")
     subcommands.add_parser("history", help="Return the latest undoable operation")
     return root
@@ -4156,7 +4237,7 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv: Iterable[str] | None = None) -> int:
     args = parser().parse_args(list(argv) if argv is not None else None)
-    if args.command == "operation":
+    if args.command in {"operation", "directory-size"}:
         signal.signal(signal.SIGTERM, request_operation_cancel)
         signal.signal(signal.SIGINT, request_operation_cancel)
     try:
@@ -4186,6 +4267,9 @@ def main(argv: Iterable[str] | None = None) -> int:
             result = metadata_command(args)
         elif args.command == "operation":
             result = operation_command(args)
+        elif args.command == "directory-size":
+            result = directory_size_command(args)
+            result["event"] = "result"
         elif args.command == "trash-list":
             result = trash_list_command(args)
         elif args.command == "history":
@@ -4199,7 +4283,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         if isinstance(exc, OperationConflict):
             payload["conflicts"] = exc.conflicts
             payload["conflictPolicyOptions"] = list(CONFLICT_POLICIES[1:])
-        if args.command == "operation":
+        if args.command in {"operation", "directory-size"}:
             payload["event"] = "result"
         json_print(payload)
         return 130 if isinstance(exc, OperationCancelled) else 2

@@ -614,9 +614,29 @@ Item {
       if (service) service.dismissOperationConflict()
       conflictRows = []
     }
+    // Closing the progress sheet is how you stop the walk. The partial total
+    // stays on the Size row, marked as stopped rather than passed off as final.
+    if (editorMode === "folder-size" && service) service.cancelFolderSize()
     pendingDrop = null
     editorMode = ""
     editorError = ""
+  }
+
+  // Only ever measures what the inspector is actually showing: a folder, on
+  // the Properties tab, with the inspector open. Anything else stops the walk.
+  function syncFolderMeasurement() {
+    if (!service) return
+    var p = service.selectedProperties
+    var wanted = inspectorOpen && p && String(p.kind || "") === "directory"
+      && service.inspectorTab === "properties" ? String(p.token || "") : ""
+    if (wanted === "") {
+      if (service.folderSizeToken !== "") service.clearFolderSize()
+      folderSizeDialogTimer.stop()
+      if (editorMode === "folder-size") dismissEditor()
+      return
+    }
+    if (service.folderSizeToken === wanted) return
+    if (service.measureFolder(wanted)) folderSizeDialogTimer.restart()
   }
 
   function cancelEditor() {
@@ -641,6 +661,28 @@ Item {
   // the name column's ellipsis point stops moving from row to row.
   // "5h" and "Yesterday" go stale on their own. A minute is fine for both:
   // relative steps no faster than that, and smart only turns over at midnight.
+  // A folder small enough to measure in under a second needs no sheet; the
+  // Size row updates and that is the whole story. Past that, the wait has to
+  // be visible and interruptible.
+  Timer {
+    id: folderSizeDialogTimer
+    interval: 1000
+    onTriggered: {
+      if (root.service && root.service.folderSizeBusy && root.editorMode === "")
+        root.beginEditor("folder-size")
+    }
+  }
+
+  Connections {
+    target: root.service
+    function onFolderSizeBusyChanged() {
+      if (!root.service.folderSizeBusy) {
+        folderSizeDialogTimer.stop()
+        if (root.editorMode === "folder-size") root.editorMode = ""
+      }
+    }
+  }
+
   Timer {
     interval: 30000
     repeat: true
@@ -918,13 +960,44 @@ Item {
         String(volume.mountPath || ""))
   }
 
+  // A directory's own `st_size` describes its index, not its contents, so the
+  // row reports the walk instead: what it has counted so far while it runs,
+  // and the total once it lands.
+  function folderSizeText(p) {
+    var plain = String(p.sizeText || "")
+      + (p.allocatedSizeText ? " · " + p.allocatedSizeText + " allocated" : "")
+    if (!service || String(p.kind || "") !== "directory") return plain
+    if (String(service.folderSizeToken || "") !== String(p.token || "")) return plain
+    var counted = sizeText(service.folderSizeBytes)
+    if (service.folderSizeBusy) return counted + " so far  ·  counting…"
+    if (service.folderSizeError !== "") return plain + "  ·  " + service.folderSizeError
+    if (!service.folderSizeResult) return counted + "  ·  stopped"
+    var done = service.folderSizeResult
+    return String(done.sizeText || counted)
+      + "  ·  " + service.folderSizeFiles + " files in "
+      + service.folderSizeDirectories + " folders"
+      + (done.truncated === true ? "  ·  partial" : "")
+  }
+
+  function sizeText(bytes) {
+    var amount = Math.max(0, Number(bytes) || 0)
+    var units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"]
+    var index = 0
+    while (amount >= 1024 && index < units.length - 1) {
+      amount /= 1024
+      index++
+    }
+    return (index === 0 ? String(Math.round(amount)) : amount.toFixed(1))
+      + " " + units[index]
+  }
+
   function propertyRows() {
     if (!service || !service.selectedProperties) return []
     var p = service.selectedProperties
     var rows = [
       { label: "Type", value: p.kind || "" },
       { label: "MIME", value: p.mime || "" },
-      { label: "Size", value: (p.sizeText || "") + (p.allocatedSizeText ? " · " + p.allocatedSizeText + " allocated" : "") },
+      { label: "Size", value: folderSizeText(p) },
       { label: "Modified", value: p.modified || "" },
       { label: "Accessed", value: p.accessed || "" },
       { label: "Created", value: p.created || "—" },
@@ -1361,8 +1434,8 @@ Item {
   // keyboard. Mirrors the confirm button's own visibility and enabled state.
   function editorConfirmEnabled() {
     if (!service || service.actionBusy) return false
-    if (["", "trash-browser", "quick-nav", "drop-choice", "conflict", "shortcuts"]
-      .indexOf(editorMode) >= 0) return false
+    if (["", "trash-browser", "quick-nav", "drop-choice", "conflict", "shortcuts",
+      "folder-size"].indexOf(editorMode) >= 0) return false
     if (editorMode === "knowledge-links")
       return !!service.knowledgeLinkPlan && service.knowledgeLinkPlan.createCount > 0
     return true
@@ -1423,6 +1496,7 @@ Item {
     }
     function onSelectedPropertiesChanged() {
       root.syncMetadataEditor(true)
+      root.syncFolderMeasurement()
     }
     function onActionFinished(kind, ok, message) {
       if (kind === "metadata") root.finishMetadataSave(ok)
@@ -4704,6 +4778,7 @@ Item {
                   : root.editorMode === "trash-browser" ? "Trash"
                   : root.editorMode === "trash-delete" ? "Delete permanently?"
                   : root.editorMode === "shortcuts" ? "Keyboard shortcuts"
+                  : root.editorMode === "folder-size" ? "Measuring the folder"
                   : root.editorMode === "quick-nav" ? "Quick Nav"
                   : root.editorMode === "drop-choice" ? "Copy or move here?"
                   : root.editorMode === "conflict" ? "Files already exist"
@@ -4997,6 +5072,81 @@ Item {
                   tooltip: "Review a separate confirmation before replacing existing items"
                   enabled: root.service && !root.service.actionBusy
                   onClicked: root.chooseConflictPolicy("replace")
+                }
+              }
+
+              Column {
+                visible: root.editorMode === "folder-size"
+                width: parent.width
+                spacing: Style.space(9)
+
+                // Nothing knows the total until the walk ends, so an honest
+                // bar cannot fill toward one. This sweeps to say "still
+                // working" while the counts below carry the real progress.
+                Rectangle {
+                  id: measureTrack
+                  width: parent.width
+                  height: Style.space(4)
+                  radius: height / 2
+                  color: Qt.alpha(root.foreground, 0.1)
+                  clip: true
+
+                  Rectangle {
+                    id: measureSweep
+                    width: parent.width * 0.32
+                    height: parent.height
+                    radius: height / 2
+                    color: root.accent
+                    x: -width
+
+                    XAnimator on x {
+                      running: root.editorMode === "folder-size"
+                        && root.service && root.service.folderSizeBusy
+                      loops: Animation.Infinite
+                      from: -measureSweep.width
+                      to: measureTrack.width
+                      duration: 1100
+                      easing.type: Easing.InOutQuad
+                    }
+                  }
+                }
+
+                Text {
+                  textFormat: Text.PlainText
+                  width: parent.width
+                  text: !root.service ? ""
+                    : root.sizeText(root.service.folderSizeBytes) + " counted"
+                  color: root.foreground
+                  font.family: Style.font.family
+                  font.pixelSize: root.primaryFontSize
+                  renderType: Text.NativeRendering
+                }
+
+                Text {
+                  textFormat: Text.PlainText
+                  width: parent.width
+                  text: !root.service ? ""
+                    : root.service.folderSizeFiles + " files  ·  "
+                      + root.service.folderSizeDirectories + " folders"
+                  color: root.muted
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.bodySmall
+                  renderType: Text.NativeRendering
+                }
+
+                // The folder currently being walked. A path is untrusted text
+                // like any filename, so it goes to a plain sink and elides
+                // from the left, where the interesting end is.
+                Text {
+                  textFormat: Text.PlainText
+                  objectName: "quickfileMeasurePath"
+                  width: parent.width
+                  text: root.service ? root.service.folderSizePath : ""
+                  color: root.muted
+                  elide: Text.ElideLeft
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                  renderType: Text.NativeRendering
                 }
               }
 
@@ -5407,6 +5557,7 @@ Item {
                   glyph: "󰅖"
                   label: ["trash-browser", "shortcuts"].indexOf(root.editorMode) >= 0
                     ? "Close"
+                    : root.editorMode === "folder-size" ? "Stop"
                     : root.editorMode === "conflict-replace" ? "Back" : "Cancel"
                   onClicked: {
                     root.cancelEditor()
@@ -5415,7 +5566,7 @@ Item {
                 }
                 ActionButton {
                   visible: ["trash-browser", "quick-nav", "drop-choice", "conflict",
-                    "shortcuts"].indexOf(root.editorMode) < 0
+                    "shortcuts", "folder-size"].indexOf(root.editorMode) < 0
                   glyph: root.editorMode === "trash" ? "󰩺"
                     : root.editorMode === "trash-delete" ? "󰆴"
                     : root.editorMode === "conflict-replace" ? "󰁯"

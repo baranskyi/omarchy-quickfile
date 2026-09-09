@@ -175,8 +175,18 @@ inspector when a right click opens it on an item. It is a flash, not a state —
 nothing stays lit, and the outline never takes a click from what it marks.
 
 Click the search-mode label to cycle between search modes. Folder chevrons
-expand in place; double-clicking the row changes the tree root. In the
-properties inspector, choose a color or enter a note (`Ctrl+Enter` saves it).
+expand in place; double-clicking the row changes the tree root.
+
+A folder's `Size` is the whole tree, not the size of its index: opening
+Properties on one walks it, counting hard-linked bytes once and skipping
+symlink targets, the way `du` does. Small folders resolve before you notice.
+Past a second the panel raises a sheet with the running total, the files and
+folders counted so far, and the folder being walked; closing it stops the walk
+and the row keeps the partial total, marked as stopped rather than passed off
+as final. The walk follows the inspector — change the selection or close the
+panel and it stops.
+
+In the properties inspector, choose a color or enter a note (`Ctrl+Enter` saves it).
 File actions are available as an icon strip directly below the selected name;
 delayed tooltips explain each action. Starring is done from the file row
 itself; starred items appear as indented children of the `FAVORITES` module

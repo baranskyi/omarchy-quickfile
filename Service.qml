@@ -137,6 +137,22 @@ Item {
   // this never re-runs the listing.
   readonly property var dateFormats: ["full", "adaptive", "smart", "relative", "off"]
   property string dateFormat: "full"
+
+  // Recursive size of the inspected folder. `st_size` on a directory is the
+  // size of its index, not of what it holds, so the real number has to be
+  // walked for — and a deep tree takes long enough that the walk reports as
+  // it goes and can be stopped.
+  property string folderSizeToken: ""
+  property bool folderSizeBusy: folderSizeProcess.running
+  property bool folderSizeCancelling: false
+  property double folderSizeBytes: 0
+  property double folderSizeAllocated: 0
+  property int folderSizeFiles: 0
+  property int folderSizeDirectories: 0
+  property string folderSizePath: ""
+  property var folderSizeResult: null
+  property string folderSizeError: ""
+  property double folderSizeStarted: 0
   property string query: ""
   property string searchMode: "fuzzy"
   property bool caseSensitive: false
@@ -1569,6 +1585,71 @@ Item {
     return conflict
   }
 
+  function measureFolder(token) {
+    var value = String(token || "")
+    if (value === "" || !initialized) return false
+    if (folderSizeProcess.running) {
+      if (folderSizeToken === value) return false
+      cancelFolderSize()
+    }
+    folderSizeToken = value
+    folderSizeCancelling = false
+    folderSizeBytes = 0
+    folderSizeAllocated = 0
+    folderSizeFiles = 0
+    folderSizeDirectories = 0
+    folderSizePath = ""
+    folderSizeResult = null
+    folderSizeError = ""
+    folderSizeStarted = Date.now()
+    folderSizeProcess.command = ["/usr/bin/env", "python3", cliPath,
+      "directory-size", "--path-token", value]
+    folderSizeProcess.running = true
+    return true
+  }
+
+  function cancelFolderSize() {
+    if (!folderSizeProcess.running || folderSizeCancelling) return false
+    folderSizeCancelling = true
+    folderSizeProcess.signal(15)
+    return true
+  }
+
+  function clearFolderSize() {
+    if (folderSizeProcess.running) cancelFolderSize()
+    folderSizeToken = ""
+    folderSizeResult = null
+    folderSizeError = ""
+    folderSizeBytes = 0
+    folderSizeAllocated = 0
+    folderSizeFiles = 0
+    folderSizeDirectories = 0
+    folderSizePath = ""
+  }
+
+  function handleFolderSizeEvent(line) {
+    var parsed = null
+    try { parsed = JSON.parse(String(line || "")) } catch (error) { return }
+    if (!parsed) return
+    if (parsed.event === "progress") {
+      folderSizeBytes = Number(parsed.bytesDone) || 0
+      folderSizeAllocated = Number(parsed.allocated) || 0
+      folderSizeFiles = Number(parsed.files) || 0
+      folderSizeDirectories = Number(parsed.directories) || 0
+      folderSizePath = String(parsed.path || "")
+      return
+    }
+    if (parsed.ok === true) {
+      folderSizeResult = parsed
+      folderSizeBytes = Number(parsed.size) || 0
+      folderSizeAllocated = Number(parsed.allocatedSize) || 0
+      folderSizeFiles = Number(parsed.files) || 0
+      folderSizeDirectories = Number(parsed.directories) || 0
+    } else if (parsed.error) {
+      folderSizeError = String(parsed.error)
+    }
+  }
+
   function cancelOperation() {
     if (!operationProcess.running || operationCancelling) return false
     operationCancelling = true
@@ -2243,6 +2324,27 @@ Item {
       Qt.callLater(root.reloadTrash)
       // A cancelled or failed batch can still have completed earlier items.
       Qt.callLater(root.refreshAll)
+    }
+  }
+
+  Process {
+    id: folderSizeProcess
+    stdout: SplitParser {
+      onRead: function(data) { root.handleFolderSizeEvent(data) }
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        if (!root.folderSizeResult && text.trim() !== "")
+          root.folderSizeError = text.slice(-400).trim()
+      }
+    }
+    onExited: function(exitCode) {
+      // A cancelled walk keeps the partial numbers on screen; they are still
+      // a true floor for the folder, just not the whole of it.
+      if (exitCode !== 0 && !root.folderSizeResult && root.folderSizeError === "")
+        root.folderSizeError = root.folderSizeCancelling ? "" : "Could not measure the folder"
+      root.folderSizeCancelling = false
     }
   }
 

@@ -46,6 +46,24 @@ ShellRoot {
       modelChanged()
       return true
     }
+    property var measuredTokens: []
+    property int folderSizeCancels: 0
+    function measureFolder(token) {
+      if (String(token) === "") return false
+      folderSizeToken = String(token)
+      folderSizeBytes = 0
+      folderSizeResult = null
+      folderSizeError = ""
+      measuredTokens.push(String(token))
+      return true
+    }
+    function cancelFolderSize() { folderSizeCancels++; return true }
+    function clearFolderSize() {
+      folderSizeToken = ""
+      folderSizeResult = null
+      folderSizeError = ""
+      return true
+    }
     function setDateFormat(format) {
       if (dateFormats.indexOf(String(format)) < 0 || dateFormat === String(format))
         return false
@@ -775,6 +793,96 @@ ShellRoot {
     panel.editorMode = ""
   }
 
+  function folderSizeChecks() {
+    check(panel.sizeText(0) === "0 B" && panel.sizeText(2048) === "2.0 KiB"
+        && panel.sizeText(3 * 1024 * 1024) === "3.0 MiB",
+      "the byte formatter did not scale its units")
+
+    var file = ({ kind: "file", token: "plain-file", sizeText: "12 B",
+      allocatedSizeText: "4.0 KiB" })
+    check(panel.folderSizeText(file) === "12 B · 4.0 KiB allocated",
+      "a file's size row stopped reporting what the backend measured")
+
+    // A directory nobody is walking reads exactly as before.
+    var folder = ({ kind: "directory", token: "folder-token", sizeText: "2.7 KiB",
+      allocatedSizeText: "0 B" })
+    fixture.folderSizeToken = ""
+    check(panel.folderSizeText(folder) === "2.7 KiB · 0 B allocated",
+      "an unmeasured folder did not fall back to its own stat")
+
+    fixture.folderSizeToken = "folder-token"
+    fixture.folderSizeBusy = true
+    fixture.folderSizeBytes = 5 * 1024 * 1024
+    check(panel.folderSizeText(folder) === "5.0 MiB so far  ·  counting…",
+      "a folder being walked did not report its running total")
+
+    fixture.folderSizeBusy = false
+    fixture.folderSizeResult = ({ sizeText: "5.0 MiB", truncated: false })
+    fixture.folderSizeFiles = 120
+    fixture.folderSizeDirectories = 8
+    check(panel.folderSizeText(folder) === "5.0 MiB  ·  120 files in 8 folders",
+      "a finished walk did not report the total and what it counted")
+
+    fixture.folderSizeResult = ({ sizeText: "5.0 MiB", truncated: true })
+    check(panel.folderSizeText(folder).indexOf("partial") > 0,
+      "a walk stopped at the entry limit did not say it was partial")
+
+    // A stopped walk must not pass its partial total off as the answer.
+    fixture.folderSizeResult = null
+    check(panel.folderSizeText(folder) === "5.0 MiB  ·  stopped",
+      "a stopped walk presented its partial total as final")
+
+    fixture.folderSizeError = "Permission denied"
+    check(panel.folderSizeText(folder).indexOf("Permission denied") > 0,
+      "a failed walk hid its reason")
+    fixture.folderSizeError = ""
+    fixture.folderSizeToken = ""
+    fixture.folderSizeResult = null
+
+    // The walk follows what the inspector is showing, and only that.
+    fixture.measuredTokens = []
+    fixture.inspectorTab = "properties"
+    panel.inspectorOpen = true
+    fixture.selectedProperties = ({ kind: "directory", token: "walk-me",
+      sizeText: "4.0 KiB", allocatedSizeText: "0 B" })
+    panel.syncFolderMeasurement()
+    check(fixture.measuredTokens.length === 1
+        && fixture.measuredTokens[0] === "walk-me",
+      "opening Properties on a folder did not start measuring it")
+
+    panel.syncFolderMeasurement()
+    check(fixture.measuredTokens.length === 1,
+      "the same folder was measured twice for one inspection")
+
+    fixture.selectedProperties = ({ kind: "file", token: "not-a-folder",
+      sizeText: "10 B" })
+    panel.syncFolderMeasurement()
+    check(fixture.folderSizeToken === "" && fixture.measuredTokens.length === 1,
+      "selecting a file left the folder walk running")
+
+    fixture.selectedProperties = ({ kind: "directory", token: "walk-me",
+      sizeText: "4.0 KiB", allocatedSizeText: "0 B" })
+    panel.syncFolderMeasurement()
+    check(fixture.measuredTokens.length === 2, "the walk did not restart")
+    var cancels = fixture.folderSizeCancels
+    panel.inspectorOpen = false
+    panel.syncFolderMeasurement()
+    check(fixture.folderSizeToken === "",
+      "closing the inspector left the folder walk running")
+
+    // Dismissing the progress sheet is what stops the walk.
+    fixture.folderSizeCancels = cancels
+    panel.editorMode = "folder-size"
+    panel.dismissEditor()
+    check(panel.editorMode === "" && fixture.folderSizeCancels === cancels + 1,
+      "closing the progress sheet did not stop the walk it was reporting")
+    check(!panel.editorConfirmEnabled(),
+      "the progress sheet offered a confirm action")
+
+    fixture.selectedProperties = null
+    fixture.measuredTokens = []
+  }
+
   function footerChecks() {
     var footer = objectFinder.findChild(panel, "quickfileFooterStatus")
     check(footer !== null, "could not find the footer status label")
@@ -1228,7 +1336,15 @@ ShellRoot {
   function captureIfRequested() {
     if (!Quickshell.env("QUICKFILE_PANEL_SCREENSHOT")) return false
     var mode = String(Quickshell.env("QUICKFILE_PANEL_SCREENSHOT_MODE") || "preview")
-    if (mode === "shortcuts") {
+    if (mode === "folder-size") {
+      fixture.folderSizeBusy = true
+      fixture.folderSizeToken = "walk-me"
+      fixture.folderSizeBytes = 5.4 * 1024 * 1024 * 1024
+      fixture.folderSizeFiles = 48213
+      fixture.folderSizeDirectories = 3907
+      fixture.folderSizePath = "/home/test/Personal-Super-Agent/Projects/omarchy-quickfile/components"
+      panel.beginEditor("folder-size")
+    } else if (mode === "shortcuts") {
       panel.beginEditor("shortcuts")
     } else if (mode === "inspector") {
       fixture.inspectorTab = "notes"
@@ -1274,6 +1390,7 @@ ShellRoot {
         testRoot.dateFormatChecks()
         testRoot.dateChipChecks()
         testRoot.footerChecks()
+        testRoot.folderSizeChecks()
         // After the pulse checks: P opens the inspector, and they assert on an
         // inspector outline that nothing has asked for yet.
         testRoot.focusPulseChecks()

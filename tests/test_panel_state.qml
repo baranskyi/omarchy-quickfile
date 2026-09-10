@@ -780,7 +780,7 @@ ShellRoot {
     check(panel.pluginVersion === "9.9.9", "the version did not reach the panel")
 
     var link = objectFinder.findChild(panel, "quickfileAuthorLink")
-    check(link !== null && link.url === "https://retless-brain.com",
+    check(link !== null && link.url === "https://restless-brain.com",
       "the shortcut sheet lost its author link")
 
     var help = objectFinder.findChild(panel, "quickfileHelpButton")

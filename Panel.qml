@@ -5246,9 +5246,9 @@ Item {
                   textFormat: Text.PlainText
                   id: authorLink
                   objectName: "quickfileAuthorLink"
-                  readonly property string url: "https://retless-brain.com"
+                  readonly property string url: "https://restless-brain.com"
                   anchors.verticalCenter: parent.verticalCenter
-                  text: "retless-brain.com"
+                  text: "restless-brain.com"
                   color: root.accent
                   font.family: Style.font.family
                   font.pixelSize: Style.font.caption

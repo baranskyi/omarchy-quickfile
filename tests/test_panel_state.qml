@@ -470,12 +470,20 @@ ShellRoot {
     // offset from it, so the assertions do not rot with the calendar.
     var now = new Date(2026, 8, 9, 14, 0, 0).getTime()
     function at(msAgo) { return ({ modifiedEpoch: (now - msAgo) / 1000 }) }
+    // A wall clock an age away from the fixed one is built as a calendar date,
+    // not as a subtraction: in a timezone that observes daylight saving, an
+    // offset in milliseconds lands an hour off the hour it names, and an
+    // assertion spelling out the clock would then fail on the calendar rather
+    // than on the code.
+    function on(year, month, dayOfMonth) {
+      return ({ modifiedEpoch: new Date(year, month, dayOfMonth, 14, 0, 0).getTime() / 1000 })
+    }
     var minute = 60000, hour = 3600000, day = 86400000
 
     fixture.dateFormat = "full"
     check(panel.dateLabel(at(0), now) === "2026-09-09 14:00",
       "the full format stopped producing the stamp it always has")
-    check(panel.dateLabel(at(300 * day), now) === "2025-11-13 14:00",
+    check(panel.dateLabel(on(2025, 10, 13), now) === "2025-11-13 14:00",
       "the full format changed shape for an old file")
 
     fixture.dateFormat = "adaptive"

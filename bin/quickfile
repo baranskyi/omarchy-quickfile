@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-VERSION = "0.15.0"
+VERSION = "0.15.1"
 DEFAULT_LIMIT = 2000
 COMMAND_TIMEOUT = 3
 # `git status` is the only command on the navigation path that can scale with
@@ -58,6 +58,13 @@ OPERATION_ENTRY_LIMIT = 250000
 # it far short of an ordinary home directory. It stays bounded, just at a
 # height a real tree fits under, and remains cancellable throughout.
 MEASURE_ENTRY_LIMIT = 20000000
+# How much the walk may hold, as opposed to how far it may count. It runs in
+# the long-lived helper beside the panel, so a single directory of millions of
+# entries must never be materialized, and neither the queue of directories
+# still to visit nor the hard-link identities may grow with the tree. Past
+# either ceiling the walk keeps counting and reports `truncated`.
+MEASURE_PENDING_LIMIT = 50000
+MEASURE_IDENTITY_LIMIT = 200000
 OPERATION_DEPTH_LIMIT = 128
 OPERATION_HISTORY_LIMIT = 50
 OPERATION_HISTORY_SIZE_LIMIT = 2 * 1024 * 1024
@@ -2954,38 +2961,56 @@ def directory_size_command(args: argparse.Namespace) -> dict[str, Any]:
             continue
         try:
             with os.scandir(current) as iterator:
-                children = list(iterator)
+                # Streamed, never listed. Materializing the directory would
+                # allocate every entry before any ceiling below has had the
+                # chance to stop anything, which is the whole tree's size in
+                # memory for a directory built to be large.
+                for child in iterator:
+                    check_operation_cancelled()
+                    if files + directories + links >= MEASURE_ENTRY_LIMIT:
+                        truncated = True
+                        pending = []
+                        break
+                    try:
+                        details = child.stat(follow_symlinks=False)
+                    except OSError:
+                        unreadable += 1
+                        continue
+                    if stat.S_ISLNK(details.st_mode):
+                        links += 1
+                        continue
+                    if child.is_dir(follow_symlinks=False):
+                        directories += 1
+                        # A directory is counted whether or not it is queued;
+                        # what the ceiling bounds is what the walk retains.
+                        if len(pending) >= MEASURE_PENDING_LIMIT:
+                            truncated = True
+                            continue
+                        pending.append(
+                            (os.path.join(current, child.name), depth + 1))
+                        continue
+                    files += 1
+                    # A hard link counts once: the bytes exist once on disk, and
+                    # counting them twice would overstate what deleting the tree
+                    # frees. Past the ceiling the walk stops deduplicating
+                    # rather than growing, which turns the total into an upper
+                    # bound — what `truncated` is there to say.
+                    identity = (details.st_dev, details.st_ino)
+                    if details.st_nlink > 1:
+                        if identity in seen:
+                            continue
+                        if len(seen) >= MEASURE_IDENTITY_LIMIT:
+                            truncated = True
+                        else:
+                            seen.add(identity)
+                    total += details.st_size
+                    # A platform without block counts reports the field as
+                    # None rather than omitting it, so a default alone is not
+                    # enough to keep the arithmetic real.
+                    allocated += (getattr(details, "st_blocks", 0) or 0) * 512
         except OSError:
             unreadable += 1
             continue
-        for child in children:
-            check_operation_cancelled()
-            if files + directories + links >= MEASURE_ENTRY_LIMIT:
-                truncated = True
-                pending = []
-                break
-            try:
-                details = child.stat(follow_symlinks=False)
-            except OSError:
-                unreadable += 1
-                continue
-            if stat.S_ISLNK(details.st_mode):
-                links += 1
-                continue
-            if child.is_dir(follow_symlinks=False):
-                directories += 1
-                pending.append((os.path.join(current, child.name), depth + 1))
-                continue
-            files += 1
-            # A hard link counts once: the bytes exist once on disk, and
-            # counting them twice would overstate what deleting the tree frees.
-            identity = (details.st_dev, details.st_ino)
-            if details.st_nlink > 1:
-                if identity in seen:
-                    continue
-                seen.add(identity)
-            total += details.st_size
-            allocated += getattr(details, "st_blocks", 0) * 512
         reporter.emit("measuring", bytesDone=total, allocated=allocated,
                       files=files, directories=directories,
                       path=display_text(current))

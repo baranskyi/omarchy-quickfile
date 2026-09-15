@@ -365,6 +365,74 @@ class BackendTests(unittest.TestCase):
         self.assertGreater(quickfile.MEASURE_ENTRY_LIMIT,
                            quickfile.OPERATION_ENTRY_LIMIT)
 
+    def test_directory_size_streams_a_directory_instead_of_listing_it(self) -> None:
+        # A directory large enough to hurt is the reason the ceiling exists, so
+        # the walk has to stop pulling entries at it — not after the kernel has
+        # handed over every one of them into a list.
+        produced = {"count": 0}
+
+        class Entry:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def stat(self, follow_symlinks: bool = True) -> os.stat_result:
+                return os.stat_result(
+                    (0o100644, 1, 1, 1, 0, 0, 8, 0, 0, 0))
+
+            def is_dir(self, follow_symlinks: bool = True) -> bool:
+                return False
+
+        class Scan:
+            def __enter__(self):
+                def entries():
+                    for index in range(1000):
+                        produced["count"] += 1
+                        yield Entry("file-%d.bin" % index)
+                return entries()
+
+            def __exit__(self, *_):
+                return False
+
+        with mock.patch.object(os, "scandir", lambda _path: Scan()), \
+                mock.patch.object(quickfile, "MEASURE_ENTRY_LIMIT", 10):
+            result = quickfile.directory_size_command(argparse.Namespace(
+                path=str(self.root), path_token=None,
+            ))
+        self.assertTrue(result["truncated"])
+        # One past the ceiling is what it takes to notice it; a listed
+        # directory would have produced all thousand.
+        self.assertLessEqual(produced["count"], 11)
+
+    def test_directory_size_bounds_the_directory_queue(self) -> None:
+        for index in range(4):
+            (self.root / ("branch-%d" % index)).mkdir()
+        with mock.patch.object(quickfile, "MEASURE_PENDING_LIMIT", 1):
+            result = quickfile.directory_size_command(argparse.Namespace(
+                path=str(self.root), path_token=None,
+            ))
+        self.assertTrue(result["truncated"])
+        # Every directory is still counted; what the ceiling bounds is what
+        # the walk holds on to.
+        self.assertGreaterEqual(result["directories"], 5)
+        self.assertLess(quickfile.MEASURE_PENDING_LIMIT,
+                        quickfile.OPERATION_ENTRY_LIMIT)
+
+    def test_directory_size_bounds_the_hard_link_set(self) -> None:
+        room = self.root / "pairs"
+        room.mkdir()
+        (room / "original.bin").write_bytes(b"z" * 2048)
+        os.link(room / "original.bin", room / "same.bin")
+        with mock.patch.object(quickfile, "MEASURE_IDENTITY_LIMIT", 0):
+            result = quickfile.directory_size_command(argparse.Namespace(
+                path=str(room), path_token=None,
+            ))
+        # Retaining nothing, the walk counts the pair twice. That is an upper
+        # bound, and `truncated` is what says so rather than a silent overstatement.
+        self.assertEqual(result["size"], 4096)
+        self.assertTrue(result["truncated"])
+        self.assertLess(quickfile.MEASURE_IDENTITY_LIMIT,
+                        quickfile.MEASURE_ENTRY_LIMIT)
+
     def test_directory_size_refuses_a_file(self) -> None:
         with self.assertRaises(quickfile.QuickfileError) as raised:
             quickfile.directory_size_command(argparse.Namespace(

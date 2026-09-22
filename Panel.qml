@@ -2992,7 +2992,7 @@ Item {
           objectName: "quickfileDevicesModule"
           anchors.left: parent.left
           anchors.right: parent.right
-          y: searchSurface.y + searchSurface.height + Style.space(6)
+          y: searchSurface.y + searchSurface.height + smartSummary.height + Style.space(6)
             + root.moduleStackOffset("devices", keyScope.moduleHeights)
           visible: root.moduleVisible("devices")
           height: visible ? devicesHeader.height + devicesList.height : 0
@@ -3160,7 +3160,7 @@ Item {
           objectName: "quickfileFavoritesModule"
           anchors.left: parent.left
           anchors.right: parent.right
-          y: searchSurface.y + searchSurface.height + Style.space(6)
+          y: searchSurface.y + searchSurface.height + smartSummary.height + Style.space(6)
             + root.moduleStackOffset("favorites", keyScope.moduleHeights)
           visible: root.moduleVisible("favorites")
           height: visible ? favoritesHeader.height + favoritesList.height : 0
@@ -3343,7 +3343,7 @@ Item {
           objectName: "quickfileKnowledgeModule"
           anchors.left: parent.left
           anchors.right: parent.right
-          y: searchSurface.y + searchSurface.height + Style.space(6)
+          y: searchSurface.y + searchSurface.height + smartSummary.height + Style.space(6)
             + root.moduleStackOffset("knowledge", keyScope.moduleHeights)
           visible: root.moduleVisible("knowledge")
           height: visible ? knowledgeHeader.height + knowledgeList.height : 0
@@ -3577,7 +3577,8 @@ Item {
 
         Rectangle {
           id: contextStrip
-          y: searchSurface.y + searchSurface.height + Style.space(2)
+          objectName: "quickfileContextStrip"
+          y: searchSurface.y + searchSurface.height + smartSummary.height + Style.space(2)
             + root.moduleStackHeight(keyScope.moduleHeights)
           anchors.left: parent.left
           anchors.right: parent.right

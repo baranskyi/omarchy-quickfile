@@ -1300,6 +1300,44 @@ ShellRoot {
         && noteEditor.selectionStart === 6 && noteEditor.selectionEnd === 10,
       "module changes rebuilt file delegates or discarded the editor draft")
 
+    // The Smart Search chip row sits between the field and the module stack:
+    // every module, in any order, and the strip below them must clear it.
+    var smartSummary = objectFinder.findChild(panel, "quickfileSmartSummary")
+    var contextStrip = objectFinder.findChild(panel, "quickfileContextStrip")
+    var summarySearchField = objectFinder.findChild(panel, "quickfileSearchField")
+    var modulesBeforeChips = fixture.moduleLayout
+    fixture.setModulePinned("sessions", true)
+    fixture.setModulePinned("devices", true)
+    fixture.setModulePinned("favorites", true)
+    fixture.setModulePinned("knowledge", true)
+    fixture.searchMode = "smart"
+    summarySearchField.text = "find config yesterday"
+    check(smartSummary.visible && smartSummary.height > 0,
+      "the Smart Search chip row did not appear for a SMART query")
+    var stacked = ["quickfileSessionsModule", "quickfileDevicesModule",
+      "quickfileFavoritesModule", "quickfileKnowledgeModule"]
+      .map(function(name) { return objectFinder.findChild(panel, name) })
+      .filter(function(item) { return item !== null && item.visible && item.height > 0 })
+      .sort(function(a, b) { return a.y - b.y })
+    check(stacked.length === 4, "a pinned module was not shown beside the chip row")
+    var chipBottom = smartSummary.y + smartSummary.height
+    for (var m = 0; m < stacked.length; m++) {
+      check(stacked[m].y >= chipBottom,
+        stacked[m].objectName + " was drawn over the Smart Search chip row")
+      if (m > 0)
+        check(stacked[m - 1].y + stacked[m - 1].height <= stacked[m].y + 0.5,
+          stacked[m - 1].objectName + " overlapped " + stacked[m].objectName)
+    }
+    var lastModule = stacked[stacked.length - 1]
+    check(contextStrip.y >= lastModule.y + lastModule.height - 0.5,
+      "the context strip was drawn over the module stack")
+    summarySearchField.text = ""
+    fixture.searchMode = "fuzzy"
+    fixture.moduleLayout = modulesBeforeChips
+    fixture.applyModuleCollapseFlags()
+    check(!smartSummary.visible && smartSummary.height === 0,
+      "the Smart Search chip row kept its space after leaving SMART")
+
     check(panel.showInlinePreview(fixture.selectedEntry), "inline preview did not start")
     var preview = objectFinder.findChild(panel, "quickfileInlinePreview")
     var previewText = objectFinder.findChild(panel, "quickfilePreviewText")

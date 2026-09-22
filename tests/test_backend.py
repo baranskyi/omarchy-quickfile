@@ -21,6 +21,7 @@ SPEC = importlib.util.spec_from_loader(LOADER.name, LOADER)
 assert SPEC is not None
 quickfile = importlib.util.module_from_spec(SPEC)
 LOADER.exec_module(quickfile)
+import quickfile_smart  # noqa: E402 - the backend adds its bundled bin directory
 
 
 class BackendTests(unittest.TestCase):
@@ -536,6 +537,257 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(content["matchKind"], "content")
         self.assertEqual(content["matchLine"], 1)
         self.assertEqual(content["matchSnippet"], "hello")
+
+    def test_smart_search_extracts_bilingual_rules_and_keeps_hints_soft(self) -> None:
+        plan = quickfile.fallback_plan("PDF с бюджетом за прошлый месяц")
+        self.assertEqual(plan["terms"], ["бюджет"])
+        self.assertEqual(plan["hints"]["kind"]["value"], "document")
+        self.assertEqual(plan["hints"]["time"]["value"], "last-month")
+
+        # The checkpoint's hints below 0.75 were mostly noise when measured.
+        low_confidence = quickfile_smart.merge_laya_answers(
+            quickfile.fallback_plan("budget"),
+            {"kind": {"choice": "document", "confidence": 0.74},
+             "time": {"choice": "older", "confidence": 0.8}},
+        )
+        self.assertEqual(low_confidence["hints"]["kind"]["value"], "any")
+        self.assertEqual(low_confidence["hints"]["time"], {
+            "value": "older", "confidence": 0.8, "source": "laya",
+        })
+
+        # A deliberately wrong image hint must not hide a strong text match.
+        plan = quickfile.fallback_plan("hello")
+        plan["hints"]["kind"] = {
+            "value": "image", "confidence": 0.99, "source": "laya",
+        }
+        result = quickfile.search_command(argparse.Namespace(
+            path=str(self.root), path_token=None, query="hello", mode="smart",
+            smart_plan_json=json.dumps(plan), case_sensitive=False,
+            show_hidden=False, no_git=True, limit=100, scan_limit=1000,
+            timeout=2.0, content_file_limit=1024 * 1024,
+            content_byte_limit=8 * 1024 * 1024,
+        ))
+        self.assertEqual(result["entries"][0]["name"], "notes.txt")
+        self.assertEqual(result["smart"]["state"], "ready")
+        self.assertEqual(result["entries"][0]["matchKind"], "content")
+
+    def test_smart_rules_cover_ukrainian_and_keep_topic_words_out_of_dates(self) -> None:
+        cases = {
+            "подкаст про стартапы": (["стартап"], {"kind": "audio"}),
+            "старые проекты": (["проект"], {"time": "older"}),
+            "недавние скриншоты": ([], {"kind": "image"}),
+            "знайди відео вчора": ([], {"kind": "video", "time": "yesterday"}),
+            "тека з проєктами": (["проєкт"], {"target": "folder"}),
+            "налаштування hyprland": (["hyprland"], {"kind": "config"}),
+            "файлы за прошлый год": ([], {"target": "file", "time": "older"}),
+            "old invoices": (["invoice"], {"time": "older"}),
+        }
+        for query, (terms, hints) in cases.items():
+            with self.subTest(query=query):
+                plan = quickfile.fallback_plan(query)
+                self.assertEqual(plan["terms"], terms)
+                self.assertEqual({
+                    field: hint["value"] for field, hint in plan["hints"].items()
+                    if hint["value"] != "any"
+                }, hints)
+
+    def test_smart_terms_trim_only_safe_inflections(self) -> None:
+        self.assertEqual(quickfile.fallback_plan("фотки с отпуска")["terms"], ["отпуск"])
+        # Quoted phrases, short words and words without an ending stay verbatim.
+        self.assertEqual(
+            quickfile.fallback_plan('"отчёт за квартал" Киев договор status class')["terms"],
+            ["отчёт за квартал", "Киев", "договор", "status", "class"],
+        )
+        folder = self.root / "отпуск 2025"
+        folder.mkdir()
+        (folder / "бюджет.pdf").write_bytes(b"%PDF-1.4")
+        result = quickfile.search_command(argparse.Namespace(
+            path=str(self.root), path_token=None, query="PDF с бюджетом за прошлый месяц",
+            mode="smart", smart_plan_json=None, case_sensitive=False,
+            show_hidden=False, no_git=True, limit=100, scan_limit=1000,
+            timeout=2.0, content_file_limit=1024 * 1024,
+            content_byte_limit=8 * 1024 * 1024,
+        ))
+        self.assertEqual(result["entries"][0]["name"], "бюджет.pdf")
+
+    def test_smart_search_supports_filters_only_without_hiding_other_rows(self) -> None:
+        image = self.root / "photo.png"
+        image.write_bytes(b"not-a-real-image")
+        plan = quickfile.fallback_plan("show images from this month")
+        result = quickfile.search_command(argparse.Namespace(
+            path=str(self.root), path_token=None, query="show images from this month",
+            mode="smart", smart_plan_json=json.dumps(plan), case_sensitive=False,
+            show_hidden=False, no_git=True, limit=100, scan_limit=1000,
+            timeout=2.0, content_file_limit=1024 * 1024,
+            content_byte_limit=8 * 1024 * 1024,
+        ))
+        names = [row["name"] for row in result["entries"]]
+        self.assertEqual(names[0], "photo.png")
+        self.assertIn("notes.txt", names)
+        self.assertIn("image", result["entries"][0]["smartReasons"])
+
+    def test_smart_search_rejects_untrusted_plan_and_falls_back(self) -> None:
+        result = quickfile.search_command(argparse.Namespace(
+            path=str(self.root), path_token=None, query="notes", mode="smart",
+            smart_plan_json='{"version":99}', case_sensitive=False,
+            show_hidden=False, no_git=True, limit=100, scan_limit=1000,
+            timeout=2.0, content_file_limit=1024 * 1024,
+            content_byte_limit=8 * 1024 * 1024,
+        ))
+        self.assertEqual(result["smart"]["state"], "fallback")
+        self.assertEqual(result["smart"]["fallbackReason"], "invalid-plan")
+        self.assertIn("notes.txt", [row["name"] for row in result["entries"]])
+
+        with self.assertRaises(quickfile.QuickfileError) as raised:
+            quickfile.search_command(argparse.Namespace(
+                path=str(self.root), path_token=None, query="x" * 513, mode="smart",
+                smart_plan_json=None, case_sensitive=False, show_hidden=False,
+                no_git=True, limit=100, scan_limit=1000, timeout=2.0,
+                content_file_limit=1024 * 1024,
+                content_byte_limit=8 * 1024 * 1024,
+            ))
+        self.assertEqual(raised.exception.code, "smart-query-too-large")
+
+    def test_smart_calendar_windows_use_local_calendar_boundaries(self) -> None:
+        zone = quickfile.dt.datetime.now().astimezone().tzinfo
+        now = quickfile.dt.datetime(2026, 9, 22, 15, 0, tzinfo=zone)
+        last_month = quickfile.dt.datetime(2026, 8, 18, 10, 0, tzinfo=zone).timestamp()
+        this_month = quickfile.dt.datetime(2026, 9, 1, 0, 0, tzinfo=zone).timestamp()
+        self.assertTrue(quickfile.smart_time_matches(last_month, "last-month", now))
+        self.assertFalse(quickfile.smart_time_matches(this_month, "last-month", now))
+
+    def test_semantic_helper_status_is_dependency_free(self) -> None:
+        semantic_home = self.root / "semantic"
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "bin" / "quickfile-semantic"), "status"],
+            check=True, capture_output=True, text=True,
+            env={**os.environ, "QUICKFILE_SEMANTIC_HOME": str(semantic_home)},
+        )
+        payload = json.loads(result.stdout)
+        self.assertFalse(payload["installed"])
+        self.assertEqual(payload["model"], "laya-multilingual")
+
+    def test_semantic_download_is_pinned_and_keeps_its_cache_private(self) -> None:
+        fake_modules = self.root / "download-modules"
+        fake_modules.mkdir()
+        (fake_modules / "huggingface_hub.py").write_text(
+            "import json, os\n"
+            "from pathlib import Path\n"
+            "def snapshot_download(**kwargs):\n"
+            "    target = Path(kwargs['local_dir'])\n"
+            "    (target / 'multilingual').mkdir(parents=True)\n"
+            "    Path(kwargs['cache_dir']).mkdir(parents=True)\n"
+            "    (target / '.cache').mkdir()\n"
+            "    (target / 'download-call.json').write_text(json.dumps({\n"
+            "        'repo': kwargs['repo_id'], 'revision': kwargs['revision'],\n"
+            "        'patterns': kwargs['allow_patterns'],\n"
+            "        'cache': kwargs['cache_dir'], 'hfHome': os.environ['HF_HOME'],\n"
+            "        'telemetry': os.environ['HF_HUB_DISABLE_TELEMETRY']}))\n"
+            "    return str(target)\n",
+            encoding="utf-8",
+        )
+        model = self.root / "download" / "model"
+        subprocess.run(
+            [sys.executable, str(ROOT / "bin" / "quickfile-semantic"),
+             "_download", "--destination", str(model)],
+            check=True, capture_output=True, text=True,
+            env={**os.environ, "PYTHONPATH": str(fake_modules)},
+        )
+        call = json.loads((model / "download-call.json").read_text(encoding="utf-8"))
+        self.assertEqual(call["repo"], "convaiinnovations/laya")
+        self.assertEqual(call["revision"], "1c5edc17a7acd8701df6fc341c0d179f1c62c982")
+        self.assertEqual(call["patterns"], ["multilingual/*"])
+        self.assertEqual(call["telemetry"], "1")
+        self.assertFalse((model.parent / ".huggingface-cache").exists())
+        self.assertFalse((model / ".cache").exists())
+
+    def test_semantic_install_uses_the_cpu_torch_runtime_first(self) -> None:
+        loader = importlib.machinery.SourceFileLoader(
+            "quickfile_semantic_cli", str(ROOT / "bin" / "quickfile-semantic"),
+        )
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        runtime, package = module.dependency_commands(Path("/venv/bin/python"))
+        self.assertEqual(runtime[-3:], [
+            "--index-url", "https://download.pytorch.org/whl/cpu", "torch",
+        ])
+        self.assertEqual(package[-1], "laya==0.3.5")
+        self.assertNotIn("--index-url", package)
+
+    def test_semantic_helper_refuses_an_unsafe_data_root(self) -> None:
+        unsafe_home = self.root / "unrelated-data"
+        unsafe_home.mkdir()
+        sentinel = unsafe_home / "keep.txt"
+        sentinel.write_text("keep", encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "bin" / "quickfile-semantic"), "remove"],
+            check=False, capture_output=True, text=True,
+            env={**os.environ, "QUICKFILE_SEMANTIC_HOME": str(unsafe_home)},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(json.loads(result.stdout)["code"], "semantic-remove-unsafe")
+        self.assertTrue(sentinel.is_file())
+        install = subprocess.run(
+            [sys.executable, str(ROOT / "bin" / "quickfile-semantic"), "install"],
+            check=False, capture_output=True, text=True,
+            env={**os.environ, "QUICKFILE_SEMANTIC_HOME": str(unsafe_home)},
+        )
+        self.assertNotEqual(install.returncode, 0)
+        self.assertEqual(json.loads(install.stdout)["code"], "semantic-install-unsafe")
+        self.assertTrue(sentinel.is_file())
+
+    def test_semantic_helper_coalesces_requests_with_fake_laya(self) -> None:
+        semantic_home = self.root / "semantic"
+        install = semantic_home / "install"
+        python_path = install / "venv" / "bin" / "python"
+        model_path = install / "model"
+        (model_path / "multilingual").mkdir(parents=True)
+        python_path.parent.mkdir(parents=True)
+        python_path.symlink_to(sys.executable)
+        (model_path / "multilingual" / "rl_agent_config.json").write_text(
+            "{}", encoding="utf-8",
+        )
+        (model_path / "multilingual" / "model.safetensors").write_bytes(b"fake")
+        semantic_home.mkdir(exist_ok=True)
+        (semantic_home / "install.json").write_text(json.dumps({
+            "version": 1,
+            "packageVersion": "0.3.5",
+            "revision": "1c5edc17a7acd8701df6fc341c0d179f1c62c982",
+            "installPath": str(install),
+            "modelPath": str(model_path),
+            "pythonPath": str(python_path),
+        }), encoding="utf-8")
+        fake_modules = self.root / "fake-modules"
+        fake_modules.mkdir()
+        (fake_modules / "laya.py").write_text(
+            "__version__ = '0.3.5'\n"
+            "class Agent:\n"
+            "    device = 'cpu'\n"
+            "    def predict(self, state, questions):\n"
+            "        return {'answers': {key: {'choice': 'any', 'confidence': 0.7} "
+            "for key in questions}}\n"
+            "def load(path, device=None, subfolder=None):\n"
+            "    assert device == 'cpu', device\n"
+            "    return Agent()\n",
+            encoding="utf-8",
+        )
+        environment = {
+            **os.environ,
+            "QUICKFILE_SEMANTIC_HOME": str(semantic_home),
+            "PYTHONPATH": str(fake_modules),
+        }
+        process = subprocess.run(
+            [sys.executable, str(ROOT / "bin" / "quickfile-semantic"), "serve"],
+            input=(json.dumps({"op": "analyze", "id": 1, "query": "first query"}) + "\n"
+                   + json.dumps({"op": "analyze", "id": 2, "query": "second query"}) + "\n"),
+            check=True, capture_output=True, text=True, env=environment, timeout=5,
+        )
+        messages = [json.loads(line) for line in process.stdout.splitlines()]
+        self.assertEqual(messages[0]["event"], "ready")
+        analyses = [message for message in messages if message["event"] == "analysis"]
+        self.assertEqual(analyses[-1]["id"], 2)
+        self.assertEqual(analyses[-1]["plan"]["model"], "laya-multilingual")
 
     def test_properties_expose_posix_and_filesystem_metadata(self) -> None:
         args = argparse.Namespace(path=str(self.root / "notes.txt"), path_token=None)
@@ -1454,6 +1706,25 @@ class BackendTests(unittest.TestCase):
         argv = runner.call_args.args[0]
         self.assertIn("--fixed-strings", argv)
         self.assertIn("hello; touch /tmp/no", argv)
+        self.assertEqual(argv[-2:], ["--", str(self.root)])
+        self.assertNotIn("sh", argv)
+
+    def test_smart_rg_prefilter_scans_once_for_all_terms(self) -> None:
+        matched = self.root / "notes.txt"
+        terms = ["budget", "month; touch /tmp/no"]
+        with mock.patch.object(quickfile.shutil, "which", return_value="/usr/bin/rg"), \
+                mock.patch.object(
+                    quickfile, "run_bounded", return_value=(0, str(matched) + "\0", "")
+                ) as runner:
+            candidates = quickfile.rg_smart_content_candidates(
+                str(self.root), terms, False, False, 4096,
+                quickfile.time.monotonic() + 2,
+            )
+        self.assertEqual(candidates, {str(matched)})
+        argv = runner.call_args.args[0]
+        self.assertEqual(argv.count("-e"), 2)
+        self.assertIn("--fixed-strings", argv)
+        self.assertIn(terms[1], argv)
         self.assertEqual(argv[-2:], ["--", str(self.root)])
         self.assertNotIn("sh", argv)
 

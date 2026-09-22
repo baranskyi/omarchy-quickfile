@@ -67,6 +67,19 @@ identity, navigation/search, metadata, and a small set of recoverable actions.
 - Small declarative extension API for data/action modules.
 - Trusted-QML extension tier with an explicit unsandboxed-code warning.
 
+## 0.7 — local smart search
+
+- [x] Explicit SMART mode with English/Russian/Ukrainian deterministic parsing,
+  inflection-tolerant keywords, and soft typed hints from an optional
+  multilingual Laya checkpoint, accepted only at calibrated confidence.
+- [x] CPU-only runtime: no CUDA download and no discrete-GPU wake-up.
+- [x] Dependency-isolated, user-confirmed model setup with atomic installation,
+  offline inference, recoverable removal, and keyword-only fallback.
+- [x] Coalesced inference requests, stale-response rejection, bounded plan
+  validation, and stable live-model reconciliation.
+- Semantic embeddings, synonym retrieval, and domain fine-tuning remain future
+  experiments; SMART currently reranks the bounded lexical candidate set.
+
 ## Non-negotiable constraints
 
 Implemented filesystem monitoring: native GIO events, bounded watches and event

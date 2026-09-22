@@ -293,6 +293,48 @@ ShellRoot {
       "Accelerated search listing was rejected")
     check(synthetic.searchEngine === "rg", "Search engine identity was discarded")
 
+    synthetic.searchMode = "smart"
+    synthetic.query = "find config yesterday"
+    synthetic.semanticPlanQuery = synthetic.query
+    synthetic.semanticPlan = ({ version: 1, terms: ["config"], hints: {
+      target: { value: "file", confidence: 0.8, source: "laya" },
+      kind: { value: "config", confidence: 0.9, source: "rule" },
+      location: { value: "any", confidence: 0.5, source: "laya" },
+      time: { value: "yesterday", confidence: 0.9, source: "rule" }
+    } })
+    var smartCommand = synthetic.buildListCommand()
+    check(smartCommand[smartCommand.indexOf("--mode") + 1] === "smart"
+      && smartCommand.indexOf("--smart-plan-json") >= 0,
+      "Smart listing command did not carry its bounded analysis plan")
+    var planBeforeStale = synthetic.semanticPlan
+    synthetic.semanticPendingId = 9
+    synthetic.semanticPendingQuery = synthetic.query
+    check(synthetic.handleSemanticEvent(JSON.stringify({ event: "analysis", id: 8,
+      plan: { version: 1, terms: ["stale"], hints: {} } })),
+      "A stale semantic response was not handled")
+    check(synthetic.semanticPlan === planBeforeStale,
+      "A stale semantic response replaced the current plan")
+    prepareRequest()
+    var smartListing = JSON.parse(response(synthetic.entries))
+    smartListing.smart = { state: "ready", model: "laya-multilingual", device: "cpu",
+      terms: ["config"], hints: synthetic.semanticPlan.hints }
+    check(synthetic.applyListing(JSON.stringify(smartListing)),
+      "Smart listing metadata was rejected")
+    check(synthetic.semanticResult && synthetic.semanticResult.state === "ready"
+      && synthetic.semanticModel === "laya-multilingual" && synthetic.semanticDevice === "cpu",
+      "Smart listing metadata was not published")
+    // Emptying the field must not unload a warm model; leaving SMART must.
+    synthetic.semanticSessionActive = true
+    synthetic.query = ""
+    check(synthetic.semanticSessionActive,
+      "Clearing a SMART query ended the model session")
+    synthetic.searchMode = "fuzzy"
+    check(!synthetic.semanticSessionActive,
+      "Leaving SMART did not end the model session")
+    synthetic.semanticPlan = null
+    synthetic.semanticPlanQuery = ""
+    synthetic.semanticResult = null
+
     synthetic.previewToken = "b"
     synthetic.previewRevision = 7
     synthetic.previewData = { kind: "metadata", name: "retained" }
@@ -413,7 +455,10 @@ ShellRoot {
             && !suite.entryNamed("created.txt")) {
           suite.mutate("(p/'renamed.txt').unlink()", "deleted")
         } else if (suite.phase === "deleted" && !suite.entryNamed("renamed.txt")) {
+          live.semanticSessionActive = true
           live.setPanelVisible(false)
+          suite.check(!live.semanticSessionActive,
+            "Closing the panel did not end the model session")
           suite.transition("closing")
         } else if (suite.phase === "closing" && !live.busy && now - suite.phaseStarted >= 700) {
           suite.check(!live.watcherReady, "Watcher remained ready after closing")

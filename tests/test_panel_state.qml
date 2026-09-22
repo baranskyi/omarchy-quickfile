@@ -447,7 +447,7 @@ ShellRoot {
 
     fixture.searchMode = "fuzzy"
     panel.openChoiceMenu("search-mode", modeButton, 4, 4)
-    check(panel.choiceOptions.length === 6 && panel.choiceActiveValue() === "fuzzy",
+    check(panel.choiceOptions.length === 7 && panel.choiceActiveValue() === "fuzzy",
       "the picker did not offer the search modes with the active one marked")
     panel.applyChoice("regex")
     check(fixture.searchMode === "regex",
@@ -456,10 +456,13 @@ ShellRoot {
 
     // Left click keeps rotating; the list is only the second way in.
     panel.cycleSearchMode(1)
+    check(fixture.searchMode === "smart",
+      "rotating after regex did not reach Smart Search")
+    panel.cycleSearchMode(1)
     check(fixture.searchMode === "fuzzy",
-      "rotating past the last search mode did not wrap to the first")
+      "rotating past Smart Search did not wrap to the first mode")
     panel.cycleSearchMode(-1)
-    check(fixture.searchMode === "regex",
+    check(fixture.searchMode === "smart",
       "rotating backwards through the search modes did not wrap")
     fixture.searchMode = "fuzzy"
     fixture.setSortOrder("name")

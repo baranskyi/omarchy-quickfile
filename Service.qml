@@ -15,6 +15,7 @@ Item {
   readonly property string pluginDir: Qt.resolvedUrl(".").toString()
     .replace(/^file:\/\//, "").replace(/\/$/, "")
   readonly property string cliPath: pluginDir + "/bin/quickfile"
+  readonly property string semanticCliPath: pluginDir + "/bin/quickfile-semantic"
   readonly property string homePath: Quickshell.env("HOME") || "/"
   // Only used if native monitoring is unavailable or its watch limit is hit.
   readonly property int fallbackRefreshInterval: 30000
@@ -158,6 +159,36 @@ Item {
   property bool caseSensitive: false
   property bool truncated: false
   property string searchEngine: ""
+  property bool semanticStatusLoaded: false
+  property bool semanticInstalled: false
+  property string semanticState: "checking"
+  property string semanticError: ""
+  property string semanticPythonPath: ""
+  property string semanticModel: "laya-multilingual"
+  property string semanticDevice: ""
+  property real semanticProgress: 0
+  property string semanticProgressPhase: ""
+  property bool semanticHelperReady: false
+  property bool semanticHelperFailed: false
+  property bool semanticFallback: false
+  property var semanticPlan: null
+  property var semanticResult: null
+  property string semanticPlanQuery: ""
+  property int semanticRequestId: 0
+  property int semanticPendingId: 0
+  property string semanticPendingQuery: ""
+  property string semanticStatusStdout: ""
+  property string semanticStatusStderr: ""
+  property string semanticHelperStderr: ""
+  property string semanticSetupStderr: ""
+  property string semanticSetupAction: ""
+  readonly property bool semanticSetupBusy: semanticSetupProcess.running
+  // Set by the first non-empty SMART query and kept until the mode changes or
+  // the panel closes, so clearing the field does not unload a warm model.
+  property bool semanticSessionActive: false
+  readonly property bool semanticShouldRun: panelVisible && searchMode === "smart"
+    && semanticSessionActive && semanticInstalled
+    && !semanticHelperFailed && !semanticSetupBusy
   property var git: ({ root: "", branch: "" })
 
   // Keep QML delegates alive. The arrays above remain the service's snapshots;
@@ -248,11 +279,16 @@ Item {
     } else {
       watcherReady = false
       eventRefresh.stop()
+      semanticInferenceTimeout.stop()
+      semanticSessionActive = false
     }
   }
 
+  onSearchModeChanged: if (searchMode !== "smart") semanticSessionActive = false
+
   function ensureLoaded() {
     if (!settingsLoaded && !settingsLoadProcess.running) reloadSettings()
+    if (!semanticStatusLoaded && !semanticStatusProcess.running) reloadSemanticStatus()
     if (!initialized) {
       initialized = true
       recordNavigationOnListing = true
@@ -545,6 +581,208 @@ Item {
     }
   }
 
+  function reloadSemanticStatus() {
+    if (semanticStatusProcess.running || semanticSetupProcess.running) return false
+    semanticStatusStdout = ""
+    semanticStatusStderr = ""
+    semanticStatusProcess.command = ["/usr/bin/python3", semanticCliPath, "status"]
+    semanticStatusProcess.running = true
+    return true
+  }
+
+  function applySemanticStatus(raw) {
+    var parsed = null
+    try { parsed = JSON.parse(String(raw || "")) } catch (error) {
+      semanticState = "failed"
+      semanticError = "Smart-search status returned invalid data"
+      return false
+    }
+    if (!parsed || parsed.ok !== true) {
+      semanticState = "failed"
+      semanticError = parsed && parsed.message ? String(parsed.message)
+        : "Could not check smart-search status"
+      return false
+    }
+    semanticStatusLoaded = true
+    semanticInstalled = parsed.installed === true
+    semanticPythonPath = semanticInstalled ? String(parsed.pythonPath || "") : ""
+    semanticModel = String(parsed.model || "laya-multilingual")
+    semanticState = semanticInstalled ? "installed" : String(parsed.state || "not-installed")
+    semanticError = ""
+    semanticProgress = semanticInstalled ? 1 : 0
+    semanticProgressPhase = ""
+    semanticHelperFailed = false
+    return true
+  }
+
+  function installSemantic() {
+    if (semanticSetupProcess.running) return false
+    semanticSetupAction = "install"
+    semanticSetupStderr = ""
+    semanticError = ""
+    semanticState = "installing"
+    semanticProgress = 0
+    semanticProgressPhase = "starting"
+    semanticSetupProcess.command = ["/usr/bin/python3", semanticCliPath, "install"]
+    semanticSetupProcess.running = true
+    return true
+  }
+
+  function removeSemantic() {
+    if (semanticSetupProcess.running) return false
+    semanticSetupAction = "remove"
+    semanticSetupStderr = ""
+    semanticError = ""
+    semanticState = "removing"
+    semanticHelperFailed = true
+    semanticSetupProcess.command = ["/usr/bin/python3", semanticCliPath, "remove"]
+    semanticSetupProcess.running = true
+    return true
+  }
+
+  function handleSemanticSetupEvent(raw) {
+    var message = null
+    try { message = JSON.parse(String(raw || "")) } catch (error) { return false }
+    if (!message || !message.event) return false
+    if (message.event === "progress") {
+      semanticState = "installing"
+      semanticProgress = Math.max(0, Math.min(1, Number(message.progress || 0)))
+      semanticProgressPhase = String(message.phase || "working")
+      return true
+    }
+    if (message.event === "error") {
+      semanticState = "failed"
+      semanticError = String(message.message || "Smart-search setup failed")
+      return true
+    }
+    if (message.event === "result") {
+      semanticInstalled = message.installed === true || message.state === "ready"
+      semanticPythonPath = semanticInstalled ? String(message.pythonPath || "") : ""
+      semanticState = semanticInstalled ? "installed" : "not-installed"
+      semanticProgress = semanticInstalled ? 1 : 0
+      semanticProgressPhase = ""
+      semanticError = ""
+      semanticHelperFailed = false
+      semanticStatusLoaded = true
+      return true
+    }
+    return false
+  }
+
+  function requestSmartAnalysis() {
+    var trimmed = String(query || "").trim()
+    semanticRequestId++
+    semanticPendingId = semanticRequestId
+    semanticPendingQuery = trimmed
+    semanticPlan = null
+    semanticPlanQuery = ""
+    semanticResult = null
+    semanticFallback = false
+    semanticInferenceTimeout.stop()
+    if (searchMode !== "smart" || trimmed === "") return false
+    if (!semanticInstalled) {
+      semanticFallback = true
+      semanticState = "not-installed"
+      reload()
+      return false
+    }
+    if (!semanticSessionActive) {
+      // A failed helper stays stopped for the rest of its session instead of
+      // reloading torch on every query; a new session or Retry tries again.
+      semanticHelperFailed = false
+      semanticSessionActive = true
+    }
+    if (semanticHelperFailed) {
+      semanticFallback = true
+      reload()
+      return false
+    }
+    if (semanticHelperReady && semanticProcess.running) {
+      semanticState = "analyzing"
+      semanticProcess.write(JSON.stringify({
+        op: "analyze", id: semanticPendingId, query: semanticPendingQuery
+      }) + "\n")
+      semanticInferenceTimeout.restart()
+      return true
+    }
+    semanticState = "loading"
+    semanticLoadTimeout.restart()
+    // Publish keyword results immediately while the optional model warms up.
+    semanticFallback = true
+    reload()
+    // `semanticShouldRun` starts the process through its running binding.
+    return true
+  }
+
+  function sendPendingSmartAnalysis() {
+    if (!semanticHelperReady || !semanticProcess.running || searchMode !== "smart"
+        || semanticPendingQuery !== String(query || "").trim()) return false
+    semanticState = "analyzing"
+    semanticProcess.write(JSON.stringify({
+      op: "analyze", id: semanticPendingId, query: semanticPendingQuery
+    }) + "\n")
+    semanticInferenceTimeout.restart()
+    return true
+  }
+
+  function useSmartFallback(reason) {
+    semanticInferenceTimeout.stop()
+    // Any result that arrives after a timeout/error belongs to the abandoned
+    // request and must not silently replace the published fallback listing.
+    semanticRequestId++
+    semanticPendingId = semanticRequestId
+    semanticPendingQuery = ""
+    semanticFallback = true
+    semanticPlan = null
+    semanticPlanQuery = ""
+    semanticResult = ({ state: "fallback", fallbackReason: String(reason || "model-unavailable") })
+    if (searchMode === "smart" && String(query || "").trim() !== "") reload()
+  }
+
+  function handleSemanticEvent(raw) {
+    var message = null
+    try { message = JSON.parse(String(raw || "")) } catch (error) { return false }
+    if (!message || !message.event) return false
+    if (message.event === "ready") {
+      semanticLoadTimeout.stop()
+      semanticHelperReady = true
+      semanticHelperFailed = false
+      semanticState = "ready"
+      semanticDevice = String(message.device || "")
+      semanticModel = String(message.model || "laya-multilingual")
+      return sendPendingSmartAnalysis()
+    }
+    if (message.event === "analysis") {
+      if (Number(message.id) !== semanticPendingId || searchMode !== "smart"
+          || semanticPendingQuery !== String(query || "").trim()) return true
+      semanticInferenceTimeout.stop()
+      var plan = message.plan
+      if (!plan || typeof plan !== "object") {
+        useSmartFallback("invalid-plan")
+        return false
+      }
+      semanticPlan = plan
+      semanticPlanQuery = semanticPendingQuery
+      semanticFallback = false
+      semanticState = "ready"
+      semanticResult = ({
+        state: "ready", terms: plan.terms || [], hints: plan.hints || ({}),
+        model: String(message.model || semanticModel),
+        device: String(message.device || semanticDevice),
+        latencyMs: Number(message.latencyMs || 0)
+      })
+      reload()
+      return true
+    }
+    if (message.event === "error") {
+      if (message.id !== undefined && Number(message.id) !== semanticPendingId) return true
+      semanticError = String(message.message || "Smart-search analysis failed")
+      useSmartFallback(String(message.code || "model-error"))
+      return true
+    }
+    return false
+  }
+
   function buildListCommand() {
     var trimmed = String(query || "").trim()
     var command = ["/usr/bin/env", "python3", cliPath,
@@ -563,6 +801,11 @@ Item {
       command.push(trimmed)
       command.push("--mode")
       command.push(searchMode)
+      if (searchMode === "smart" && semanticPlan
+          && semanticPlanQuery === trimmed) {
+        command.push("--smart-plan-json")
+        command.push(JSON.stringify(semanticPlan))
+      }
       if (caseSensitive) command.push("--case-sensitive")
     }
     return command
@@ -955,9 +1198,11 @@ Item {
     var nextEntries = Array.isArray(parsed.entries) ? parsed.entries : []
     var nextFavorites = Array.isArray(parsed.favorites) ? parsed.favorites : []
     var nextGit = parsed.git || ({ root: "", branch: "" })
+    var nextSemanticResult = parsed.smart || null
     var changed = !sameData(entries, nextEntries) || !sameData(favorites, nextFavorites)
       || !sameData(git, nextGit) || truncated !== (parsed.truncated === true)
       || searchEngine !== String(parsed.engine || "")
+      || !sameData(semanticResult, nextSemanticResult)
     var anchorToken = selectionAnchorIndex >= 0 && selectionAnchorIndex < entries.length
       ? String(entries[selectionAnchorIndex].token || "") : ""
     if (changed) listingAboutToChange()
@@ -978,6 +1223,14 @@ Item {
     if (!sameData(git, nextGit)) git = nextGit
     truncated = parsed.truncated === true
     searchEngine = String(parsed.engine || "")
+    semanticResult = nextSemanticResult
+    if (nextSemanticResult) {
+      semanticFallback = String(nextSemanticResult.state || "") === "fallback"
+      if (nextSemanticResult.model) semanticModel = String(nextSemanticResult.model)
+      if (nextSemanticResult.device) semanticDevice = String(nextSemanticResult.device)
+    } else if (searchMode !== "smart") {
+      semanticFallback = false
+    }
     errorMessage = ""
 
     var selected = null
@@ -1067,6 +1320,12 @@ Item {
     knowledgeWatch = null
     syncWatchConfiguration()
     query = ""
+    semanticInferenceTimeout.stop()
+    semanticLoadTimeout.stop()
+    semanticPlan = null
+    semanticPlanQuery = ""
+    semanticResult = null
+    semanticFallback = false
     clearPreview()
     selectedToken = ""
     selectedTokens = []
@@ -1123,7 +1382,17 @@ Item {
   function setSearch(text, mode) {
     query = String(text || "")
     if (mode) searchMode = String(mode)
-    reload()
+    if (searchMode === "smart" && String(query || "").trim() !== "")
+      requestSmartAnalysis()
+    else {
+      semanticInferenceTimeout.stop()
+      semanticLoadTimeout.stop()
+      semanticPlan = null
+      semanticPlanQuery = ""
+      semanticResult = null
+      semanticFallback = false
+      reload()
+    }
   }
 
   function toggleExpanded(token) {
@@ -1885,6 +2154,31 @@ Item {
   }
 
   Timer {
+    id: semanticLoadTimeout
+    interval: 60000
+    onTriggered: {
+      if (!root.semanticHelperReady && root.semanticShouldRun) {
+        root.semanticHelperFailed = true
+        root.semanticState = "failed"
+        root.semanticError = "Smart-search model did not load in time"
+        root.useSmartFallback("load-timeout")
+      }
+    }
+  }
+
+  Timer {
+    id: semanticInferenceTimeout
+    interval: 5000
+    onTriggered: {
+      if (root.searchMode === "smart" && root.semanticPendingQuery === String(root.query || "").trim()) {
+        root.semanticState = root.semanticHelperReady ? "ready" : "failed"
+        root.semanticError = "Smart-search analysis timed out"
+        root.useSmartFallback("timeout")
+      }
+    }
+  }
+
+  Timer {
     interval: root.fallbackRefreshInterval
     repeat: true
     running: root.panelVisible && root.initialized
@@ -1925,6 +2219,82 @@ Item {
     }
   }
 
+  Process {
+    id: semanticStatusProcess
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.semanticStatusStdout = text
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.semanticStatusStderr = text.slice(-2000)
+    }
+    onExited: function(exitCode) {
+      if (!root.applySemanticStatus(root.semanticStatusStdout) && !root.semanticError)
+        root.semanticError = root.semanticStatusStderr.trim()
+          || ("Smart-search status exited " + exitCode)
+    }
+  }
+
+  Process {
+    id: semanticSetupProcess
+    stdout: SplitParser {
+      onRead: function(data) { root.handleSemanticSetupEvent(data) }
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.semanticSetupStderr = text.slice(-2000)
+    }
+    onExited: function(exitCode) {
+      if (exitCode !== 0 && root.semanticState !== "failed") {
+        root.semanticState = "failed"
+        root.semanticError = root.semanticSetupStderr.trim()
+          || ("Smart-search setup exited " + exitCode)
+      }
+      root.semanticSetupAction = ""
+      if (exitCode === 0) Qt.callLater(root.reloadSemanticStatus)
+    }
+  }
+
+  Process {
+    id: semanticProcess
+    command: root.semanticPythonPath !== ""
+      ? [root.semanticPythonPath, root.semanticCliPath, "serve"] : []
+    stdinEnabled: true
+    running: root.semanticShouldRun
+    onStarted: {
+      root.semanticHelperReady = false
+      root.semanticState = "loading"
+      root.semanticError = ""
+      semanticLoadTimeout.restart()
+    }
+    stdout: SplitParser {
+      onRead: function(data) { root.handleSemanticEvent(data) }
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.semanticHelperStderr = text.slice(-2000)
+    }
+    onExited: function(exitCode) {
+      var unexpected = root.panelVisible && root.searchMode === "smart"
+        && root.semanticSessionActive && root.semanticInstalled
+        && !root.semanticSetupBusy && !root.semanticHelperFailed
+      root.semanticHelperReady = false
+      semanticLoadTimeout.stop()
+      semanticInferenceTimeout.stop()
+      if (unexpected) {
+        root.semanticHelperFailed = true
+        root.semanticState = "failed"
+        // Prefer the helper's own error event over its stderr tail.
+        root.semanticError = root.semanticError || root.semanticHelperStderr.trim()
+          || ("Smart-search helper exited " + exitCode)
+        root.useSmartFallback("helper-exited")
+      } else if (root.semanticInstalled && root.semanticState !== "failed") {
+        root.semanticState = "installed"
+      }
+    }
+  }
+
   IpcHandler {
     target: "quickfile"
     function status(): string {
@@ -1940,6 +2310,12 @@ Item {
         inspectorTab: root.inspectorTab,
         sortOrder: root.sortOrder,
         dateFormat: root.dateFormat,
+        smartInstalled: root.semanticInstalled,
+        smartState: root.semanticState,
+        smartModel: root.semanticModel,
+        smartDevice: root.semanticDevice,
+        smartFallback: root.semanticFallback,
+        smartSession: root.semanticSessionActive,
         moduleLayout: root.moduleLayout
       })
     }

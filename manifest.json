@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "m0sthatedman.quickfile",
   "name": "QuickFile",
-  "version": "0.15.1",
+  "version": "0.16.0",
   "author": "m0sthatedman",
   "license": "MIT",
-  "description": "An IDE-inspired file manager sidebar with previews, safe file operations, Git context, and project knowledge for Omarchy.",
+  "description": "An IDE-inspired file manager sidebar with smart search, previews, safe file operations, Git context, and project knowledge for Omarchy.",
   "kinds": [
     "service",
     "bar-widget",

@@ -60,11 +60,13 @@ def run_harness(executable: str, source: Path, timeout: float) -> bool:
             "QML_DISABLE_DISK_CACHE": "1",
             "XDG_RUNTIME_DIR": str(runtime),
             "XDG_CACHE_HOME": str(directory / "cache"),
+            "XDG_DATA_HOME": str(directory / "data"),
             "XDG_STATE_HOME": str(directory / "state"),
             "QUICKFILE_TEST_ROOT": str(fixture),
             "QUICKFILE_HOME": str(fixture),
             "QUICKFILE_METADATA_FILE": str(directory / "metadata.json"),
             "QUICKFILE_SETTINGS_FILE": str(directory / "settings.json"),
+            "QUICKFILE_SEMANTIC_HOME": str(directory / "semantic"),
             "NO_COLOR": "1",
         })
         command = [executable, "--no-duplicate", "--no-color", "--path", str(target)]

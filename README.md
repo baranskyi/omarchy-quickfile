@@ -30,6 +30,12 @@ concept. It does not depend on or copy unreleased FileBlade source code.
 - Git branch and per-path working-tree status.
 - Fuzzy, contains, exact, prefix, suffix, and regular-expression search across
   file names, folder names, relative paths, and bounded text-file contents.
+- Optional `SMART` search interprets natural-language requests in English,
+  Russian, Ukrainian and other languages with a local multilingual Laya model.
+  It extracts bounded keywords and softly reranks by
+  requested file/folder, broad type, name/path/content, and calendar period;
+  uncertain hints never remove lexical matches. Without the model it degrades
+  transparently to keyword-only search.
 - Live search badges distinguish `FOLDER`, `NAME`, `PATH`, and `CONTENT`;
   content hits include the matching line number and a short snippet. When
   ripgrep (`rg`) is available it safely prefilters content candidates, with a
@@ -204,6 +210,19 @@ not activate the Refresh button. Closing the window stops its watchers; reopenin
 it reconciles anything changed in the meantime. If monitoring is unavailable or
 its bounded watch limit is exceeded, a silent 30-second fallback keeps data fresh.
 
+`SMART` is an explicit seventh search mode. Its 700 ms input pause coalesces
+typing before inference; the six deterministic modes retain their shorter live
+delay. The chips below the field show the active hints or `KEYWORDS ONLY` when
+the optional model is unavailable. Explicit words — `PDF`, `folder`/`папка`/`тека`,
+`inside`/`внутри`, `yesterday`/`вчера`/`вчора`, `last month` — are parsed by fixed
+English, Russian and Ukrainian rules, which take precedence; the model fills
+only the hints those rules leave open, and only at 75% confidence or more.
+Keywords drop one common Russian/Ukrainian case ending or English plural, so
+`бюджетом` still finds `бюджет.pdf`; quoted phrases are kept verbatim. Smart
+search does not translate terms, generate synonyms, or build an embeddings
+index: retrieval remains the same bounded local name/path/content search, with
+model decisions used only as ranking hints.
+
 External drives appear automatically in `DEVICES`. Click a mounted drive to
 open it, or click an unmounted drive to mount and open it. The trailing eject
 button safely unmounts it; if the current file view is on that drive, QuickFile
@@ -282,6 +301,24 @@ Git context, faster content search, frequent locations, external QuickView,
 ACL details, and filesystem attributes respectively. Missing optional tools do
 not block the core file manager.
 
+Smart Search is also optional. Open QuickFile settings, choose **Install Smart
+Search**, and confirm the download. QuickFile creates an isolated environment
+under `$XDG_DATA_HOME/omarchy/quickfile/semantic/`, installs
+[Laya 0.3.5](https://github.com/NandhaKishorM/laya/tree/v0.3.5), and downloads
+only the multilingual checkpoint pinned at
+[revision `1c5edc17a7acd8701df6fc341c0d179f1c62c982`][smart-model]. PyTorch's
+CPU build comes from `download.pytorch.org`, the other Python packages from
+PyPI, and the model weights from Hugging Face: about 1 GB to download and 1.8 GB
+on disk. The CPU build avoids several gigabytes of CUDA libraries and never
+wakes a discrete GPU. Once setup finishes, inference runs on the CPU with the
+model hub and Transformers in offline mode; the model loads in roughly 15–20
+seconds when SMART is first used and then answers in about 0.3–0.5 seconds. It
+stays loaded until the panel closes or another search mode is chosen.
+The settings control can retry setup or move the entire environment and model
+to Trash.
+
+[smart-model]: https://huggingface.co/convaiinnovations/laya/tree/1c5edc17a7acd8701df6fc341c0d179f1c62c982/multilingual
+
 ## Install
 
 Install the public repository with Omarchy's standard plugin command:
@@ -306,6 +343,8 @@ notes and recovery information from accidental loss. If they are no longer
 needed, the user-owned data lives under
 `$XDG_DATA_HOME/omarchy/quickfile/` and
 `$XDG_STATE_HOME/omarchy/quickfile/`.
+The optional Smart Search environment is likewise retained across plugin
+removal; remove it from QuickFile settings first if it is no longer wanted.
 
 ## Security model
 
@@ -316,11 +355,15 @@ Controls' shared tooltip, which renders with `Text.AutoText`. A file called
 `<img src="…">` is shown as that text and loads nothing.
 
 QuickFile runs inside the unsandboxed Omarchy shell with the permissions of the
-signed-in user. It makes no network requests and collects no telemetry. It does
-not require elevated privileges or overwrite Omarchy configuration. Filesystem
-paths cross the QML/backend boundary as opaque tokens and fixed argument-array
-values; recursive scans and watches are bounded. Destructive choices require
-confirmation, and ordinary deletion uses the freedesktop Trash. The optional
+signed-in user. It collects no telemetry. Its only network-capable path is the
+explicitly confirmed Smart Search installer; ordinary file-manager operation
+and all model inference are local and offline. Smart Search sends the model only
+the user's query — never file names, paths, contents, notes, or Knowledge data.
+QuickFile does not require elevated privileges or overwrite Omarchy
+configuration. Filesystem paths cross the QML/backend boundary as opaque tokens
+and fixed argument-array values; recursive scans and watches are bounded.
+Destructive choices require confirmation, and ordinary deletion uses the
+freedesktop Trash. The optional
 session adapter performs a bounded `/proc` scan only while the window is visible;
 it neither controls agent processes nor reads their command lines.
 
@@ -401,9 +444,11 @@ SUPER+B ───────┼─> omarchy-shell panel lifecycle ─> Panel.qm
 shell IPC ─────┘                                  │
                                                   v
                                              Service.qml
-                                                  │ fixed argv + bounded JSON
-                                                  v
-                                           bin/quickfile
+                                                  │
+                         fixed argv + bounded JSON├─> bin/quickfile
+                                                  │
+                                      bounded JSONL└─> bin/quickfile-semantic
+                                                           └─ local Laya model
 ```
 
 Long-running or fallible filesystem work runs outside the shell UI process.
@@ -411,6 +456,10 @@ The service owns navigation state and coalesces reload/property requests, so a
 slow disk or malformed file cannot block or crash the bar.
 `bin/quickfile-watch` supplies filesystem and volume events. Stable QML list
 models reconcile changed rows by path token instead of replacing the model.
+`bin/quickfile-semantic` is dependency-free for status/setup and runs inference
+through its isolated environment only while a non-empty SMART search is active.
+The filesystem backend validates its bounded plan and remains fully functional
+when the helper is absent, loading, slow, malformed, or stopped.
 
 ## Next milestones
 

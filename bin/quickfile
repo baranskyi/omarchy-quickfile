@@ -15,6 +15,7 @@ import datetime as dt
 import errno
 import grp
 import hashlib
+import heapq
 import json
 import mimetypes
 import os
@@ -34,8 +35,18 @@ import uuid
 from pathlib import Path
 from typing import Any, Iterable
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from quickfile_smart import (  # noqa: E402 - bundled sibling of this executable
+    SMART_PLAN_LIMIT,
+    SMART_QUERY_LIMIT,
+    SMART_TERM_LIMIT,
+    SmartPlanError,
+    fallback_plan,
+    validate_plan,
+)
 
-VERSION = "0.15.1"
+
+VERSION = "0.16.0"
 DEFAULT_LIMIT = 2000
 COMMAND_TIMEOUT = 3
 # `git status` is the only command on the navigation path that can scale with
@@ -1947,6 +1958,383 @@ def rg_content_candidates(
     return candidates
 
 
+def rg_smart_content_candidates(
+    root: str,
+    terms: list[str],
+    case_sensitive: bool,
+    show_hidden: bool,
+    file_limit: int,
+    deadline: float,
+) -> set[str] | None:
+    """Prefilter files matching any smart term with one bounded rg walk."""
+    executable = shutil.which("rg")
+    remaining = deadline - time.monotonic()
+    if not executable or remaining < 0.15 or file_limit <= 0 or not terms:
+        return None
+    argv = [
+        executable, "--files-with-matches", "--null", "--no-messages", "--color", "never",
+        "--max-count", "1", "--max-filesize", str(file_limit), "--glob", "!.git/**",
+        "--no-ignore", "--case-sensitive" if case_sensitive else "--ignore-case",
+        "--fixed-strings",
+    ]
+    if show_hidden:
+        argv.append("--hidden")
+    for term in terms[:SMART_TERM_LIMIT]:
+        argv.extend(["-e", term])
+    argv.extend(["--", root])
+    code, output, _ = run_bounded(
+        argv, timeout=max(0.1, min(1.5, remaining / 3)), limit=RG_OUTPUT_LIMIT,
+    )
+    if (code not in {0, 1} or "\ufffd" in output
+            or len(output.encode("utf-8", "replace")) >= RG_OUTPUT_LIMIT):
+        return None
+    candidates: set[str] = set()
+    for item in output.split("\0"):
+        if not item:
+            continue
+        candidate = item if os.path.isabs(item) else os.path.join(root, item)
+        candidates.add(normalized_path(candidate))
+    return candidates
+
+
+SMART_CONFIG_NAMES = {
+    ".env", ".editorconfig", ".gitconfig", ".npmrc", ".prettierrc", ".cursorrules",
+    "dockerfile", "makefile", "meson.build", "pyproject.toml", "cargo.toml",
+}
+SMART_CONFIG_SUFFIXES = {
+    ".conf", ".config", ".env", ".ini", ".json", ".properties", ".toml", ".xml",
+    ".yaml", ".yml",
+}
+SMART_CODE_SUFFIXES = {
+    ".c", ".cc", ".cpp", ".cs", ".css", ".go", ".h", ".hpp", ".html", ".java",
+    ".js", ".jsx", ".kt", ".lua", ".php", ".py", ".qml", ".rb", ".rs", ".scss",
+    ".sh", ".sql", ".swift", ".ts", ".tsx", ".vue",
+}
+SMART_ARCHIVE_SUFFIXES = {
+    ".7z", ".bz2", ".gz", ".rar", ".tar", ".tgz", ".xz", ".zip", ".zst",
+}
+SMART_DOCUMENT_SUFFIXES = {
+    ".csv", ".doc", ".docx", ".epub", ".md", ".odt", ".ods", ".pdf", ".ppt",
+    ".pptx", ".rtf", ".tex", ".txt", ".xls", ".xlsx",
+}
+
+
+def smart_file_kind(path: str, row: dict[str, Any]) -> str:
+    if row.get("isDir"):
+        return "any"
+    name = os.path.basename(path).casefold()
+    suffix = os.path.splitext(name)[1]
+    mime = str(row.get("mime", ""))
+    if name in SMART_CONFIG_NAMES or suffix in SMART_CONFIG_SUFFIXES:
+        return "config"
+    if suffix in SMART_CODE_SUFFIXES:
+        return "code"
+    if suffix in SMART_ARCHIVE_SUFFIXES or mime.startswith(("application/zip", "application/x-tar")):
+        return "archive"
+    if mime.startswith("image/"):
+        return "image"
+    if mime.startswith("audio/"):
+        return "audio"
+    if mime.startswith("video/"):
+        return "video"
+    if suffix in SMART_DOCUMENT_SUFFIXES or mime.startswith("text/") or mime.startswith((
+        "application/pdf", "application/msword", "application/vnd.oasis",
+        "application/vnd.openxmlformats-officedocument",
+    )):
+        return "document"
+    return "any"
+
+
+def smart_time_matches(timestamp: float, value: str, now: dt.datetime | None = None) -> bool:
+    if value == "any":
+        return False
+    current = now or dt.datetime.now().astimezone()
+    zone = current.tzinfo
+    today = current.replace(hour=0, minute=0, second=0, microsecond=0)
+    this_week = today - dt.timedelta(days=today.weekday())
+    this_month = today.replace(day=1)
+    previous_month_last_day = this_month - dt.timedelta(days=1)
+    last_month = previous_month_last_day.replace(day=1)
+    windows = {
+        "today": (today, today + dt.timedelta(days=1)),
+        "yesterday": (today - dt.timedelta(days=1), today),
+        "this-week": (this_week, this_week + dt.timedelta(days=7)),
+        "last-week": (this_week - dt.timedelta(days=7), this_week),
+        "this-month": (this_month, (this_month + dt.timedelta(days=32)).replace(day=1)),
+        "last-month": (last_month, this_month),
+    }
+    try:
+        modified = dt.datetime.fromtimestamp(float(timestamp), zone)
+    except (OSError, OverflowError, ValueError):
+        return False
+    if value == "older":
+        return modified < last_month
+    bounds = windows.get(value)
+    return bool(bounds and bounds[0] <= modified < bounds[1])
+
+
+def smart_content_match(
+    path: str,
+    terms: list[str],
+    case_sensitive: bool,
+    byte_limit: int,
+    deadline: float,
+) -> tuple[dict[str, Any] | None, int, set[int], int]:
+    """Find bounded keyword occurrences in one text file with a single read."""
+    if byte_limit <= 0 or not terms or time.monotonic() >= deadline:
+        return None, 0, set(), 0
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return None, 0, set(), 0
+    if not stat.S_ISREG(info.st_mode) or info.st_size > byte_limit:
+        return None, 0, set(), 0
+    try:
+        with open(path, "rb") as stream:
+            raw = stream.read(byte_limit + 1)
+    except OSError:
+        return None, 0, set(), 0
+    if len(raw) > byte_limit or b"\x00" in raw[:8192]:
+        return None, min(len(raw), byte_limit), set(), 0
+    text = raw.decode("utf-8", "replace")
+    needles = terms if case_sensitive else [term.casefold() for term in terms]
+    matched: set[int] = set()
+    first: dict[str, Any] | None = None
+    best_score = 0
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        if time.monotonic() >= deadline:
+            break
+        candidate = line[:CONTENT_LINE_LIMIT]
+        haystack = candidate if case_sensitive else candidate.casefold()
+        line_matches = [index for index, term in enumerate(needles) if term in haystack]
+        if not line_matches:
+            continue
+        matched.update(line_matches)
+        if first is None:
+            snippet = " ".join(line.strip().split())[:CONTENT_SNIPPET_LIMIT]
+            first = {
+                "matchKind": "content", "matchLine": line_number,
+                "matchSnippet": display_text(snippet),
+            }
+        best_score = max(best_score, max(1, 600 - len(candidate) // 8))
+        if len(matched) == len(terms):
+            break
+    return first, len(raw), matched, best_score
+
+
+def smart_plan_from_args(args: argparse.Namespace, query: str) -> tuple[dict[str, Any], str, str]:
+    raw = getattr(args, "smart_plan_json", None)
+    if raw is None:
+        return fallback_plan(query), "fallback", "model-unavailable"
+    if not isinstance(raw, str) or len(raw.encode("utf-8", "replace")) > SMART_PLAN_LIMIT:
+        return fallback_plan(query), "fallback", "invalid-plan"
+    try:
+        return validate_plan(json.loads(raw)), "ready", ""
+    except (json.JSONDecodeError, SmartPlanError):
+        return fallback_plan(query), "fallback", "invalid-plan"
+
+
+def smart_search_command(args: argparse.Namespace, root: str, query: str) -> dict[str, Any]:
+    plan, smart_state, fallback_reason = smart_plan_from_args(args, query)
+    terms = list(plan["terms"])
+    hints = plan["hints"]
+    useful_hint = any(hints[field]["value"] != "any" for field in hints)
+    # An entirely empty analysis should retain the familiar fuzzy behaviour,
+    # not turn a stop-word-only sentence into an expensive match-all walk.
+    if not terms and not useful_hint:
+        raw_term = query[:64]
+        terms = [raw_term] if raw_term else []
+
+    git = git_context(root) if not args.no_git else {"root": "", "branch": "", "statuses": {}}
+    deadline = time.monotonic() + max(0.25, float(args.timeout))
+    content_file_limit = max(
+        0, int(getattr(args, "content_file_limit", DEFAULT_CONTENT_FILE_LIMIT))
+    )
+    content_byte_limit = max(
+        0, int(getattr(args, "content_byte_limit", DEFAULT_CONTENT_BYTE_LIMIT))
+    )
+    rg_candidates: set[str] | None = None
+    content_search_backend = "none"
+    if terms and content_byte_limit > 0:
+        rg_candidates = rg_smart_content_candidates(
+            root, terms, args.case_sensitive, args.show_hidden,
+            content_file_limit, deadline,
+        )
+        content_search_backend = "rg" if rg_candidates is not None else "python"
+
+    root_depth = root.rstrip(os.sep).count(os.sep)
+    watch = WatchPaths()
+    watch.add_git(git)
+    heap: list[tuple[int, int, dict[str, Any]]] = []
+    serial = 0
+    matched_count = 0
+    scanned = 0
+    content_bytes_scanned = 0
+    truncated = False
+    limit = max(0, int(args.limit))
+    scan_limit = max(0, int(args.scan_limit))
+    now = dt.datetime.now().astimezone()
+
+    for directory, dirnames, filenames in os.walk(root, followlinks=False):
+        watch.add_directory(directory)
+        if not args.show_hidden:
+            dirnames[:] = [name for name in dirnames if not name.startswith(".")]
+            filenames = [name for name in filenames if not name.startswith(".")]
+        if ".git" in dirnames:
+            dirnames.remove(".git")
+        stop = False
+        for name in dirnames + filenames:
+            scanned += 1
+            if scanned > scan_limit or time.monotonic() >= deadline:
+                truncated = True
+                stop = True
+                break
+            path = os.path.join(directory, name)
+            relative = os.path.relpath(path, root)
+            rendered_name = display_text(name)
+            rendered_relative = display_text(relative)
+            is_directory = name in dirnames
+            matched_terms: set[int] = set()
+            lexical_score = 0
+            best_kind = ""
+            match: dict[str, Any] | None = None
+            for index, term in enumerate(terms):
+                found, score = matches(rendered_name, term, "fuzzy", args.case_sensitive)
+                if found:
+                    matched_terms.add(index)
+                    adjusted = 900 + max(-200, score)
+                    if adjusted > lexical_score:
+                        lexical_score = adjusted
+                        best_kind = "folder" if is_directory else "name"
+                        match = {"matchKind": best_kind, "matchLine": 0, "matchSnippet": ""}
+                    continue
+                if rendered_relative != rendered_name:
+                    found, score = matches(rendered_relative, term, "fuzzy", args.case_sensitive)
+                    if found:
+                        matched_terms.add(index)
+                        adjusted = 650 + max(-200, score)
+                        if adjusted > lexical_score:
+                            lexical_score = adjusted
+                            best_kind = "path"
+                            match = {"matchKind": "path", "matchLine": 0, "matchSnippet": ""}
+
+            should_read_content = (
+                bool(terms) and not is_directory and content_bytes_scanned < content_byte_limit
+                and (len(matched_terms) < len(terms) or hints["location"]["value"] == "content")
+                and (rg_candidates is None or normalized_path(path) in rg_candidates)
+            )
+            content_terms: set[int] = set()
+            content_hit: dict[str, Any] | None = None
+            if should_read_content:
+                remaining = content_byte_limit - content_bytes_scanned
+                content_hit, bytes_read, content_terms, content_score = smart_content_match(
+                    path, terms, args.case_sensitive, min(content_file_limit, remaining), deadline,
+                )
+                content_bytes_scanned += bytes_read
+                matched_terms.update(content_terms)
+                if content_hit is not None and (
+                    match is None or hints["location"]["value"] == "content"
+                ):
+                    match = content_hit
+                    best_kind = "content"
+                    lexical_score = max(lexical_score, 550 + content_score)
+
+            if terms and not matched_terms:
+                continue
+            if match is None:
+                match = {"matchKind": "smart", "matchLine": 0, "matchSnippet": ""}
+                best_kind = "smart"
+            try:
+                row = entry_row(path, max(0, directory.count(os.sep) - root_depth), git, set())
+            except QuickfileError:
+                continue
+            row["relativePath"] = rendered_relative
+            row.update(match)
+
+            coverage = len(matched_terms)
+            score = lexical_score + coverage * 1000
+            if terms and coverage == len(terms):
+                score += 500
+            reasons: list[str] = []
+            target = hints["target"]["value"]
+            if (target == "folder" and row["isDir"]) or (target == "file" and not row["isDir"]):
+                bonus = round(240 * float(hints["target"]["confidence"]))
+                score += bonus
+                if bonus > 0:
+                    reasons.append(target)
+            requested_kind = hints["kind"]["value"]
+            if requested_kind != "any" and smart_file_kind(path, row) == requested_kind:
+                bonus = round(220 * float(hints["kind"]["confidence"]))
+                score += bonus
+                if bonus > 0:
+                    reasons.append(requested_kind)
+            location = hints["location"]["value"]
+            location_matches = (
+                (location == "name" and best_kind in {"name", "folder"})
+                or (location == "path" and best_kind == "path")
+                or (location == "content" and bool(content_terms))
+            )
+            if location_matches:
+                bonus = round(260 * float(hints["location"]["confidence"]))
+                score += bonus
+                if bonus > 0:
+                    reasons.append(location)
+            requested_time = hints["time"]["value"]
+            if smart_time_matches(float(row.get("modifiedEpoch", 0)), requested_time, now):
+                bonus = round(200 * float(hints["time"]["confidence"]))
+                score += bonus
+                if bonus > 0:
+                    reasons.append(requested_time)
+            row["smartScore"] = score
+            row["smartReasons"] = reasons[:4]
+            matched_count += 1
+            serial += 1
+            if limit <= 0:
+                truncated = True
+                continue
+            item = (score, serial, row)
+            if len(heap) < limit:
+                heapq.heappush(heap, item)
+            elif score > heap[0][0]:
+                heapq.heapreplace(heap, item)
+            else:
+                truncated = True
+        if stop:
+            break
+    if matched_count > len(heap):
+        truncated = True
+    rows = [item[2] for item in heap]
+    rows.sort(key=lambda row: (-int(row.get("smartScore", 0)), row["relativePath"].casefold()))
+    metadata = load_metadata_store()
+    enrich_rows(rows, metadata)
+    smart_payload = {
+        "state": smart_state,
+        "fallbackReason": fallback_reason,
+        "terms": plan["terms"],
+        "hints": hints,
+        "model": str(plan.get("model", "")),
+        "device": str(plan.get("device", "")),
+        "latencyMs": int(plan.get("latencyMs", 0)),
+    }
+    return {
+        "ok": True,
+        "root": {"path": display_text(root), "token": encode_path(root)},
+        "entries": rows,
+        "favorites": favorite_rows(metadata),
+        "git": {key: value for key, value in git.items() if key != "statuses"},
+        "query": query,
+        "mode": "smart",
+        "smart": smart_payload,
+        "truncated": truncated,
+        "scanned": scanned,
+        "contentBytesScanned": content_bytes_scanned,
+        "contentSearchBackend": content_search_backend,
+        "engine": content_search_backend,
+        "limit": args.limit,
+        "watch": watch.payload(),
+    }
+
+
 def search_command(args: argparse.Namespace) -> dict[str, Any]:
     root = path_from_args(args, required=False)
     query = args.query.strip()
@@ -1956,6 +2344,13 @@ def search_command(args: argparse.Namespace) -> dict[str, Any]:
         return tree_command(args)
     if not os.path.isdir(root):
         raise QuickfileError(f"Not a directory: {display_text(root)}", "not-a-directory")
+    if args.mode == "smart":
+        if len(query) > SMART_QUERY_LIMIT:
+            raise QuickfileError(
+                f"Smart-search queries are limited to {SMART_QUERY_LIMIT} characters",
+                "smart-query-too-large",
+            )
+        return smart_search_command(args, root, query)
     git = git_context(root) if not args.no_git else {"root": "", "branch": "", "statuses": {}}
     rows: list[tuple[int, dict[str, Any]]] = []
     truncated = False
@@ -4149,7 +4544,12 @@ def parser() -> argparse.ArgumentParser:
     search = subcommands.add_parser("search", help="Recursively search below a root")
     add_path_arguments(search)
     search.add_argument("--query", required=True)
-    search.add_argument("--mode", choices=("contains", "exact", "prefix", "suffix", "regex", "fuzzy"), default="fuzzy")
+    search.add_argument(
+        "--mode",
+        choices=("contains", "exact", "prefix", "suffix", "regex", "fuzzy", "smart"),
+        default="fuzzy",
+    )
+    search.add_argument("--smart-plan-json")
     search.add_argument("--case-sensitive", action="store_true")
     search.add_argument("--show-hidden", action="store_true")
     search.add_argument("--no-git", action="store_true")

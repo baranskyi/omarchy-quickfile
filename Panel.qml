@@ -675,6 +675,11 @@ Item {
 
   Connections {
     target: root.service
+    function onSemanticStatusLoadedChanged() {
+      if (root.service && root.service.semanticStatusLoaded
+          && root.service.searchMode === "smart" && !root.service.semanticInstalled
+          && root.editorMode === "") root.beginEditor("semantic-install")
+    }
     function onFolderSizeBusyChanged() {
       if (!root.service.folderSizeBusy) {
         folderSizeDialogTimer.stop()
@@ -935,6 +940,7 @@ Item {
     if (value === "name") return "NAME"
     if (value === "path") return "PATH"
     if (value === "content") return "CONTENT"
+    if (value === "smart") return "SMART"
     return ""
   }
 
@@ -1217,7 +1223,28 @@ Item {
       { value: "exact", label: "Exact" },
       { value: "prefix", label: "Starts with" },
       { value: "suffix", label: "Ends with" },
-      { value: "regex", label: "Regex" }]
+      { value: "regex", label: "Regex" },
+      { value: "smart", label: "Smart" }]
+  }
+
+  function smartSummaryLabels() {
+    if (!service || String(service.searchMode || "") !== "smart") return []
+    if (String(service.query || "") !== String(searchField.text || "").trim())
+      return ["WAITING"]
+    var state = String(service.semanticState || "")
+    if (state === "loading") return ["LOADING MODEL"]
+    if (state === "analyzing") return ["ANALYZING"]
+    var result = service.semanticResult
+    if (!result || String(result.state || "") === "fallback") return ["KEYWORDS ONLY"]
+    var labels = []
+    var hints = result.hints || ({})
+    var order = ["target", "kind", "location", "time"]
+    for (var i = 0; i < order.length; i++) {
+      var hint = hints[order[i]] || ({})
+      var value = String(hint.value || "any")
+      if (value !== "any") labels.push(value.replace(/-/g, " ").toUpperCase())
+    }
+    return labels.length > 0 ? labels : ["SMART"]
   }
 
   function sortOptions() {
@@ -1266,6 +1293,9 @@ Item {
   function applySearchMode(value) {
     if (!service || String(service.searchMode) === String(value)) return false
     service.searchMode = String(value)
+    if (String(value) === "smart" && service.semanticStatusLoaded
+        && !service.semanticInstalled && editorMode === "")
+      beginEditor("semantic-install")
     searchDebounce.restart()
     return true
   }
@@ -1435,11 +1465,13 @@ Item {
   // Delete that raised "Move to Trash?" could not be finished from the
   // keyboard. Mirrors the confirm button's own visibility and enabled state.
   function editorConfirmEnabled() {
-    if (!service || service.actionBusy) return false
+    if (!service || service.actionBusy || service.semanticSetupBusy) return false
     if (["", "trash-browser", "quick-nav", "drop-choice", "conflict", "shortcuts",
       "folder-size"].indexOf(editorMode) >= 0) return false
     if (editorMode === "knowledge-links")
       return !!service.knowledgeLinkPlan && service.knowledgeLinkPlan.createCount > 0
+    if (editorMode === "semantic-install") return !service.semanticInstalled
+    if (editorMode === "semantic-remove") return service.semanticInstalled
     return true
   }
 
@@ -1452,6 +1484,16 @@ Item {
     if (editorMode === "knowledge-links") {
       if (!service.applyKnowledgeLinks())
         editorError = "There are no safe links to create"
+      return
+    }
+    if (editorMode === "semantic-install") {
+      if (service.installSemantic()) editorMode = ""
+      else editorError = "Could not start smart-search installation"
+      return
+    }
+    if (editorMode === "semantic-remove") {
+      if (service.removeSemantic()) editorMode = ""
+      else editorError = "Could not remove smart-search data"
       return
     }
     if (editorMode === "trash") {
@@ -2353,6 +2395,137 @@ Item {
                 }
               }
             }
+            Rectangle {
+              width: parent.width
+              height: Math.max(1, Style.normalBorderWidth)
+              color: root.borderColor
+            }
+            Text {
+              textFormat: Text.PlainText
+              width: parent.width
+              height: Style.space(23)
+              text: "SMART SEARCH"
+              color: root.foreground
+              font.family: Style.font.family
+              font.pixelSize: Style.font.bodySmall
+              font.bold: true
+              font.letterSpacing: 1
+              verticalAlignment: Text.AlignVCenter
+            }
+            Rectangle {
+              id: semanticSettingsRow
+              objectName: "quickfileSemanticSettings"
+              width: parent.width
+              height: Style.space(54)
+              radius: Style.cornerRadius > 0 ? Style.space(4) : 0
+              color: semanticSettingsMouse.containsMouse ? Style.hoverFill : "transparent"
+              MouseArea {
+                id: semanticSettingsMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                acceptedButtons: Qt.NoButton
+              }
+              Column {
+                anchors.left: parent.left
+                anchors.leftMargin: Style.space(7)
+                anchors.right: semanticSettingsActions.left
+                anchors.rightMargin: Style.space(7)
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.space(2)
+                Text {
+                  textFormat: Text.PlainText
+                  width: parent.width
+                  text: !root.service || !root.service.semanticStatusLoaded ? "Checking…"
+                    : root.service.semanticState === "installing"
+                      ? "Installing · " + String(root.service.semanticProgressPhase || "working")
+                    : root.service.semanticState === "removing" ? "Moving to Trash…"
+                    : root.service.semanticInstalled && root.service.semanticHelperFailed
+                      ? "Laya multilingual · failed to load"
+                    : root.service.semanticInstalled ? "Laya multilingual · installed"
+                    : root.service.semanticState === "update-required" ? "Smart Search update required"
+                    : root.service.semanticState === "failed" ? "Setup failed" : "Not installed"
+                  color: root.service && (root.service.semanticState === "failed"
+                    || root.service.semanticHelperFailed) ? Color.urgent : root.foreground
+                  elide: Text.ElideRight
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.bodySmall
+                }
+                Text {
+                  textFormat: Text.PlainText
+                  width: parent.width
+                  text: root.service && root.service.semanticInstalled
+                    && root.service.semanticHelperFailed && root.service.semanticError
+                    ? String(root.service.semanticError).trim().split("\n").pop()
+                    : root.service && root.service.semanticInstalled
+                    ? "Local inference · no file data enters the model"
+                    : "Optional local model · network used only for setup"
+                  color: root.muted
+                  maximumLineCount: 1
+                  elide: Text.ElideRight
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                }
+              }
+              Row {
+                id: semanticSettingsActions
+                anchors.right: parent.right
+                anchors.rightMargin: Style.space(2)
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: 0
+                Components.IconButton {
+                  objectName: "quickfileSemanticInstallButton"
+                  visible: !root.service || !root.service.semanticInstalled
+                  glyph: root.service && root.service.semanticState === "failed" ? "󰑐" : "󰇚"
+                  tooltip: root.service && root.service.semanticState === "failed"
+                    ? "Retry Smart Search installation"
+                    : root.service && root.service.semanticState === "update-required"
+                      ? "Update Smart Search" : "Install Smart Search"
+                  buttonSize: Style.space(29)
+                  available: root.service && root.service.semanticStatusLoaded
+                    && !root.service.semanticSetupBusy
+                  onClicked: {
+                    moduleSettingsPopup.close()
+                    root.beginEditor("semantic-install")
+                  }
+                }
+                Components.IconButton {
+                  objectName: "quickfileSemanticRemoveButton"
+                  visible: root.service && root.service.semanticInstalled
+                  glyph: "󰆴"
+                  tooltip: "Move Smart Search model to Trash"
+                  buttonSize: Style.space(29)
+                  available: root.service && !root.service.semanticSetupBusy
+                  onClicked: {
+                    moduleSettingsPopup.close()
+                    root.beginEditor("semantic-remove")
+                  }
+                }
+              }
+              Rectangle {
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.bottom: parent.bottom
+                height: Style.space(2)
+                visible: root.service && root.service.semanticSetupBusy
+                color: Qt.alpha(root.foreground, 0.08)
+                Rectangle {
+                  height: parent.height
+                  width: parent.width * Math.max(0, Math.min(1,
+                    root.service ? root.service.semanticProgress : 0))
+                  color: root.accent
+                }
+              }
+            }
+            Text {
+              textFormat: Text.PlainText
+              visible: root.service && String(root.service.semanticError || "") !== ""
+              width: parent.width
+              text: root.service ? String(root.service.semanticError || "") : ""
+              color: Color.urgent
+              elide: Text.ElideRight
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+            }
             Text {
               textFormat: Text.PlainText
               visible: root.service && String(root.service.settingsError || "") !== ""
@@ -2479,6 +2652,7 @@ Item {
             // The hint below replaces the placeholder: it has to show the key
             // that opens search, which plain placeholder text cannot draw.
             placeholderText: ""
+            maximumLength: root.service && root.service.searchMode === "smart" ? 512 : 32767
             selectByMouse: true
             font.family: Style.font.family
             font.pixelSize: root.primaryFontSize
@@ -2573,9 +2747,52 @@ Item {
 
           Timer {
             id: searchDebounce
-            interval: 180
+            interval: root.service && root.service.searchMode === "smart" ? 700 : 180
             onTriggered: if (root.service)
               root.service.setSearch(searchField.text, root.service.searchMode)
+          }
+        }
+
+        Rectangle {
+          id: smartSummary
+          objectName: "quickfileSmartSummary"
+          anchors.top: searchSurface.bottom
+          anchors.left: parent.left
+          anchors.leftMargin: Style.space(9)
+          anchors.right: parent.right
+          anchors.rightMargin: Style.space(9)
+          height: visible ? Style.space(26) : 0
+          visible: root.service && root.service.searchMode === "smart"
+            && searchField.text.trim() !== ""
+          color: "transparent"
+
+          Row {
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.space(5)
+            Repeater {
+              model: root.smartSummaryLabels()
+              delegate: Rectangle {
+                required property var modelData
+                height: Style.space(18)
+                width: smartChipText.implicitWidth + Style.space(10)
+                radius: Style.space(4)
+                color: Qt.alpha(root.accent, 0.1)
+                border.width: Math.max(1, Style.normalBorderWidth)
+                border.color: Qt.alpha(root.accent, 0.42)
+                Text {
+                  id: smartChipText
+                  textFormat: Text.PlainText
+                  anchors.centerIn: parent
+                  text: String(parent.modelData || "")
+                  color: root.accent
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                  renderType: Text.NativeRendering
+                }
+              }
+            }
           }
         }
 
@@ -2584,7 +2801,7 @@ Item {
           objectName: "quickfileSessionsModule"
           anchors.left: parent.left
           anchors.right: parent.right
-          y: searchSurface.y + searchSurface.height + Style.space(6)
+          y: searchSurface.y + searchSurface.height + smartSummary.height + Style.space(6)
             + root.moduleStackOffset("sessions", keyScope.moduleHeights)
           visible: root.moduleVisible("sessions")
           height: visible ? sessionsHeader.height + sessionsBody.height : 0
@@ -3536,7 +3753,7 @@ Item {
             anchors.rightMargin: Style.space(5)
             anchors.verticalCenter: parent.verticalCenter
             glyph: "󰒓"
-            tooltip: "Arrange modules"
+            tooltip: "QuickFile settings"
             buttonSize: Style.space(23)
             active: moduleSettingsPopup.visible
             onClicked: moduleSettingsPopup.visible
@@ -4787,6 +5004,8 @@ Item {
                   : root.editorMode === "conflict-replace" ? "Replace existing items?"
                   : root.editorMode === "knowledge-links"
                     ? "Connect Project Knowledge"
+                  : root.editorMode === "semantic-install" ? "Install Smart Search?"
+                  : root.editorMode === "semantic-remove" ? "Remove Smart Search?"
                   : "Move to Trash?"
                 color: root.foreground
                 font.family: Style.font.family
@@ -5268,6 +5487,25 @@ Item {
 
               Text {
                 textFormat: Text.PlainText
+                visible: root.editorMode === "semantic-install"
+                  || root.editorMode === "semantic-remove"
+                width: parent.width
+                wrapMode: Text.Wrap
+                text: root.editorMode === "semantic-install"
+                  ? "QuickFile will download about 1 GB and use about 1.8 GB of disk: the CPU "
+                    + "build of PyTorch from pytorch.org, Python packages from PyPI, and the "
+                    + "Apache-2.0 multilingual Laya model from Hugging Face. Search queries stay "
+                    + "local after setup; file names, paths, and contents are never sent to the model."
+                  : "The isolated environment and model will be moved to Trash. QuickFile "
+                    + "metadata, notes, and files are not affected."
+                color: root.editorMode === "semantic-remove" ? Color.urgent : root.foreground
+                font.family: Style.font.family
+                font.pixelSize: Style.font.bodySmall
+                renderType: Text.NativeRendering
+              }
+
+              Text {
+                textFormat: Text.PlainText
                 visible: root.editorMode === "trash" || root.editorMode === "trash-delete"
                 width: parent.width
                 wrapMode: Text.Wrap
@@ -5572,17 +5810,24 @@ Item {
                   glyph: root.editorMode === "trash" ? "󰩺"
                     : root.editorMode === "trash-delete" ? "󰆴"
                     : root.editorMode === "conflict-replace" ? "󰁯"
+                    : root.editorMode === "semantic-install" ? "󰇚"
+                    : root.editorMode === "semantic-remove" ? "󰆴"
                     : root.editorMode === "knowledge-links" ? "󰌷" : "󰄬"
                   label: root.editorMode === "trash" ? "Move to Trash"
                     : root.editorMode === "trash-delete" ? "Delete permanently"
                     : root.editorMode === "conflict-replace" ? "Replace existing items"
+                    : root.editorMode === "semantic-install" ? "Download and install"
+                    : root.editorMode === "semantic-remove" ? "Move to Trash"
                     : root.editorMode === "knowledge-links"
                       ? (!root.service || !root.service.knowledgeLinkPlan
                         ? "Preparing…"
                         : "Create " + root.service.knowledgeLinkPlan.createCount)
                     : "Confirm"
-                  destructive: root.editorMode === "trash-delete" || root.editorMode === "conflict-replace"
+                  destructive: root.editorMode === "trash-delete"
+                    || root.editorMode === "conflict-replace"
+                    || root.editorMode === "semantic-remove"
                   enabled: root.service && !root.service.actionBusy
+                    && !root.service.semanticSetupBusy
                     && (root.editorMode !== "knowledge-links"
                     || (root.service && root.service.knowledgeLinkPlan
                       && root.service.knowledgeLinkPlan.createCount > 0

@@ -1250,10 +1250,25 @@ Item {
     if (!result || String(result.state || "") === "fallback") return ["KEYWORDS ONLY"]
     var labels = []
     var hints = result.hints || ({})
+    var formats = Array.isArray(result.formats) ? result.formats : []
+    var kinds = Array.isArray(result.kinds) ? result.kinds : []
     var order = ["target", "kind", "location", "time"]
     for (var i = 0; i < order.length; i++) {
       var hint = hints[order[i]] || ({})
       var value = String(hint.value || "any")
+      if (order[i] === "kind") {
+        // A typed format ("PDF") says more than the broad kind it implies,
+        // and every further kind asked for ("photos and videos") shows too.
+        if (formats.length > 0) {
+          for (var f = 0; f < formats.length; f++) labels.push(String(formats[f]).toUpperCase())
+        } else if (value !== "any") {
+          labels.push(value.toUpperCase())
+        }
+        for (var k = 0; k < kinds.length; k++) {
+          if (String(kinds[k]) !== value) labels.push(String(kinds[k]).toUpperCase())
+        }
+        continue
+      }
       if (value !== "any") labels.push(value.replace(/-/g, " ").toUpperCase())
     }
     return labels.length > 0 ? labels : ["SMART"]

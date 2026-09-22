@@ -767,6 +767,7 @@ Item {
       semanticState = "ready"
       semanticResult = ({
         state: "ready", terms: plan.terms || [], hints: plan.hints || ({}),
+        formats: plan.formats || [], kinds: plan.kinds || [],
         model: String(message.model || semanticModel),
         device: String(message.device || semanticDevice),
         latencyMs: Number(message.latencyMs || 0)

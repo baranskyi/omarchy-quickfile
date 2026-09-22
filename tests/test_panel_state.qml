@@ -1337,6 +1337,34 @@ ShellRoot {
     fixture.semanticState = "ready"
     fixture.foregroundListingPending = false
     check(!panel.smartSearchWorking(), "a finished SMART search still read as working")
+    // A typed format is shown as itself rather than as the broad kind.
+    var resultBeforeFormat = fixture.semanticResult
+    fixture.semanticResult = ({ state: "ready", terms: ["garden"], formats: ["pdf"], hints: {
+      target: { value: "file", confidence: 1, source: "rule" },
+      kind: { value: "document", confidence: 1, source: "rule" }
+    } })
+    check(JSON.stringify(panel.smartSummaryLabels()) === JSON.stringify(["FILE", "PDF"]),
+      "a typed format did not take the place of its broad kind chip: " + panel.smartSummaryLabels())
+    fixture.semanticResult = ({ state: "ready", hints: { kind: { value: "document" } } })
+    check(JSON.stringify(panel.smartSummaryLabels()) === JSON.stringify(["DOCUMENT"]),
+      "a plan without formats lost its kind chip")
+    // Every kind a query asks for is shown, a format in place of its own.
+    fixture.semanticResult = ({ state: "ready", kinds: ["image", "video"], hints: {
+      kind: { value: "image", confidence: 1, source: "rule" },
+      time: { value: "past-week", confidence: 1, source: "rule" }
+    } })
+    check(JSON.stringify(panel.smartSummaryLabels()) === JSON.stringify(["IMAGE", "VIDEO", "PAST WEEK"]),
+      "a second kind asked for had no chip: " + panel.smartSummaryLabels())
+    fixture.semanticResult = ({ state: "ready", hints: {
+      time: { value: "last-year", confidence: 1, source: "rule" }
+    } })
+    check(JSON.stringify(panel.smartSummaryLabels()) === JSON.stringify(["LAST YEAR"]),
+      "the calendar year before this one had no chip: " + panel.smartSummaryLabels())
+    fixture.semanticResult = ({ state: "ready", formats: ["pdf"], kinds: ["document", "image"],
+      hints: { kind: { value: "document", confidence: 1, source: "rule" } } })
+    check(JSON.stringify(panel.smartSummaryLabels()) === JSON.stringify(["PDF", "IMAGE"]),
+      "a format beside a second kind read wrong: " + panel.smartSummaryLabels())
+    fixture.semanticResult = resultBeforeFormat
     var smartChips = objectFinder.findChild(panel, "quickfileSmartChips")
     var settledChip = smartChips && smartChips.count > 0 ? smartChips.itemAt(0) : null
     check(settledChip !== null && settledChip.glow === 0 && !settledChip.layer.enabled,

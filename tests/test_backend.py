@@ -301,6 +301,25 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(reread["settings"]["sortOrder"], "size")
         self.assertFalse(reread["changed"])
 
+    def test_settings_remember_that_smart_onboarding_is_done(self) -> None:
+        # A settings file from before the flag existed still loads, not done.
+        quickfile.settings_file().parent.mkdir(parents=True, exist_ok=True)
+        quickfile.settings_file().write_text(
+            json.dumps({"version": 2, "sortOrder": "name"}), encoding="utf-8",
+        )
+        fresh = quickfile.settings_command(argparse.Namespace())
+        self.assertFalse(fresh["settings"]["smartOnboardingDone"])
+        saved = quickfile.settings_command(argparse.Namespace(smart_onboarding_done="true"))
+        self.assertTrue(saved["changed"])
+        reread = quickfile.settings_command(argparse.Namespace())
+        self.assertTrue(reread["settings"]["smartOnboardingDone"])
+        quickfile.settings_file().write_text(
+            json.dumps({"version": 2, "smartOnboardingDone": "yes"}), encoding="utf-8",
+        )
+        with self.assertRaises(quickfile.QuickfileError) as raised:
+            quickfile.settings_command(argparse.Namespace())
+        self.assertEqual(raised.exception.code, "settings-invalid")
+
     def test_settings_persist_the_chosen_date_format(self) -> None:
         saved = quickfile.settings_command(argparse.Namespace(
             active_sessions=None, inspector_tab=None, sort_order=None,

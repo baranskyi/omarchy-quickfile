@@ -573,6 +573,9 @@ def default_settings_store() -> dict[str, Any]:
         "inspectorTab": "properties",
         "sortOrder": "name",
         "dateFormat": "full",
+        # SMART is the default search; the one-time tip to fetch its model
+        # stays dismissed once the user installs it or says not now.
+        "smartOnboardingDone": False,
         "modules": default_module_layout(),
     }
 
@@ -603,12 +606,16 @@ def load_settings_store() -> dict[str, Any]:
     date_format = parsed.get("dateFormat", "full")
     if not isinstance(date_format, str) or date_format not in DATE_FORMATS:
         raise QuickfileError("Date format preference is invalid", "settings-invalid")
+    onboarding_done = parsed.get("smartOnboardingDone", False)
+    if not isinstance(onboarding_done, bool):
+        raise QuickfileError("Smart Search onboarding flag must be true or false", "settings-invalid")
     return {
         "version": 2,
         "activeSessionsEnabled": active_sessions,
         "inspectorTab": inspector_tab,
         "sortOrder": sort_order,
         "dateFormat": date_format,
+        "smartOnboardingDone": onboarding_done,
         "modules": normalize_module_layout(parsed.get("modules", default_module_layout())),
     }
 
@@ -665,6 +672,11 @@ def settings_command(args: argparse.Namespace) -> dict[str, Any]:
             raise QuickfileError("Date format preference is invalid", "settings-invalid")
         changed = changed or store["dateFormat"] != date_format
         store["dateFormat"] = date_format
+    onboarding_done = getattr(args, "smart_onboarding_done", None)
+    if onboarding_done is not None:
+        done = onboarding_done == "true"
+        changed = changed or store["smartOnboardingDone"] != done
+        store["smartOnboardingDone"] = done
     module_layout_json = getattr(args, "module_layout_json", None)
     if module_layout_json is not None:
         try:
@@ -5486,6 +5498,7 @@ def parser() -> argparse.ArgumentParser:
     settings.add_argument("--inspector-tab", choices=INSPECTOR_TAB_ORDER)
     settings.add_argument("--sort-order", choices=SORT_ORDER)
     settings.add_argument("--date-format", choices=DATE_FORMAT)
+    settings.add_argument("--smart-onboarding-done", choices=("true", "false"))
     settings.add_argument("--module-layout-json")
 
     knowledge_links = subcommands.add_parser(

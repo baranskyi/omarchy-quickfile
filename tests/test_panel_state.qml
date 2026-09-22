@@ -468,6 +468,33 @@ ShellRoot {
     fixture.setSortOrder("name")
   }
 
+  function smartOnboardingChecks() {
+    fixture.searchMode = "smart"
+    fixture.settingsLoaded = true
+    fixture.semanticStatusLoaded = true
+    fixture.semanticInstalled = false
+    fixture.semanticState = "not-installed"
+    fixture.smartOnboardingDone = false
+    check(fixture.smartOnboardingDue && panel.editorMode === "smart-onboarding",
+      "Smart Search without its model did not offer the one-time tip")
+    check(panel.editorConfirmEnabled(), "the tip's Download button was not available")
+    panel.cancelEditor()
+    check(panel.editorMode === "" && fixture.smartOnboardingDone && !fixture.smartOnboardingDue,
+      "Not now did not close the tip for good")
+    panel.applySearchMode("fuzzy")
+    panel.applySearchMode("smart")
+    check(panel.editorMode === "", "picking Smart again reopened an answered tip")
+
+    fixture.smartOnboardingDone = false
+    check(panel.editorMode === "smart-onboarding", "the tip did not return once it was due again")
+    panel.commitEditor()
+    check(panel.editorMode === "semantic-install" && fixture.smartOnboardingDone,
+      "Download did not lead to the installer's confirmation")
+    panel.dismissEditor()
+    fixture.semanticStatusLoaded = false
+    fixture.semanticState = "checking"
+  }
+
   function dateFormatChecks() {
     // A fixed clock: 2026-09-09 14:00 local. Every expectation below is an
     // offset from it, so the assertions do not rot with the calendar.
@@ -1483,6 +1510,8 @@ ShellRoot {
       panel.beginEditor("folder-size")
     } else if (mode === "shortcuts") {
       panel.beginEditor("shortcuts")
+    } else if (mode === "smart-onboarding") {
+      panel.beginEditor("smart-onboarding")
     } else if (mode === "inspector") {
       fixture.inspectorTab = "notes"
       panel.inspectorOpen = true
@@ -1524,6 +1553,7 @@ ShellRoot {
         testRoot.searchFocusChecks()
         testRoot.sortChecks()
         testRoot.choiceMenuChecks()
+        testRoot.smartOnboardingChecks()
         testRoot.dateFormatChecks()
         testRoot.dateChipChecks()
         testRoot.footerChecks()

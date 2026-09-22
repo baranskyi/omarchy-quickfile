@@ -640,7 +640,15 @@ Item {
     if (service.measureFolder(wanted)) folderSizeDialogTimer.restart()
   }
 
+  // Smart Search is the default search. Until the user installs its model or
+  // says not now, one small tip explains what the model adds.
+  function maybeShowSmartOnboarding() {
+    if (service && service.smartOnboardingDue && service.searchMode === "smart"
+        && editorMode === "") beginEditor("smart-onboarding")
+  }
+
   function cancelEditor() {
+    if (editorMode === "smart-onboarding" && service) service.finishSmartOnboarding()
     if (editorMode === "conflict-replace") {
       editorMode = "conflict"
       editorError = ""
@@ -676,11 +684,7 @@ Item {
 
   Connections {
     target: root.service
-    function onSemanticStatusLoadedChanged() {
-      if (root.service && root.service.semanticStatusLoaded
-          && root.service.searchMode === "smart" && !root.service.semanticInstalled
-          && root.editorMode === "") root.beginEditor("semantic-install")
-    }
+    function onSmartOnboardingDueChanged() { root.maybeShowSmartOnboarding() }
     function onFolderSizeBusyChanged() {
       if (!root.service.folderSizeBusy) {
         folderSizeDialogTimer.stop()
@@ -1339,9 +1343,7 @@ Item {
   function applySearchMode(value) {
     if (!service || String(service.searchMode) === String(value)) return false
     service.searchMode = String(value)
-    if (String(value) === "smart" && service.semanticStatusLoaded
-        && !service.semanticInstalled && editorMode === "")
-      beginEditor("semantic-install")
+    if (String(value) === "smart") maybeShowSmartOnboarding()
     searchDebounce.restart()
     return true
   }
@@ -1516,7 +1518,8 @@ Item {
       "folder-size"].indexOf(editorMode) >= 0) return false
     if (editorMode === "knowledge-links")
       return !!service.knowledgeLinkPlan && service.knowledgeLinkPlan.createCount > 0
-    if (editorMode === "semantic-install") return !service.semanticInstalled
+    if (editorMode === "semantic-install" || editorMode === "smart-onboarding")
+      return !service.semanticInstalled
     if (editorMode === "semantic-remove") return service.semanticInstalled
     return true
   }
@@ -1530,6 +1533,12 @@ Item {
     if (editorMode === "knowledge-links") {
       if (!service.applyKnowledgeLinks())
         editorError = "There are no safe links to create"
+      return
+    }
+    if (editorMode === "smart-onboarding") {
+      // The installer's own confirmation still names every download source.
+      service.finishSmartOnboarding()
+      beginEditor("semantic-install")
       return
     }
     if (editorMode === "semantic-install") {
@@ -5088,6 +5097,7 @@ Item {
                   : root.editorMode === "conflict-replace" ? "Replace existing items?"
                   : root.editorMode === "knowledge-links"
                     ? "Connect Project Knowledge"
+                  : root.editorMode === "smart-onboarding" ? "Smart Search is on"
                   : root.editorMode === "semantic-install" ? "Install Smart Search?"
                   : root.editorMode === "semantic-remove" ? "Remove Smart Search?"
                   : "Move to Trash?"
@@ -5573,9 +5583,16 @@ Item {
                 textFormat: Text.PlainText
                 visible: root.editorMode === "semantic-install"
                   || root.editorMode === "semantic-remove"
+                  || root.editorMode === "smart-onboarding"
                 width: parent.width
                 wrapMode: Text.Wrap
-                text: root.editorMode === "semantic-install"
+                text: root.editorMode === "smart-onboarding"
+                  ? "Type what you need in plain words: \u201cinvoices from last month\u201d, "
+                    + "\u201cfolder of the dog project\u201d. For the best results, download Laya, "
+                    + "a small local AI model: about 1 GB, runs offline on your CPU and sees only "
+                    + "your query, never your files. Without it, Smart Search still matches your "
+                    + "keywords, and you can add it later in QuickFile settings."
+                  : root.editorMode === "semantic-install"
                   ? "QuickFile will download about 1 GB and use about 1.8 GB of disk: the CPU "
                     + "build of PyTorch from pytorch.org, Python packages from PyPI, and the "
                     + "Apache-2.0 multilingual Laya model from Hugging Face. Search queries stay "
@@ -5881,6 +5898,7 @@ Item {
                   glyph: "󰅖"
                   label: ["trash-browser", "shortcuts"].indexOf(root.editorMode) >= 0
                     ? "Close"
+                    : root.editorMode === "smart-onboarding" ? "Not now"
                     : root.editorMode === "folder-size" ? "Stop"
                     : root.editorMode === "conflict-replace" ? "Back" : "Cancel"
                   onClicked: {
@@ -5894,13 +5912,15 @@ Item {
                   glyph: root.editorMode === "trash" ? "󰩺"
                     : root.editorMode === "trash-delete" ? "󰆴"
                     : root.editorMode === "conflict-replace" ? "󰁯"
-                    : root.editorMode === "semantic-install" ? "󰇚"
+                    : root.editorMode === "semantic-install"
+                      || root.editorMode === "smart-onboarding" ? "󰇚"
                     : root.editorMode === "semantic-remove" ? "󰆴"
                     : root.editorMode === "knowledge-links" ? "󰌷" : "󰄬"
                   label: root.editorMode === "trash" ? "Move to Trash"
                     : root.editorMode === "trash-delete" ? "Delete permanently"
                     : root.editorMode === "conflict-replace" ? "Replace existing items"
                     : root.editorMode === "semantic-install" ? "Download and install"
+                    : root.editorMode === "smart-onboarding" ? "Download Laya"
                     : root.editorMode === "semantic-remove" ? "Move to Trash"
                     : root.editorMode === "knowledge-links"
                       ? (!root.service || !root.service.knowledgeLinkPlan

@@ -155,7 +155,10 @@ Item {
   property string folderSizeError: ""
   property double folderSizeStarted: 0
   property string query: ""
-  property string searchMode: "fuzzy"
+  // Plain-language search is the default; without its optional model it
+  // still ranks the typed keywords, and a one-time tip offers the model.
+  property string searchMode: "smart"
+  property bool smartOnboardingDone: false
   property bool caseSensitive: false
   property bool truncated: false
   property string searchEngine: ""
@@ -183,6 +186,9 @@ Item {
   property string semanticSetupStderr: ""
   property string semanticSetupAction: ""
   readonly property bool semanticSetupBusy: semanticSetupProcess.running
+  readonly property bool smartOnboardingDue: settingsLoaded && semanticStatusLoaded
+    && !smartOnboardingDone && !semanticInstalled && !semanticSetupBusy
+    && semanticState === "not-installed"
   // Set by the first non-empty SMART query and kept until the mode changes or
   // the panel closes, so clearing the field does not unload a warm model.
   property bool semanticSessionActive: false
@@ -967,6 +973,7 @@ Item {
     }
     var storedFormat = String(parsed.settings.dateFormat || "")
     if (dateFormats.indexOf(storedFormat) >= 0) dateFormat = storedFormat
+    smartOnboardingDone = parsed.settings.smartOnboardingDone === true
     applyModuleCollapseFlags()
     settingsLoaded = true
     settingsError = ""
@@ -989,8 +996,16 @@ Item {
       "--inspector-tab", inspectorTab,
       "--sort-order", sortOrder,
       "--date-format", dateFormat,
+      "--smart-onboarding-done", smartOnboardingDone ? "true" : "false",
       "--module-layout-json", JSON.stringify(moduleLayout)]
     settingsSaveProcess.running = true
+    return true
+  }
+
+  function finishSmartOnboarding() {
+    if (smartOnboardingDone) return false
+    smartOnboardingDone = true
+    persistSettings()
     return true
   }
 
@@ -2326,6 +2341,7 @@ Item {
         smartDevice: root.semanticDevice,
         smartFallback: root.semanticFallback,
         smartSession: root.semanticSessionActive,
+        smartOnboardingDone: root.smartOnboardingDone,
         moduleLayout: root.moduleLayout
       })
     }

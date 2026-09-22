@@ -212,7 +212,8 @@ not activate the Refresh button. Closing the window stops its watchers; reopenin
 it reconciles anything changed in the meantime. If monitoring is unavailable or
 its bounded watch limit is exceeded, a silent 30-second fallback keeps data fresh.
 
-`SMART` is an explicit seventh search mode. Its 700 ms input pause coalesces
+`SMART` is the default search mode; the six deterministic modes stay one click
+away on the mode label. Its 700 ms input pause coalesces
 typing before inference; the six deterministic modes retain their shorter live
 delay. The chips below the field show the active hints, with a typed format in
 place of the broad kind it implies (`PDF`) and every other kind asked for
@@ -411,8 +412,10 @@ Git context, faster content search, frequent locations, external QuickView,
 ACL details, and filesystem attributes respectively. Missing optional tools do
 not block the core file manager.
 
-Smart Search is also optional. Open QuickFile settings, choose **Install Smart
-Search**, and confirm the download. QuickFile creates an isolated environment
+The Smart Search model is optional. Without it, SMART ranks the typed keywords;
+the first time QuickFile opens without the model, a small tip offers it once, and
+**Not now** keeps it from returning. To add it, choose **Download Laya** in that
+tip or **Install Smart Search** in QuickFile settings, and confirm the download. QuickFile creates an isolated environment
 under `$XDG_DATA_HOME/omarchy/quickfile/semantic/`, installs
 [Laya 0.3.5](https://github.com/NandhaKishorM/laya/tree/v0.3.5), and downloads
 only the multilingual checkpoint pinned at

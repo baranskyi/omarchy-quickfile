@@ -1328,10 +1328,25 @@ ShellRoot {
         check(stacked[m - 1].y + stacked[m - 1].height <= stacked[m].y + 0.5,
           stacked[m - 1].objectName + " overlapped " + stacked[m].objectName)
     }
+    // The chips glow while SMART is still working and settle once it is done.
+    fixture.query = ""
+    check(panel.smartSearchWorking(), "a pending SMART query did not mark the search as working")
+    fixture.query = "find config yesterday"
+    fixture.semanticState = "analyzing"
+    check(panel.smartSearchWorking(), "an analysing model did not mark the search as working")
+    fixture.semanticState = "ready"
+    fixture.foregroundListingPending = false
+    check(!panel.smartSearchWorking(), "a finished SMART search still read as working")
+    var smartChips = objectFinder.findChild(panel, "quickfileSmartChips")
+    var settledChip = smartChips && smartChips.count > 0 ? smartChips.itemAt(0) : null
+    check(settledChip !== null && settledChip.glow === 0 && !settledChip.layer.enabled,
+      "a settled Smart Search chip kept its glow")
     var lastModule = stacked[stacked.length - 1]
     check(contextStrip.y >= lastModule.y + lastModule.height - 0.5,
       "the context strip was drawn over the module stack")
     summarySearchField.text = ""
+    fixture.query = ""
+    fixture.semanticState = "checking"
     fixture.searchMode = "fuzzy"
     fixture.moduleLayout = modulesBeforeChips
     fixture.applyModuleCollapseFlags()

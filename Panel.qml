@@ -2,6 +2,7 @@ pragma ComponentBehavior: Bound
 
 import QtQuick
 import QtQuick.Controls
+import QtQuick.Effects
 import QtQuick.Window
 import Quickshell
 import Quickshell.Hyprland
@@ -1225,6 +1226,17 @@ Item {
       { value: "suffix", label: "Ends with" },
       { value: "regex", label: "Regex" },
       { value: "smart", label: "Smart" }]
+  }
+
+  // True while SMART is still working on what was typed: the input pause, the
+  // model loading or analysing, and the ranked search it then runs.
+  function smartSearchWorking() {
+    if (!service || String(service.searchMode || "") !== "smart") return false
+    var typed = String(searchField.text || "").trim()
+    if (typed === "") return false
+    if (String(service.query || "") !== typed) return true
+    var state = String(service.semanticState || "")
+    return state === "loading" || state === "analyzing" || service.foregroundBusy === true
   }
 
   function smartSummaryLabels() {
@@ -2771,15 +2783,40 @@ Item {
             anchors.verticalCenter: parent.verticalCenter
             spacing: Style.space(5)
             Repeater {
+              objectName: "quickfileSmartChips"
               model: root.smartSummaryLabels()
               delegate: Rectangle {
+                id: smartChip
                 required property var modelData
+                // 0 at rest; breathes between 0.35 and 1 while SMART works.
+                property real glow: 0
+                objectName: "quickfileSmartChip"
                 height: Style.space(18)
                 width: smartChipText.implicitWidth + Style.space(10)
                 radius: Style.space(4)
-                color: Qt.alpha(root.accent, 0.1)
+                color: Qt.alpha(root.accent, 0.1 + 0.14 * glow)
                 border.width: Math.max(1, Style.normalBorderWidth)
-                border.color: Qt.alpha(root.accent, 0.42)
+                border.color: Qt.alpha(root.accent, 0.42 + 0.58 * glow)
+                // The halo only exists while it is visible, so a settled chip
+                // costs no offscreen layer.
+                layer.enabled: glow > 0
+                layer.effect: MultiEffect {
+                  shadowEnabled: true
+                  shadowColor: root.accent
+                  shadowBlur: 1.0
+                  shadowOpacity: smartChip.glow
+                  shadowHorizontalOffset: 0
+                  shadowVerticalOffset: 0
+                  blurMax: 16
+                }
+                SequentialAnimation on glow {
+                  running: root.smartSearchWorking()
+                  loops: Animation.Infinite
+                  alwaysRunToEnd: false
+                  NumberAnimation { to: 1; duration: 620; easing.type: Easing.InOutSine }
+                  NumberAnimation { to: 0.35; duration: 620; easing.type: Easing.InOutSine }
+                  onRunningChanged: if (!running) smartChip.glow = 0
+                }
                 Text {
                   id: smartChipText
                   textFormat: Text.PlainText

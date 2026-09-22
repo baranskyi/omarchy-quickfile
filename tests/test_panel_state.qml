@@ -1364,6 +1364,20 @@ ShellRoot {
       hints: { kind: { value: "document", confidence: 1, source: "rule" } } })
     check(JSON.stringify(panel.smartSummaryLabels()) === JSON.stringify(["PDF", "IMAGE"]),
       "a format beside a second kind read wrong: " + panel.smartSummaryLabels())
+    // The kind named first may be another than the format's: its chip stays,
+    // and a format's own kind never shows beside it.
+    fixture.semanticResult = ({ state: "ready", formats: ["pdf"], kinds: ["image", "document"],
+      hints: { kind: { value: "image", confidence: 1, source: "rule" } } })
+    check(JSON.stringify(panel.smartSummaryLabels()) === JSON.stringify(["PDF", "IMAGE"]),
+      "a kind named before a format lost its chip: " + panel.smartSummaryLabels())
+    fixture.semanticResult = ({ state: "ready", formats: ["mp3"], kinds: ["video", "audio"],
+      hints: { kind: { value: "video", confidence: 1, source: "rule" } } })
+    check(JSON.stringify(panel.smartSummaryLabels()) === JSON.stringify(["MP3", "VIDEO"]),
+      "a format's own kind showed in place of the kind asked for: " + panel.smartSummaryLabels())
+    fixture.semanticResult = ({ state: "ready", formats: ["pdf", "png"], kinds: ["document", "image"],
+      hints: { kind: { value: "document", confidence: 1, source: "rule" } } })
+    check(JSON.stringify(panel.smartSummaryLabels()) === JSON.stringify(["PDF", "PNG"]),
+      "two formats of two kinds showed a kind chip: " + panel.smartSummaryLabels())
     fixture.semanticResult = resultBeforeFormat
     var smartChips = objectFinder.findChild(panel, "quickfileSmartChips")
     var settledChip = smartChips && smartChips.count > 0 ? smartChips.itemAt(0) : null

@@ -32,10 +32,12 @@ concept. It does not depend on or copy unreleased FileBlade source code.
   file names, folder names, relative paths, and bounded text-file contents.
 - Optional `SMART` search interprets natural-language requests in English,
   Russian, Ukrainian and other languages with a local multilingual Laya model.
-  It extracts bounded keywords and softly reranks by
+  It extracts bounded keywords and explicit formats and ranks by them and by
   requested file/folder, broad type, name/path/content, and calendar period;
-  uncertain hints never remove lexical matches. Without the model it degrades
-  transparently to keyword-only search.
+  uncertain hints never remove lexical matches. It walks past dependency,
+  build and cache trees, so the scan budget of a search from home goes to the
+  user's own folders. Without the model it degrades transparently to
+  keyword-only search.
 - Live search badges distinguish `FOLDER`, `NAME`, `PATH`, and `CONTENT`;
   content hits include the matching line number and a short snippet. When
   ripgrep (`rg`) is available it safely prefilters content candidates, with a
@@ -212,16 +214,124 @@ its bounded watch limit is exceeded, a silent 30-second fallback keeps data fres
 
 `SMART` is an explicit seventh search mode. Its 700 ms input pause coalesces
 typing before inference; the six deterministic modes retain their shorter live
-delay. The chips below the field show the active hints or `KEYWORDS ONLY` when
-the optional model is unavailable. Explicit words — `PDF`, `folder`/`папка`/`тека`,
-`inside`/`внутри`, `yesterday`/`вчера`/`вчора`, `last month` — are parsed by fixed
-English, Russian and Ukrainian rules, which take precedence; the model fills
-only the hints those rules leave open, and only at 75% confidence or more.
-Keywords drop one common Russian/Ukrainian case ending or English plural, so
-`бюджетом` still finds `бюджет.pdf`; quoted phrases are kept verbatim. Smart
-search does not translate terms, generate synonyms, or build an embeddings
-index: retrieval remains the same bounded local name/path/content search, with
-model decisions used only as ranking hints.
+delay. The chips below the field show the active hints, with a typed format in
+place of the broad kind it implies (`PDF`) and every other kind asked for
+(`IMAGE`, `VIDEO`), or `KEYWORDS ONLY` when the optional model is unavailable.
+Explicit words — `PDF`, `folder`/`папка`/`тека`, `inside`/`внутри`,
+`yesterday`/`вчера`/`вчора`, `last month` — are parsed by fixed English, Russian
+and Ukrainian rules, which take precedence. `Last week` is the calendar week
+before this one, while `the past week`, `last 7 days`, `за неделю`, `за
+последнюю неделю` and `за останній тиждень` are the seven days up to today and
+`the past year`, `за последний год` and `за останній рік` the 365; `this
+year`/`в этом году`/`цього року` is the calendar year and `last year`/`в прошлом
+году`/`минулого року` the one before it. A rolling window of another length is
+the shortest of these that holds it (`the past 3 days`, `the last few days`, `за
+последние две недели`, `за последние 3 месяца`, the day before yesterday),
+`recent`, `недавние` or `нещодавні` ask for the past month and `this morning`
+for today. A longer word that begins like a time word is a topic (`годовщина`).
+The model is asked only whether files or folders are wanted, where the words
+should match and which calendar period is meant — its answers on file kinds were
+mostly wrong — and fills only the hints the rules leave open, at 75% confidence
+or more. Its hints only reorder rows: they never decide which rows are listed or
+which files are read.
+
+A format written as a word (`inventory pdf`, `diagram png`, `inventory in
+excel`, `pdf-документ`) or with its dot (`.md`, `*.ts`) weighs almost like a
+requirement, and narrows the kind it implies: `pdf` alone lists PDFs, not every
+document. A format word that describes another word — `csv parser`, `mp3 to
+wav`, `tools for pdf`, `json-server` — and an extension that is also an ordinary
+word (`opus`, `tar`, `md` without its dot) stay keywords, while after a verb of
+searching (`looking for pdf`, `hunting for png`) the format is asked for. The
+kind named first, by a kind word or a format, is the one asked for (`видео с
+музыкой` is a video and `mp4 with music` an MP4, `script for photos` is code),
+except that of two English nouns side by side the last one is (`photo archive`);
+kinds joined by `and`/`и`/`та` are all asked for (`photos and videos`). A folder
+named for a kind (`Videos`, `Музыка`) is listed for it. Any text file under the
+XDG configuration home counts as configuration, so a Lua or CSS config ranks as
+one, if a little less surely than a file in a configuration format.
+
+Keywords match whole words, word starts or, from six letters, the inside of a
+word of a name — never scattered letters — and a word of three letters matches
+only with an ending (`tax` finds `taxes`, not `syntax` or `taxonomy`). Beside
+another keyword, a word of a name that begins a long keyword abbreviates it
+(`development notes` finds `dev-notes.md`), unless it only frames a request
+(`and`); one of three letters is as often a word of its own (`new` of
+`newsletter`, `pro` of `project`), so it counts only where it ends on a
+consonant and stands beside the other keyword in the order the query writes
+them. A match in a folder on the way counts for less than in the entry's own
+name, and text inside a file for less still, the longer the file the less,
+unless the query asks about contents (`mentions`, `the memo that discusses`,
+`где упоминается`). Keywords drop one common Russian/Ukrainian case ending, so
+`графиком` still finds `график.pdf`, and a word too short to trim meets its
+other case forms (`дачи` finds `Дача`, not `дачный`). English plurals, a
+fleeting vowel (`книжок` finds `книжка`), month names where a date writes them
+(`march` finds `2024/03/` and `scan_20240312.pdf`, and `10` counts as October
+only in a year's folder; `Мартин` is a name, not March) and a small vocabulary
+of document and recording words (`resume`/`cv`/`резюме`, `contract`/`договір`,
+`invoice`/`рахунок`, `screenshot`/`скриншот`, `recording`/`запис`) are matched
+as spellings of each other; a Ukrainian `лист` is a letter only when a letter is
+asked for, as typed it is as often a sheet. Russian and Ukrainian spellings fold
+together in names and in text (`кино`/`кіно`, `Одесса`/`Одеса`,
+`объект`/`об'єкт`); an apostrophe between letters is part of its word (`м'ясо`,
+`мʼясо` and `мясо` are one), and a short word shortened by its doubled letter
+still takes only its own endings (`Инна` is not `иначе`). A word in one script
+meets its transliteration in the other (`Львів`/`Lviv`, `Тюмень`/`Tyumen`), a
+word borrowed from English its English spelling as well (`компьютер`/`computer`,
+`джаз`/`jazz`) — an English word never meets its neighbour's (`wine` is not
+`vine`). A short word typed in lower case is as often another word there (`мост`
+is not `most`): it meets only the same whole word or its plural, for less than
+the word itself in a name or a text, and one of three letters only when it has
+no vowel, as an abbreviation (`смс`/`sms`). A word that an entry's type says
+counts for that entry: a phone's `IMG_0042.PNG` is a screenshot, a call's `.m4a`
+a recording, a folder a project, a `.lua` file `lua`. Such an entry is listed on
+its type alone only with the date and format the query types, and a file's
+extension says what it is, never what it is about (`pdf parser` is not every
+PDF). The translations of such a word name only entries of its type and the
+folders that hold them: English `recording` finds `Запис 03.mp4`, not an
+appointment. A file typed with its extension (`notes.md`, `package.json`) is
+found by its whole name, by another spelling of its extension (`ledger.xls`
+finds `ledger.xlsx`, `site-backup.tgz` finds `site-backup.tar.gz`) and, below
+those, by its name alone. A keyword of five letters or more that no name spells
+as typed forgives one misspelt letter (`calender` finds `calendar`). Quoted
+words are matched as typed, as whole words, and a query of symbols (`!!!`,
+`C++`) finds the names that contain them. `change`, `update`, `edit` and
+`modify` are keywords (`CHANGES.md`, `change log`, a photo editor's `Edited`
+folder) unless the query says someone did them (`what they edited`, `updated
+today`). A word spent on a kind or on what someone did still counts for a name
+or a folder that says it — `config.toml` for `… config`, `Edited/` for `edited
+photos` — as one more keyword found would; a kind word only for an entry of that
+kind or a folder named for it (a JPG called `video-still.jpg` is no video), and
+in a request of hints alone only among rows that satisfy the same hints. Topic
+words are not translated and no embeddings index is built: retrieval remains a
+bounded local name/path/content search.
+
+The walk is breadth-first, so every top-level folder is reached before any is
+searched deeply, and it does not enter `node_modules`, `__pycache__`,
+`site-packages`, a Python installation's `lib/python3.X` (one that holds
+`site-packages`), a virtualenv's tools or directories tagged `CACHEDIR.TAG`
+(Cargo's `target/`) unless the query names one. With hidden files shown,
+dot-directories are entered only after every other folder, since application
+state would otherwise spend the scan budget first. With ripgrep, one bounded
+pass per keyword tells which files hold its text, so text counts for every file
+rather than for the ones an 8 MiB read budget happened to reach; Python reads
+only what rg could not answer and the lines shown. Every row with a keyword in
+its name, path or text is listed — a word that only frames the request, such as
+`project` or `recording`, is not enough in a path or a text, but an entry named
+with it is listed (`Recording 3.m4a`, a `Recordings` folder), and every audio
+file is a candidate for `voice memo` whatever it is called (a word that is not
+always media, such as `запись`, only ranks the media another keyword finds) —
+best first: a row with every keyword before one with some (less so when some are
+found only in a long text), a row with a keyword before one whose type alone
+says some of them, names before text, words written side by side in the query
+and in a name before scattered ones, and among equals the shallower. A request
+of hints alone (`архивы за прошлый месяц`) lists what satisfies them, every hint
+first and the kind it names before the date: an archive of another month comes
+before a document of last month. A request for a folder or a project also
+credits a folder with what one entry inside it says, less for each level down,
+so the project whose README describes the request is found however its folder is
+named; a folder's date counts only when folders are asked for. `truncated` marks
+a result that lost a row it would have listed, whether to the scan, time, row or
+content budget.
 
 External drives appear automatically in `DEVICES`. Click a mounted drive to
 open it, or click an unmounted drive to mount and open it. The trailing eject

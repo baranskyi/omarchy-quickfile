@@ -1239,6 +1239,20 @@ Item {
     return state === "loading" || state === "analyzing" || service.foregroundBusy === true
   }
 
+  // The broad kind a format in a SMART plan implies, as the backend's
+  // SMART_FORMATS maps them: the backend narrows that kind to the format.
+  function smartFormatKind(format) {
+    var value = String(format || "")
+    if (value.match(/^(pdf|docx?|odt|rtf|txt|md|csv|xlsx?|ods|pptx?|odp|epub|tex)$/)) return "document"
+    if (value.match(/^(png|jpe?g|gif|webp|svg|heic|bmp|tiff?|psd)$/)) return "image"
+    if (value.match(/^(mp3|wav|flac|ogg|m4a|opus|aac)$/)) return "audio"
+    if (value.match(/^(mp4|mkv|mov|webm|avi)$/)) return "video"
+    if (value.match(/^(zip|tar|gz|tgz|7z|rar|xz|zst)$/)) return "archive"
+    if (value.match(/^(json|ya?ml|toml|ini|xml|conf)$/)) return "config"
+    if (value.match(/^(py|jsx?|tsx?|sh|lua|qml|rs|html|css|sql)$/)) return "code"
+    return ""
+  }
+
   function smartSummaryLabels() {
     if (!service || String(service.searchMode || "") !== "smart") return []
     if (String(service.query || "") !== String(searchField.text || "").trim())
@@ -1258,14 +1272,19 @@ Item {
       var value = String(hint.value || "any")
       if (order[i] === "kind") {
         // A typed format ("PDF") says more than the broad kind it implies,
-        // and every further kind asked for ("photos and videos") shows too.
-        if (formats.length > 0) {
-          for (var f = 0; f < formats.length; f++) labels.push(String(formats[f]).toUpperCase())
-        } else if (value !== "any") {
-          labels.push(value.toUpperCase())
+        // and every other kind asked for ("photos and videos", "photos and
+        // pdf") shows too: the kinds the search filters by.
+        var implied = []
+        for (var f = 0; f < formats.length; f++) {
+          labels.push(String(formats[f]).toUpperCase())
+          implied.push(smartFormatKind(formats[f]))
         }
+        var asked = value !== "any" ? [value] : []
         for (var k = 0; k < kinds.length; k++) {
-          if (String(kinds[k]) !== value) labels.push(String(kinds[k]).toUpperCase())
+          if (asked.indexOf(String(kinds[k])) < 0) asked.push(String(kinds[k]))
+        }
+        for (var a = 0; a < asked.length; a++) {
+          if (implied.indexOf(asked[a]) < 0) labels.push(asked[a].toUpperCase())
         }
         continue
       }

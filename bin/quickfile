@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import collections
+import concurrent.futures
 import ctypes
 import datetime as dt
 import errno
@@ -17,6 +19,7 @@ import grp
 import hashlib
 import heapq
 import json
+import math
 import mimetypes
 import os
 import pwd
@@ -33,16 +36,35 @@ import time
 import urllib.parse
 import uuid
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, NamedTuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from quickfile_smart import (  # noqa: E402 - bundled sibling of this executable
+    SMART_EQUIVALENT_FACTOR,
+    SMART_FORMATS,
+    SMART_INFIX_MIN,
+    SMART_NOUN_ENDINGS,
     SMART_PLAN_LIMIT,
     SMART_QUERY_LIMIT,
-    SMART_TERM_LIMIT,
+    SMART_TYPO_PROBE,
     SmartPlanError,
+    SmartTerm,
     fallback_plan,
+    fold_text,
+    format_suffixes,
+    inflected,
+    latin_keys,
+    media_words,
+    name_words,
+    smart_terms,
+    spent_words,
+    stop_word,
+    text_script,
+    typed_words,
+    unspaced,
     validate_plan,
+    within_one_edit,
+    word_kind,
 )
 
 
@@ -1958,49 +1980,282 @@ def rg_content_candidates(
     return candidates
 
 
-def rg_smart_content_candidates(
+# Trees a SMART walk lists but does not enter: installed dependencies,
+# bytecode and framework build output. They are machine-written, can hold most
+# of the entries under a developer's home, and their long paths contain almost
+# any word, so walking them spent the whole scan budget on rows nobody asked
+# for before the real answers were reached. A query that names such a
+# directory ("node_modules react") still enters it.
+SMART_PRUNED_DIRECTORIES = frozenset({
+    "node_modules", "bower_components", "jspm_packages", "__pycache__", "__pypackages__",
+    "site-packages", "dist-packages", "Pods", "DerivedData", ".next", ".nuxt",
+    ".svelte-kit", ".turbo", ".parcel-cache", ".gradle", ".tox", ".nox", ".mypy_cache",
+    ".pytest_cache", ".ruff_cache",
+})
+# The cache-directory tagging convention marks a machine-written tree whatever
+# it is called: Cargo's target/, pytest and ccache write CACHEDIR.TAG.
+SMART_CACHE_MARKER = "CACHEDIR.TAG"
+# A virtualenv holds pyvenv.cfg beside the tools and headers pip writes, which
+# are skipped. Its packages are in site-packages, skipped anywhere, under a
+# python3.X folder of its lib/, skipped as every Python installation's library
+# is: a lib/pythonN that holds site-packages. Nothing else is: `python -m venv
+# .` makes a project's own folder a virtualenv, and its lib/, share/ and
+# sources are what a search is for, as are the Python bindings a project keeps
+# in its own lib/python3/.
+SMART_VENV_MARKER = "pyvenv.cfg"
+SMART_VENV_DIRECTORIES = frozenset({"bin", "include", "Include", "Scripts"})
+SMART_LIBRARY_DIRECTORIES = frozenset({"lib", "lib64", "Lib"})
+SMART_PYTHON_LIBRARY = re.compile(r"python\d+(?:\.\d+)*")
+SMART_PYTHON_PACKAGES = "site-packages"
+# Directories found but not yet listed. The walk is breadth-first so that a
+# search from home reaches every top-level folder before it goes deep in any
+# of them; the queue is what that costs, and it is capped. With hidden files
+# shown, dot-directories and everything in them wait until every other folder
+# has been listed: they hold application state, often far more of it than the
+# user's own files, and would otherwise spend the scan budget first.
+SMART_PENDING_LIMIT = 50000
+# A folder named only by a month's number ("03") is that month when it is in
+# a year's folder, as in an archive sorted into 2024/03; elsewhere it is a
+# chapter, a lecture or a day.
+SMART_YEAR_FOLDER = re.compile(r"(?:19|20)\d\d")
+# Entries ranked only once the walk is over: files whose text Python has to
+# read, names that match only by a slip, and folders ranked with what they
+# hold. Past this many an entry is ranked on what it has, and the result is
+# marked truncated.
+SMART_DEFERRED_LIMIT = 20000
+# rg answers which files hold each keyword with one bounded pass apiece, a few
+# at a time, within this share of the time budget.
+SMART_RG_WORKERS = 4
+SMART_RG_BUDGET_SHARE = 0.4
+# Formats that never hold readable text: reading them only spends the content
+# budget that a text file could use.
+SMART_BINARY_SUFFIXES = frozenset({
+    ".7z", ".a", ".aac", ".apk", ".avi", ".bin", ".bmp", ".bz2", ".class", ".db", ".deb",
+    ".dll", ".dmg", ".doc", ".docx", ".epub", ".exe", ".flac", ".gif", ".gz", ".heic",
+    ".ico", ".iso", ".jar", ".jpeg", ".jpg", ".m4a", ".mkv", ".mov", ".mp3", ".mp4",
+    ".o", ".odp", ".ods", ".odt", ".ogg", ".opus", ".otf", ".pdf", ".png", ".ppt",
+    ".pptx", ".psd", ".pyc", ".rar", ".rpm", ".so", ".sqlite", ".tar", ".tgz", ".tif",
+    ".tiff", ".ttf", ".wasm", ".wav", ".webm", ".webp", ".woff", ".woff2", ".xls",
+    ".xlsx", ".xz", ".zip", ".zst",
+})
+
+# How well a keyword meets a word of a name: the whole word, its start (a stem,
+# a plural, a longer compound) or, for a long keyword, somewhere inside it.
+# Keywords are never matched as scattered letters: l..e..s..s..o..n occurs in
+# most long paths. A word one letter away from a long keyword counts as a
+# slip, but only when the keyword itself is in no name the walk reaches.
+SMART_GRADE_EXACT = 1.0
+SMART_GRADE_PREFIX = 0.9
+SMART_GRADE_INFIX = 0.5
+SMART_GRADE_TYPO = 0.5
+# A word of a name that is the start of a long keyword abbreviates it ("calc"
+# of "calculator", "spec" of "спецификация"), but only in a name that another
+# keyword found: alone, "calc" is as often a spreadsheet. A word that frames
+# a request ("and", "про") abbreviates nothing, and one of three letters is
+# as often a word of its own ("new" of "newsletter", "pro" of "project",
+# "rep" in sales-rep-list): it counts only where it ends on a consonant and
+# stands beside another keyword in the order the query writes the two, as
+# dev-notes.md does for "development notes".
+SMART_GRADE_ABBREVIATION = 0.5
+SMART_ABBREVIATION_MIN = 3
+SMART_ABBREVIATION_LOOSE = 4
+SMART_VOWELS = frozenset("aeiouyаеиоуюя")
+# A keyword in a folder on the way counts for less than in the entry's own
+# name, and less the further up that folder is. A word an entry's type says
+# ("screenshot" of an image, "lua" of a .lua file) counts like a folder right
+# above it. One found
+# only inside a file counts for least, unless the query asks about contents:
+# a LICENSE that mentions a name is not about that name. The longer the text,
+# the more words it holds by chance, so past a few pages content counts less
+# with the square root of the size.
+SMART_PATH_FACTOR = 0.6
+SMART_PATH_DECAY = 0.85
+SMART_TYPE_GRADE = 0.6
+SMART_CONTENT_FACTOR = 0.35
+SMART_CONTENT_ASKED_FACTOR = 0.7
+SMART_CONTENT_REFERENCE_BYTES = 32 * 1024
+# Asked for a folder, a folder is about what the files in it are about: a
+# folder whose README describes gearboxes is an answer to "gearbox folders",
+# however it is named. A file's text describes its folder nearly as well as
+# the file; a file's name counts for its folder as a folder's name counts for
+# its files. Both count less for each level between them, only a few levels
+# up, and from one entry inside: a folder is not about "gearboxes" and
+# "pulleys" because one entry in it mentions gearboxes and another pulleys.
+SMART_FOLDER_TEXT_FACTOR = 0.9
+SMART_GATHER_DEPTH = 3
+SMART_GATHER_DECAY = 0.5
+# Finding every keyword is worth as much again as one keyword in a name, so a
+# file with all of them outranks a file with one. A keyword seen in the name
+# or in the folder right above gives full credit; one seen further up, only
+# in the text or only inside a longer word gives less, and a row that has
+# every keyword somewhere gets a bonus of its own: it answers the whole
+# request, where a strong match of some words answers part of it — less for
+# a keyword found only in a long text, which holds every word of a long
+# request more easily than a short one does. Keywords the query writes side by
+# side and the name holds side by side ("tax return" in TaxReturn.pdf) add a
+# little, and so does a name that is mostly keywords: "invoice.pdf" says more
+# than "invoice-template-for-others.pdf" — for the share of the request's
+# keywords the name has, as a name made of one word of six says little.
+SMART_COVERAGE_WEIGHT = 1.0
+SMART_COMPLETE_BONUS = 0.5
+# A word the query spent on a hint ("config" in "zorb config") counts for a
+# name or a folder that has it as much as coverage counts one more keyword
+# found: a lot beside one keyword, little beside five. In a request of hints
+# alone it only orders the rows that satisfy the same hints, for less than
+# the smallest hint bonus.
+SMART_SPENT_WORD_BONUS = 1.0
+SMART_SPENT_ALONE_BONUS = 0.25
+SMART_PHRASE_BONUS = 0.3
+SMART_TIGHTNESS_BONUS = 0.2
+# Hint bonuses, in the same units. A format the user asked for is close to a
+# requirement — "manual in pdf" is not answered by manual.md, however many of
+# the words its text contains — so it outweighs two keywords found in
+# contents. A typed date counts about as much as a keyword, and a typed kind,
+# which a whole family of formats satisfies, a little less; a model hint only
+# breaks ties between rows the words rank alike, because it may be wrong.
+SMART_FORMAT_BONUS = 2.0
+SMART_TIME_BONUS = 0.8
+SMART_KIND_BONUS = 0.6
+# In a request of hints alone the kind it names is what it asks for, and a
+# date only narrows it: for "archives from last month" an archive of another
+# month comes before a document of that month.
+SMART_KIND_SUBJECT_BONUS = 0.5
+SMART_TARGET_BONUS = 0.5
+SMART_LOCATION_BONUS = 0.3
+SMART_MODEL_WEIGHT = 0.25
+SMART_SCORE_SCALE = 1000
+# Letters Russian and Ukrainian spell one word with, and the ё that Russian
+# usually writes as е: in text, as in names, either spelling finds the other.
+# So does a doubled letter, which one of them often writes once ("Одесса",
+# "Одеса").
+SMART_CONTENT_LETTERS = {
+    **dict.fromkeys("еёєэ", "еёєэ"), **dict.fromkeys("иіїы", "иіїы"),
+    **dict.fromkeys("гґ", "гґ"),
+}
+SMART_CYRILLIC_LETTER = re.compile(r"[а-яёіїєґ]")
+SMART_CYRILLIC_DOUBLE = re.compile(r"([а-яёіїєґ])\1+")
+SMART_CONTENT_SEPARATORS = "ъ'\u2019\u02bc"
+SMART_CONTENT_SEPARATOR = re.compile(f"[{SMART_CONTENT_SEPARATORS}]")
+SMART_CONTENT_IOTATED = frozenset("еёєюяї")
+SMART_REGEX_SPECIAL = re.compile(r"([\\.+*?()|\[\]{}^$])")
+
+
+def smart_content_spelling(spelling: str, *, rg: bool) -> str:
+    """One content spelling as a regular expression, for Python or for rg.
+
+    A spelling shorter than five letters has to start a word — "tax" is not
+    in "syntax" — and one of three may add only an ending: "cat" is not
+    "category". Letters and digits continue a word while "_", "-" and "."
+    start one. A script written without spaces has no word starts. A
+    Cyrillic letter stands for itself written once or more, and before a
+    vowel an apostrophe or a hard sign may stand between two letters or not
+    ("мясо", "м'ясо"; "объект", "об'єкт"). A short stem whose doubled letter
+    merged ("анн" of "Анна") takes only a case ending: "Анны", not "анализ".
+    """
+    letters = SMART_CONTENT_SEPARATOR.sub("", spelling)
+    spelling = SMART_CYRILLIC_DOUBLE.sub(r"\1", letters)
+    pieces: list[str] = []
+    for index, char in enumerate(spelling):
+        if index and char in SMART_CONTENT_IOTATED and SMART_CYRILLIC_LETTER.fullmatch(
+                spelling[index - 1]):
+            pieces.append(f"[{SMART_CONTENT_SEPARATORS}]?")
+        pieces.append(
+            (f"[{SMART_CONTENT_LETTERS[char]}]" if char in SMART_CONTENT_LETTERS
+             else SMART_REGEX_SPECIAL.sub(r"\\\1", char))
+            + ("+" if SMART_CYRILLIC_LETTER.fullmatch(char) else "")
+        )
+    body = "".join(pieces)
+    if unspaced(spelling) or len(letters) >= 5:
+        return body
+    # rg's regular expressions have no look-behind, hence its leading class.
+    if rg:
+        start, letter, end = r"(?:^|[^\p{L}\p{N}])", r"\p{L}", r"(?:$|[^\p{L}\p{N}])"
+    else:
+        start, letter, end = r"(?<![^\W_])", r"[^\W\d_]", r"(?![^\W_])"
+    if spelling != letters:
+        body += "(?:" + "|".join(SMART_NOUN_ENDINGS) + ")?" + end
+    elif len(spelling) < 4:
+        body += letter + "{0,3}" + end
+    return start + body
+
+
+def smart_content_pattern(spellings: list[str]) -> re.Pattern[str] | None:
+    """One lower-case pattern for a keyword, or None when it has no spelling
+    long enough to mean anything in text ("ok")."""
+    if not spellings:
+        return None
+    return re.compile("|".join(
+        smart_content_spelling(spelling, rg=False) for spelling in spellings
+    ))
+
+
+def rg_smart_term_files(
     root: str,
-    terms: list[str],
-    case_sensitive: bool,
+    spellings: list[list[str]],
+    skipped: frozenset[str],
     show_hidden: bool,
     file_limit: int,
     deadline: float,
-) -> set[str] | None:
-    """Prefilter files matching any smart term with one bounded rg walk."""
+) -> list[set[str] | None]:
+    """Which files hold each keyword's text, from one bounded rg pass apiece.
+
+    Knowing that for every file weighs content evidence without reading
+    files one by one, where a byte budget spent in walk order would decide by
+    directory order which files get any. None marks a keyword rg could not
+    answer — no rg, a keyword with no spelling, a timeout or output past its
+    bound — which Python then reads for.
+    """
+    found: list[set[str] | None] = [None] * len(spellings)
     executable = shutil.which("rg")
-    remaining = deadline - time.monotonic()
-    if not executable or remaining < 0.15 or file_limit <= 0 or not terms:
-        return None
-    argv = [
+    now = time.monotonic()
+    wanted = [index for index, forms in enumerate(spellings) if forms]
+    if not executable or deadline - now < 0.15 or file_limit <= 0 or not wanted:
+        return found
+    budget_end = now + (deadline - now) * SMART_RG_BUDGET_SHARE
+    base = [
         executable, "--files-with-matches", "--null", "--no-messages", "--color", "never",
         "--max-count", "1", "--max-filesize", str(file_limit), "--glob", "!.git/**",
-        "--no-ignore", "--case-sensitive" if case_sensitive else "--ignore-case",
-        "--fixed-strings",
+        "--no-ignore", "--ignore-case",
     ]
+    # rg cannot see the marker files, but skipping the named trees keeps its
+    # output about the files the walk will actually reach.
+    for name in sorted(skipped):
+        base.extend(["--glob", f"!{name}"])
     if show_hidden:
-        argv.append("--hidden")
-    for term in terms[:SMART_TERM_LIMIT]:
-        argv.extend(["-e", term])
-    argv.extend(["--", root])
-    code, output, _ = run_bounded(
-        argv, timeout=max(0.1, min(1.5, remaining / 3)), limit=RG_OUTPUT_LIMIT,
-    )
-    if (code not in {0, 1} or "\ufffd" in output
-            or len(output.encode("utf-8", "replace")) >= RG_OUTPUT_LIMIT):
-        return None
-    candidates: set[str] = set()
-    for item in output.split("\0"):
-        if not item:
-            continue
-        candidate = item if os.path.isabs(item) else os.path.join(root, item)
-        candidates.add(normalized_path(candidate))
-    return candidates
+        base.append("--hidden")
+
+    def files_holding(forms: list[str]) -> set[str] | None:
+        argv = list(base)
+        for form in forms:
+            argv.extend(["-e", smart_content_spelling(form, rg=True)])
+        argv.extend(["--", root])
+        remaining = budget_end - time.monotonic()
+        if remaining < 0.1:
+            return None
+        code, output, _ = run_bounded(argv, timeout=remaining, limit=RG_OUTPUT_LIMIT)
+        if code not in {0, 1} or len(output.encode("utf-8", "replace")) >= RG_OUTPUT_LIMIT:
+            return None
+        # A name that is not UTF-8 comes back mangled and matches no walked
+        # path; the walk reads such files itself.
+        return {
+            normalized_path(item if os.path.isabs(item) else os.path.join(root, item))
+            for item in output.split("\0") if item and "\ufffd" not in item
+        }
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(SMART_RG_WORKERS, len(wanted)),
+    ) as pool:
+        answers = pool.map(files_holding, [spellings[index] for index in wanted])
+        for index, files in zip(wanted, answers):
+            found[index] = files
+    return found
 
 
 SMART_CONFIG_NAMES = {
     ".env", ".editorconfig", ".gitconfig", ".npmrc", ".prettierrc", ".cursorrules",
     "dockerfile", "makefile", "meson.build", "pyproject.toml", "cargo.toml",
 }
+SMART_CONFIG_HOME_GRADE = 0.5
 SMART_CONFIG_SUFFIXES = {
     ".conf", ".config", ".env", ".ini", ".json", ".properties", ".toml", ".xml",
     ".yaml", ".yml",
@@ -2019,13 +2274,16 @@ SMART_DOCUMENT_SUFFIXES = {
 }
 
 
-def smart_file_kind(path: str, row: dict[str, Any]) -> str:
-    if row.get("isDir"):
+def smart_file_kind(name: str, is_dir: bool) -> str:
+    """The broad kind of an entry from its name alone, as the walk sees it."""
+    if is_dir:
         return "any"
-    name = os.path.basename(path).casefold()
-    suffix = os.path.splitext(name)[1]
-    mime = str(row.get("mime", ""))
-    if name in SMART_CONFIG_NAMES or suffix in SMART_CONFIG_SUFFIXES:
+    folded = name.casefold()
+    suffix = os.path.splitext(folded)[1]
+    mime = mimetypes.guess_type(display_text(name), strict=False)[0] or ""
+    # Dotfiles such as .bashrc and .vimrc are their programs' configuration.
+    if (folded in SMART_CONFIG_NAMES or suffix in SMART_CONFIG_SUFFIXES
+            or (folded.startswith(".") and folded.endswith("rc"))):
         return "config"
     if suffix in SMART_CODE_SUFFIXES:
         return "code"
@@ -2045,6 +2303,27 @@ def smart_file_kind(path: str, row: dict[str, Any]) -> str:
     return "any"
 
 
+def smart_config_home() -> str:
+    configured = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    return normalized_path(configured or str(Path.home() / ".config"))
+
+
+def smart_kind_grade(requested: str, kind: str, name: str, in_config_home: bool) -> float:
+    """How surely a file of `kind` is what a request for `requested` wants.
+
+    Any text file under the XDG configuration home is configuration, whatever
+    its extension: Neovim and AwesomeWM are configured in Lua, GTK in CSS.
+    It is less surely so than a file in a configuration format, as the same
+    folders hold a plugin's sources and its README.
+    """
+    if kind == requested:
+        return 1.0
+    if (requested == "config" and in_config_home and kind in {"code", "document", "any"}
+            and os.path.splitext(name.casefold())[1] not in SMART_BINARY_SUFFIXES):
+        return SMART_CONFIG_HOME_GRADE
+    return 0.0
+
+
 def smart_time_matches(timestamp: float, value: str, now: dt.datetime | None = None) -> bool:
     if value == "any":
         return False
@@ -2055,13 +2334,21 @@ def smart_time_matches(timestamp: float, value: str, now: dt.datetime | None = N
     this_month = today.replace(day=1)
     previous_month_last_day = this_month - dt.timedelta(days=1)
     last_month = previous_month_last_day.replace(day=1)
+    tomorrow = today + dt.timedelta(days=1)
+    this_year = today.replace(month=1, day=1)
     windows = {
-        "today": (today, today + dt.timedelta(days=1)),
+        "today": (today, tomorrow),
         "yesterday": (today - dt.timedelta(days=1), today),
         "this-week": (this_week, this_week + dt.timedelta(days=7)),
         "last-week": (this_week - dt.timedelta(days=7), this_week),
+        # The seven, thirty and 365 days up to and including today.
+        "past-week": (today - dt.timedelta(days=6), tomorrow),
+        "past-month": (today - dt.timedelta(days=29), tomorrow),
+        "past-year": (today - dt.timedelta(days=364), tomorrow),
         "this-month": (this_month, (this_month + dt.timedelta(days=32)).replace(day=1)),
         "last-month": (last_month, this_month),
+        "this-year": (this_year, this_year.replace(year=this_year.year + 1)),
+        "last-year": (this_year.replace(year=this_year.year - 1), this_year),
     }
     try:
         modified = dt.datetime.fromtimestamp(float(timestamp), zone)
@@ -2073,53 +2360,62 @@ def smart_time_matches(timestamp: float, value: str, now: dt.datetime | None = N
     return bool(bounds and bounds[0] <= modified < bounds[1])
 
 
+def smart_content_grade(size: int, factor: float) -> float:
+    """How much a keyword found in a text of `size` bytes counts."""
+    return factor * min(1.0, math.sqrt(SMART_CONTENT_REFERENCE_BYTES / max(1, size)))
+
+
 def smart_content_match(
     path: str,
-    terms: list[str],
-    case_sensitive: bool,
+    patterns: list[re.Pattern[str] | None],
     byte_limit: int,
     deadline: float,
-) -> tuple[dict[str, Any] | None, int, set[int], int]:
-    """Find bounded keyword occurrences in one text file with a single read."""
-    if byte_limit <= 0 or not terms or time.monotonic() >= deadline:
-        return None, 0, set(), 0
+) -> tuple[dict[str, Any] | None, int, set[int]]:
+    """Find which keywords one text file contains, with a single bounded read.
+
+    `patterns` holds one `smart_content_pattern` per keyword, None for those
+    not looked for; the result is the first matching line, the bytes read
+    (the whole file when it matched) and the indices of the keywords found.
+    """
+    wanted = [index for index, pattern in enumerate(patterns) if pattern is not None]
+    if byte_limit <= 0 or not wanted or time.monotonic() >= deadline:
+        return None, 0, set()
     try:
         info = os.lstat(path)
     except OSError:
-        return None, 0, set(), 0
+        return None, 0, set()
     if not stat.S_ISREG(info.st_mode) or info.st_size > byte_limit:
-        return None, 0, set(), 0
+        return None, 0, set()
     try:
         with open(path, "rb") as stream:
             raw = stream.read(byte_limit + 1)
     except OSError:
-        return None, 0, set(), 0
+        return None, 0, set()
     if len(raw) > byte_limit or b"\x00" in raw[:8192]:
-        return None, min(len(raw), byte_limit), set(), 0
+        return None, min(len(raw), byte_limit), set()
     text = raw.decode("utf-8", "replace")
-    needles = terms if case_sensitive else [term.casefold() for term in terms]
     matched: set[int] = set()
     first: dict[str, Any] | None = None
-    best_score = 0
     for line_number, line in enumerate(text.splitlines(), start=1):
         if time.monotonic() >= deadline:
             break
-        candidate = line[:CONTENT_LINE_LIMIT]
-        haystack = candidate if case_sensitive else candidate.casefold()
-        line_matches = [index for index, term in enumerate(needles) if term in haystack]
-        if not line_matches:
+        haystack = line[:CONTENT_LINE_LIMIT].lower()
+        found = [
+            index for index in wanted
+            if index not in matched and patterns[index].search(haystack)
+        ]
+        if not found:
             continue
-        matched.update(line_matches)
+        matched.update(found)
         if first is None:
             snippet = " ".join(line.strip().split())[:CONTENT_SNIPPET_LIMIT]
             first = {
                 "matchKind": "content", "matchLine": line_number,
                 "matchSnippet": display_text(snippet),
             }
-        best_score = max(best_score, max(1, 600 - len(candidate) // 8))
-        if len(matched) == len(terms):
+        if len(matched) == len(wanted):
             break
-    return first, len(raw), matched, best_score
+    return first, len(raw), matched
 
 
 def smart_plan_from_args(args: argparse.Namespace, query: str) -> tuple[dict[str, Any], str, str]:
@@ -2134,16 +2430,312 @@ def smart_plan_from_args(args: argparse.Namespace, query: str) -> tuple[dict[str
         return fallback_plan(query), "fallback", "invalid-plan"
 
 
+def smart_word_grade(word: str, text: str, extension: int | None, infix: float) -> float:
+    """How well one spelling meets one word of a name."""
+    if word == text:
+        return SMART_GRADE_EXACT
+    if word.startswith(text) and (extension is None or len(word) - len(text) <= extension):
+        return SMART_GRADE_PREFIX
+    return infix if infix and text in word else 0.0
+
+
+# An extension is one word after the last dot, with a letter in it.
+SMART_EXTENSION = re.compile(r"\.[^\W_]*[^\W\d_][^\W_]*")
+
+
+class SmartName(NamedTuple):
+    """What one name says about each keyword."""
+
+    # Per keyword: the grade of the name's own words, of the spellings that
+    # count only for an entry of the keyword's type (see `SmartTerm`), of a
+    # slip, and whether the keyword is only the file's extension, which says
+    # what the file is as its type does ("lua" of quux.lua) rather than what
+    # it is about.
+    grades: list[float]
+    typed: list[float]
+    typos: list[float]
+    suffix: list[bool]
+    # The share of the name's words the keywords account for, and whether
+    # keywords the query writes side by side are side by side in it.
+    tightness: float
+    phrase: bool
+
+
+def smart_share(word: str, text: str) -> float:
+    """How much of a word a spelling that matched it accounts for: all of it,
+    or the letters it has of a longer word ("port" of "portal")."""
+    return 1.0 if word == text else min(1.0, len(text) / max(1, len(word)))
+
+
+class SmartMatcher:
+    """Grade names against the analysed keywords of one query."""
+
+    def __init__(self, terms: list[SmartTerm]) -> None:
+        self.terms = terms
+        # Each spelling starts with a probe, a plain substring test that rules
+        # a name out before it is split into words — all most names ever cost.
+        self.forms: list[tuple[int, str, str, float, int | None, float, bool]] = []
+        for index, term in enumerate(terms):
+            for text, factor, extension, infix, typed in term.forms:
+                grade = 0.0
+                if infix:
+                    grade = SMART_GRADE_PREFIX if unspaced(text) else SMART_GRADE_INFIX
+                probe = max(text.split(" "), key=len)
+                self.forms.append((index, probe, text, factor, extension, grade, typed))
+        self.latin = [
+            (index, text, factor, extension, term.script)
+            for index, term in enumerate(terms) for text, factor, extension in term.latin
+        ]
+        self.stems = [(index, term.stem) for index, term in enumerate(terms) if term.stem]
+        # A month's number where a date writes it: after a year ("2026-10-14",
+        # "20261014"), or as the whole name of a folder in a year's folder
+        # ("2026/10") — never a day, a counter or the seconds of 15-47-10.
+        self.months = [
+            (index, term.month, re.compile(
+                r"(?<!\d)(?:19|20)\d\d[-_. ]?%s(?:[-_. ]?[0-3]\d)?(?!\d)" % term.month
+            ))
+            for index, term in enumerate(terms) if term.month
+        ]
+        self.typos = [
+            (index, term.typo[:SMART_TYPO_PROBE], term.typo)
+            for index, term in enumerate(terms) if term.typo
+        ]
+        self.symbols = [(index, term.symbols) for index, term in enumerate(terms) if term.symbols]
+        self.pairs = [
+            (index, terms[index].folded, terms[index + 1].folded)
+            for index in range(len(terms) - 1)
+            if " " not in terms[index].folded + terms[index + 1].folded
+            and terms[index].folded and terms[index + 1].folded
+        ]
+
+    def name(self, name: str, is_dir: bool, in_year: bool = False) -> SmartName | None:
+        """What a name says about each keyword, or None when it says nothing.
+        `in_year` tells that the entry is in a folder named for a year."""
+        folded = fold_text(name)
+        hits = [form for form in self.forms if form[1] in folded]
+        latin_hits = []
+        if self.latin:
+            spellings = latin_keys(folded)
+            latin_hits = [
+                form for form in self.latin if any(form[1] in latin for latin in spellings)
+            ]
+        months = [
+            index for index, number, dated in self.months
+            if dated.search(folded) or (is_dir and in_year and folded == number)
+        ]
+        stem_hits = [form for form in self.stems if form[1] in folded]
+        typo_hits = [form for form in self.typos if form[1] in folded]
+        symbols = [index for index, text in self.symbols if text in name.casefold()]
+        if not (hits or latin_hits or months or stem_hits or typo_hits or symbols):
+            return None
+        full_words, full_humps = name_words(name)
+        # The last words of a file's name are its extension when it has one:
+        # the word after the last dot, "mp" and "4" of ".mp4" alike, and not
+        # the rest of "release-2.0-notes".
+        extension = os.path.splitext(name)[1]
+        cut = 0
+        if not is_dir and SMART_EXTENSION.fullmatch(extension):
+            ending = name_words(extension)[0]
+            if ending and full_words[-len(ending):] == ending:
+                cut = len(ending)
+        suffix = full_words[-1] if cut else ""
+        words = full_words[:-cut] if cut else full_words
+        humps = full_humps[:-cut] if cut and full_humps else full_humps
+        tokens = words + [hump for hump in humps if hump not in words]
+        # The name's words as a person reads them, for how much of the name
+        # the keywords explain: humps split, the extension and numbers left out.
+        units = humps or words
+        grades = [0.0] * len(self.terms)
+        typed_grades = [0.0] * len(self.terms)
+        typos = [0.0] * len(self.terms)
+        suffixed = [False] * len(self.terms)
+        explained = [0.0] * len(units)
+        positions: list[set[int]] = [set() for _ in self.terms]
+        # A quoted or dotted keyword is a run of whole words, which may end
+        # with the extension: "notes.md" is all of notes.md.
+        runs = [" " + " ".join(run) + " " for run in (full_words, full_humps) if run]
+        for index, _probe, text, factor, extension_letters, infix, typed in hits:
+            found = typed_grades if typed else grades
+            if " " in text:
+                if any(f" {text} " in run for run in runs):
+                    found[index] = max(found[index], SMART_GRADE_EXACT * factor)
+                    parts = text.split(" ")
+                    for position, unit in enumerate(units):
+                        if unit in parts:
+                            explained[position] = 1.0
+                continue
+            for token in tokens:
+                grade = smart_word_grade(token, text, extension_letters, infix)
+                found[index] = max(found[index], grade * factor)
+            for position, unit in enumerate(units):
+                if smart_word_grade(unit, text, extension_letters, infix):
+                    explained[position] = max(explained[position], smart_share(unit, text))
+                    positions[index].add(position)
+            if suffix and smart_word_grade(suffix, text, extension_letters, infix):
+                suffixed[index] = True
+        for index, text, factor, extension_letters, script in latin_hits:
+            # Only across scripts: "wine" is not "vine", nor "sell" "cell".
+            for token in tokens:
+                token_script = text_script(token)
+                if not token_script or token_script == script:
+                    continue
+                for spelled in latin_keys(token):
+                    grade = smart_word_grade(spelled, text, extension_letters, 0.0)
+                    grades[index] = max(grades[index], grade * factor)
+                    if grade and token in units:
+                        position = units.index(token)
+                        explained[position] = max(
+                            explained[position], smart_share(spelled, text))
+            # An extension says what a file is in either script: a .torrent is
+            # a "торрент".
+            if suffix and text_script(suffix) not in {"", script} and any(
+                    smart_word_grade(spelled, text, extension_letters, 0.0)
+                    for spelled in latin_keys(suffix)):
+                suffixed[index] = True
+        for index, stem in stem_hits:
+            for token in tokens:
+                if inflected(token, stem):
+                    grades[index] = max(grades[index], SMART_EQUIVALENT_FACTOR)
+            for position, unit in enumerate(units):
+                if inflected(unit, stem):
+                    explained[position] = 1.0
+                    positions[index].add(position)
+        for index in months:
+            grades[index] = max(grades[index], SMART_EQUIVALENT_FACTOR)
+        for index in symbols:
+            grades[index] = SMART_GRADE_EXACT
+        for index, _probe, text in typo_hits:
+            if not grades[index] and any(
+                word.isalpha() and within_one_edit(word, text) for word in tokens
+            ):
+                typos[index] = SMART_GRADE_TYPO
+        if any(grades) or any(typos):
+            # Where the name has each keyword, a slip of it included.
+            found_at = [
+                found | {
+                    position for position, unit in enumerate(units)
+                    if typos[index] and within_one_edit(unit, self.terms[index].typo)
+                }
+                for index, found in enumerate(positions)
+            ]
+            for index, term in enumerate(self.terms):
+                if (grades[index] or len(term.folded) < SMART_INFIX_MIN
+                        or not term.folded.isalpha()):
+                    continue
+                for position, unit in enumerate(units):
+                    if (len(unit) < SMART_ABBREVIATION_MIN or not unit.isalpha()
+                            or stop_word(unit)):
+                        continue
+                    # In the other script, by the Latin spelling: "doc" of "документация".
+                    spellings = [(unit, term.folded)] if text_script(unit) == term.script else [
+                        (short, long) for short in latin_keys(unit)
+                        for long in latin_keys(term.folded)
+                    ]
+                    if not any(len(short) < len(long) and long.startswith(short)
+                               for short, long in spellings):
+                        continue
+                    if len(unit) < SMART_ABBREVIATION_LOOSE and (
+                        unit[-1] in SMART_VOWELS or not any(
+                            position - 1 in found_at[other] if other < index
+                            else position + 1 in found_at[other]
+                            for other in range(len(self.terms)) if other != index
+                        )
+                    ):
+                        continue
+                    grades[index] = SMART_GRADE_ABBREVIATION
+                    explained[position] = 1.0
+                    positions[index].add(position)
+        phrase = False
+        for index, left, right in self.pairs:
+            # Written together ("TaxReturn", "taxreturn") the words are one
+            # run, where the shorter of them could not match alone.
+            if any(token.startswith(left + right) for token in tokens):
+                grades[index] = max(grades[index], SMART_GRADE_PREFIX)
+                grades[index + 1] = max(grades[index + 1], SMART_GRADE_PREFIX)
+                phrase = True
+            elif any(position + 1 in positions[index + 1] for position in positions[index]):
+                phrase = True
+        if not any(grades) and not any(typed_grades) and not any(typos) and not any(suffixed):
+            return None
+        # A word the keyword only begins counts for the letters it has: a
+        # name made of "port" is tighter than one made of "portal".
+        counted = [share for unit, share in zip(units, explained) if not unit.isdigit()]
+        tightness = sum(counted) / len(counted) if counted else 0.0
+        return SmartName(grades, typed_grades, typos, suffixed, tightness, phrase)
+
+    def own(self, evidence: SmartName | None, entry_type: str) -> list[float]:
+        """What a name says about each keyword for an entry of `entry_type`:
+        a spelling that counts only for an entry of the keyword's type counts
+        when the entry is one or a folder that may hold them (Recordings/,
+        Записи/)."""
+        if evidence is None:
+            return [0.0] * len(self.terms)
+        return [
+            max(grade, typed) if typed and (
+                entry_type in term.spelled_types or entry_type == "folder")
+            else grade
+            for term, grade, typed in zip(self.terms, evidence.grades, evidence.typed)
+        ]
+
+
 def smart_search_command(args: argparse.Namespace, root: str, query: str) -> dict[str, Any]:
     plan, smart_state, fallback_reason = smart_plan_from_args(args, query)
-    terms = list(plan["terms"])
     hints = plan["hints"]
-    useful_hint = any(hints[field]["value"] != "any" for field in hints)
-    # An entirely empty analysis should retain the familiar fuzzy behaviour,
-    # not turn a stop-word-only sentence into an expensive match-all walk.
-    if not terms and not useful_hint:
-        raw_term = query[:64]
-        terms = [raw_term] if raw_term else []
+    formats = list(plan["formats"])
+    raw_terms = list(plan["terms"])
+    # Hints the user typed; the model's may reorder rows but never decide
+    # which are listed, read or ranked with what they hold.
+    typed = {
+        field for field in hints
+        if hints[field]["value"] != "any" and hints[field]["source"] == "rule"
+    }
+    # An entirely empty analysis should still search for what was typed, not
+    # turn a stop-word-only sentence into an expensive match-all walk. A model
+    # hint does not stand in for it: it may not decide which rows are listed.
+    if not raw_terms and not typed and not formats:
+        raw_terms = [query[:64]]
+    # Every kind the query names ("photos and videos"), the hint's first. A
+    # format narrows the kind it implies: "pdf" asks for PDFs, not for every
+    # document.
+    wanted_kinds: list[str] = []
+    if hints["kind"]["value"] != "any":
+        wanted_kinds = [hints["kind"]["value"]]
+        wanted_kinds += [kind for kind in plan["kinds"] if kind not in wanted_kinds]
+    filter_kinds = (
+        set(wanted_kinds) - {SMART_FORMATS[value] for value in formats}
+        if "kind" in typed else set()
+    )
+    # Without keywords a query is a filter: every entry of its typed kind,
+    # date or format — or, when it names none, its file or folder hint.
+    filters = (
+        ({"kind"} if filter_kinds else set()) | (typed & {"time"})
+        | ({"format"} if formats else set())
+    )
+    terms = smart_terms(raw_terms, bool(filters), media_words(query), typed_words(query))
+    if not filters and "target" in typed:
+        filters = {"target"}
+    matcher = SmartMatcher(terms)
+    required = bool(terms)
+    suffixes = format_suffixes(formats)
+    target = hints["target"]["value"] if "target" in typed else "any"
+    content_asked = "location" in typed and hints["location"]["value"] == "content"
+    content_factor = SMART_CONTENT_ASKED_FACTOR if content_asked else SMART_CONTENT_FACTOR
+    # A pruned tree the query names is entered after all.
+    named = {fold_text(term.text).strip("._-") for term in terms}
+    skipped = frozenset(
+        name for name in SMART_PRUNED_DIRECTORIES if fold_text(name).strip("._-") not in named
+    )
+    config_home = smart_config_home()
+    types_asked = any(term.types for term in terms)
+    total_weight = sum(term.weight for term in terms)
+    # The words spent on a hint that also name things ("config", "фото",
+    # "edited") are no keyword a row needs, but a name or a folder that says
+    # one is named for what the query asks: config.toml, photos/, Edited/.
+    spent = spent_words(query)
+    spent_matcher = SmartMatcher([SmartTerm(word) for word, _kind in spent])
+    spent_kinds = [kind for _word, kind in spent]
+    spends = bool(spent_matcher.terms)
+    no_spent = [0.0] * len(spent_matcher.terms)
 
     git = git_context(root) if not args.no_git else {"root": "", "branch": "", "statuses": {}}
     deadline = time.monotonic() + max(0.25, float(args.timeout))
@@ -2153,164 +2745,456 @@ def smart_search_command(args: argparse.Namespace, root: str, query: str) -> dic
     content_byte_limit = max(
         0, int(getattr(args, "content_byte_limit", DEFAULT_CONTENT_BYTE_LIMIT))
     )
-    rg_candidates: set[str] | None = None
+    # A request in words is matched without regard to case; --case-sensitive
+    # belongs to the pattern modes.
+    patterns = [smart_content_pattern(term.content_forms) for term in terms]
+    term_files: list[set[str] | None] = [None] * len(terms)
     content_search_backend = "none"
-    if terms and content_byte_limit > 0:
-        rg_candidates = rg_smart_content_candidates(
-            root, terms, args.case_sensitive, args.show_hidden,
+    if content_byte_limit > 0 and any(patterns):
+        term_files = rg_smart_term_files(
+            root, [term.content_forms for term in terms], skipped, args.show_hidden,
             content_file_limit, deadline,
         )
-        content_search_backend = "rg" if rg_candidates is not None else "python"
+        answered_any = any(files is not None for files in term_files)
+        content_search_backend = "rg" if answered_any else "python"
+    answered = [index for index, files in enumerate(term_files) if files is not None]
+    unread = [
+        index for index, pattern in enumerate(patterns)
+        if pattern is not None and term_files[index] is None
+    ]
 
-    root_depth = root.rstrip(os.sep).count(os.sep)
     watch = WatchPaths()
     watch.add_git(git)
-    heap: list[tuple[int, int, dict[str, Any]]] = []
+    heap: list[tuple[float, int, dict[str, Any]]] = []
     serial = 0
-    matched_count = 0
     scanned = 0
+    pruned = 0
     content_bytes_scanned = 0
     truncated = False
     limit = max(0, int(args.limit))
     scan_limit = max(0, int(args.scan_limit))
     now = dt.datetime.now().astimezone()
+    no_grades = [0.0] * len(terms)
+    # Whether each keyword is in some name as typed. One that is not may be
+    # misspelt, and only then do names one letter away count.
+    spelled = [False] * len(terms)
+    deferred: list[dict[str, Any]] = []
+    # Only a typed request for folders gathers what they hold: a model hint
+    # must not decide how rows are ranked against each other.
+    gathers = required and target == "folder"
+    folders: dict[str, dict[str, Any]] = {}
 
-    for directory, dirnames, filenames in os.walk(root, followlinks=False):
-        watch.add_directory(directory)
-        if not args.show_hidden:
-            dirnames[:] = [name for name in dirnames if not name.startswith(".")]
-            filenames = [name for name in filenames if not name.startswith(".")]
-        if ".git" in dirnames:
-            dirnames.remove(".git")
-        stop = False
-        for name in dirnames + filenames:
-            scanned += 1
-            if scanned > scan_limit or time.monotonic() >= deadline:
-                truncated = True
-                stop = True
+    def lift(path: str, vector: list[float]) -> None:
+        """Offer one entry's evidence to the gathered folders above it."""
+        ancestor = os.path.dirname(path)
+        for _level in range(SMART_GATHER_DEPTH):
+            folder = folders.get(ancestor)
+            if folder is None:
                 break
-            path = os.path.join(directory, name)
-            relative = os.path.relpath(path, root)
-            rendered_name = display_text(name)
-            rendered_relative = display_text(relative)
-            is_directory = name in dirnames
-            matched_terms: set[int] = set()
-            lexical_score = 0
-            best_kind = ""
-            match: dict[str, Any] | None = None
-            for index, term in enumerate(terms):
-                found, score = matches(rendered_name, term, "fuzzy", args.case_sensitive)
-                if found:
-                    matched_terms.add(index)
-                    adjusted = 900 + max(-200, score)
-                    if adjusted > lexical_score:
-                        lexical_score = adjusted
-                        best_kind = "folder" if is_directory else "name"
-                        match = {"matchKind": best_kind, "matchLine": 0, "matchSnippet": ""}
-                    continue
-                if rendered_relative != rendered_name:
-                    found, score = matches(rendered_relative, term, "fuzzy", args.case_sensitive)
-                    if found:
-                        matched_terms.add(index)
-                        adjusted = 650 + max(-200, score)
-                        if adjusted > lexical_score:
-                            lexical_score = adjusted
-                            best_kind = "path"
-                            match = {"matchKind": "path", "matchLine": 0, "matchSnippet": ""}
+            weight = sum(term.weight * grade for term, grade in zip(terms, vector))
+            if weight > folder["childWeight"]:
+                folder["child"], folder["childWeight"] = vector, weight
+            vector = [grade * SMART_GATHER_DECAY for grade in vector]
+            ancestor = os.path.dirname(ancestor)
 
-            should_read_content = (
-                bool(terms) and not is_directory and content_bytes_scanned < content_byte_limit
-                and (len(matched_terms) < len(terms) or hints["location"]["value"] == "content")
-                and (rg_candidates is None or normalized_path(path) in rg_candidates)
-            )
-            content_terms: set[int] = set()
-            content_hit: dict[str, Any] | None = None
-            if should_read_content:
-                remaining = content_byte_limit - content_bytes_scanned
-                content_hit, bytes_read, content_terms, content_score = smart_content_match(
-                    path, terms, args.case_sensitive, min(content_file_limit, remaining), deadline,
-                )
-                content_bytes_scanned += bytes_read
-                matched_terms.update(content_terms)
-                if content_hit is not None and (
-                    match is None or hints["location"]["value"] == "content"
-                ):
-                    match = content_hit
-                    best_kind = "content"
-                    lexical_score = max(lexical_score, 550 + content_score)
+    def keep(item: dict[str, Any], content: dict[int, float], hit: dict[str, Any] | None) -> None:
+        """Score one entry with all of its evidence and offer it to the heap."""
+        nonlocal serial, truncated
+        name = item["entry"].name
+        is_dir = item["isDir"]
+        evidence: SmartName | None = item["name"]
+        kind = smart_file_kind(name, is_dir)
+        entry_type = "folder" if is_dir else kind
+        own = matcher.own(evidence, entry_type)
+        if evidence:
+            for index, slip in enumerate(evidence.typos):
+                if slip and not spelled[index]:
+                    own[index] = max(own[index], slip)
+        paths = item["paths"]
+        child = item.get("child") or no_grades
+        suffix = evidence.suffix if evidence else [False] * len(terms)
+        said = [entry_type in term.types or suffix[index] for index, term in enumerate(terms)]
+        grades = [
+            max(own[index], paths[index], content.get(index, 0.0), child[index],
+                SMART_TYPE_GRADE if said[index] else 0.0)
+            for index in range(len(terms))
+        ]
+        # A row needs every keyword, or one of those that say what the entry is
+        # about in its name, path or text, or to be the media the query names:
+        # a phone's recording is one whatever else the query says. The words
+        # an entry's type can say ("project", "screenshot", "recording") only
+        # frame the request, so a folder or a text on the way is not enough —
+        # not everything under Projects/ is a project — but an entry named
+        # with one is what the word asks for ("Recording 3.m4a", Recordings/).
+        literal = [
+            bool(own[index] or paths[index] or content.get(index) or child[index])
+            for index in range(len(terms))
+        ]
+        complete = required and all(grades)
+        framing = [bool(term.types) for term in terms]
+        subject = any(
+            own[index] if frame else hit
+            for index, (hit, frame) in enumerate(zip(literal, framing))
+        ) or (all(framing) and any(literal))
+        if required and not complete and not subject and not any(
+                term.media == entry_type for term in terms):
+            return
+        # A row that only its type says the words of — any image for
+        # "screenshots", any .lua file for "lua" — is one only on the date and
+        # in the format the query typed.
+        by_type = required and not any(literal)
+        if gathers and not is_dir and (any(own) or content):
+            lift(item["path"], [
+                max(own[index] * SMART_PATH_FACTOR,
+                    content.get(index, 0.0) * SMART_FOLDER_TEXT_FACTOR)
+                for index in range(len(terms))
+            ])
+        lexical = sum(term.weight * grade for term, grade in zip(terms, grades))
+        coverage = sum(
+            term.weight * min(1.0, grade / SMART_PATH_FACTOR) for term, grade in zip(terms, grades)
+        ) / total_weight if total_weight else 0.0
+        # A kind word names only an entry of its kind and a folder named for
+        # the kind, where such entries are kept: the images in photos/, not a
+        # PDF there or a JPG called video-still.jpg.
+        spent_named = max((
+            grade for grade, spent_kind in zip(item["spent"], spent_kinds)
+            if not spent_kind or (word_kind(name) == spent_kind if is_dir else smart_kind_grade(
+                spent_kind, kind, name, item["inConfigHome"]))
+        ), default=0.0)
+        firm = lexical + SMART_COVERAGE_WEIGHT * coverage + spent_named * (
+            SMART_SPENT_WORD_BONUS / max(1.0, total_weight) if required
+            else SMART_SPENT_ALONE_BONUS)
+        if complete and len(terms) > 1:
+            firm += SMART_COMPLETE_BONUS * min(
+                min(1.0, grade / content_factor) for grade in grades)
+        if evidence and any(own):
+            named = sum(term.weight for term, grade in zip(terms, own) if grade)
+            firm += SMART_TIGHTNESS_BONUS * evidence.tightness * named / total_weight
+            if evidence.phrase:
+                firm += SMART_PHRASE_BONUS
+        source = ("name" if any(own) or any(suffix) else "path" if any(paths)
+                  else "content" if content else "smart")
 
-            if terms and not matched_terms:
-                continue
-            if match is None:
-                match = {"matchKind": "smart", "matchLine": 0, "matchSnippet": ""}
-                best_kind = "smart"
-            try:
-                row = entry_row(path, max(0, directory.count(os.sep) - root_depth), git, set())
-            except QuickfileError:
-                continue
-            row["relativePath"] = rendered_relative
-            row.update(match)
+        model = 0.0
+        reasons: list[str] = []
+        satisfied: set[str] = set()
 
-            coverage = len(matched_terms)
-            score = lexical_score + coverage * 1000
-            if terms and coverage == len(terms):
-                score += 500
-            reasons: list[str] = []
-            target = hints["target"]["value"]
-            if (target == "folder" and row["isDir"]) or (target == "file" and not row["isDir"]):
-                bonus = round(240 * float(hints["target"]["confidence"]))
-                score += bonus
-                if bonus > 0:
-                    reasons.append(target)
-            requested_kind = hints["kind"]["value"]
-            if requested_kind != "any" and smart_file_kind(path, row) == requested_kind:
-                bonus = round(220 * float(hints["kind"]["confidence"]))
-                score += bonus
-                if bonus > 0:
-                    reasons.append(requested_kind)
-            location = hints["location"]["value"]
-            location_matches = (
-                (location == "name" and best_kind in {"name", "folder"})
-                or (location == "path" and best_kind == "path")
-                or (location == "content" and bool(content_terms))
-            )
-            if location_matches:
-                bonus = round(260 * float(hints["location"]["confidence"]))
-                score += bonus
-                if bonus > 0:
-                    reasons.append(location)
-            requested_time = hints["time"]["value"]
-            if smart_time_matches(float(row.get("modifiedEpoch", 0)), requested_time, now):
-                bonus = round(200 * float(hints["time"]["confidence"]))
-                score += bonus
-                if bonus > 0:
-                    reasons.append(requested_time)
-            row["smartScore"] = score
-            row["smartReasons"] = reasons[:4]
-            matched_count += 1
-            serial += 1
-            if limit <= 0:
-                truncated = True
-                continue
-            item = (score, serial, row)
-            if len(heap) < limit:
-                heapq.heappush(heap, item)
-            elif score > heap[0][0]:
-                heapq.heapreplace(heap, item)
+        def add(field: str, amount: float, reason: str) -> None:
+            nonlocal firm, model
+            hint = hints[field]
+            value = amount * float(hint["confidence"])
+            if hint["source"] == "laya":
+                model += value * SMART_MODEL_WEIGHT
             else:
+                firm += value
+                satisfied.add(field)
+            if value > 0:
+                reasons.append(reason)
+
+        if suffixes and not is_dir and name.casefold().endswith(suffixes):
+            firm += SMART_FORMAT_BONUS
+            reasons.append("format")
+            satisfied.add("format")
+        wanted_target = hints["target"]["value"]
+        if (wanted_target == "folder" and is_dir) or (wanted_target == "file" and not is_dir):
+            add("target", SMART_TARGET_BONUS, wanted_target)
+        # A folder named for a kind ("Videos", "Музыка") is where it is kept.
+        folder_kind = word_kind(name) if is_dir and wanted_kinds else ""
+        kind_grades = {
+            wanted: float(folder_kind == wanted) if is_dir
+            else smart_kind_grade(wanted, kind, name, item["inConfigHome"])
+            for wanted in wanted_kinds
+        }
+        matched_kinds = [wanted for wanted in wanted_kinds if kind_grades[wanted]]
+        # A row only its type says some of the words of has had that type
+        # counted once: beside a keyword it lacks, "screenshots" is not an
+        # image's word and its kind again.
+        if matched_kinds and not (by_type and not complete):
+            asked = filter_kinds.intersection(matched_kinds)
+            subject = SMART_KIND_SUBJECT_BONUS if asked and not required else 0.0
+            add("kind", (SMART_KIND_BONUS + subject) * max(kind_grades.values()),
+                matched_kinds[0])
+            if not asked:
+                # A PDF asked for as a PDF passes by its format, not its kind.
+                satisfied.discard("kind")
+        location = hints["location"]["value"]
+        if ((location == "name" and source == "name") or (location == "path" and source == "path")
+                or (location == "content" and bool(content))):
+            add("location", SMART_LOCATION_BONUS, location)
+        period = hints["time"]["value"]
+        # A folder's date moves when an entry is added or removed, not when
+        # a file in it is edited, so it counts only when folders are asked for.
+        if period != "any" and (not is_dir or target == "folder"):
+            try:
+                modified = item["entry"].stat(follow_symlinks=False).st_mtime
+            except OSError:
+                modified = None
+            if modified is not None and smart_time_matches(modified, period, now):
+                add("time", SMART_TIME_BONUS, period)
+        if not required and not (satisfied & filters) and lexical <= 0:
+            return
+        if by_type and not (filters & {"time", "format"}).issubset(satisfied):
+            return
+        if hit is not None and (source == "content" or content_asked):
+            match = hit
+        elif source == "content":
+            match = {"matchKind": "content", "matchLine": 0, "matchSnippet": ""}
+        elif source in {"name", "path"}:
+            badge = "folder" if is_dir and source == "name" else source
+            match = {"matchKind": badge, "matchLine": 0, "matchSnippet": ""}
+        else:
+            match = {"matchKind": "smart", "matchLine": 0, "matchSnippet": ""}
+        item.update({"score": firm + model, "firm": firm, "reasons": reasons, "match": match})
+        serial += 1
+        if limit <= 0:
+            truncated = True
+            return
+        # A full heap gives up the rows the typed words and hints rank lowest —
+        # never because of a model hint — and between equals keeps the one
+        # found first, which is the shallower one.
+        entry = (firm, -serial, item)
+        if len(heap) < limit:
+            heapq.heappush(heap, entry)
+        else:
+            heapq.heappushpop(heap, entry)
+            truncated = True
+
+    def defer(item: dict[str, Any]) -> bool:
+        nonlocal truncated
+        if len(deferred) >= SMART_DEFERRED_LIMIT:
+            truncated = True
+            return False
+        deferred.append(item)
+        return True
+
+    # Each directory to list, what its path says of each keyword and of each
+    # spent word, and whether it is a dot-directory or inside one, which wait
+    # in a queue of their own (see SMART_PENDING_LIMIT).
+    pending: collections.deque[tuple[str, str, int, list[float], list[float], bool]] = (
+        collections.deque([(root, "", 0, no_grades, no_spent, False)])
+    )
+    pending_hidden: collections.deque[tuple[str, str, int, list[float], list[float], bool]] = (
+        collections.deque()
+    )
+    stop = False
+    while (pending or pending_hidden) and not stop:
+        directory, relative_directory, depth, path_grades, spent_path, hidden = (
+            pending or pending_hidden
+        ).popleft()
+        watch.add_directory(directory)
+        in_matching_path = any(path_grades)
+        in_config_home = directory == config_home or directory.startswith(config_home + os.sep)
+        venv = directory != root and os.path.lexists(os.path.join(directory, SMART_VENV_MARKER))
+        folder_name = os.path.basename(directory)
+        library = folder_name in SMART_LIBRARY_DIRECTORIES
+        in_year = SMART_YEAR_FOLDER.fullmatch(folder_name) is not None
+        try:
+            iterator = os.scandir(directory)
+        except OSError:
+            continue
+        with iterator:
+            try:
+                # Streamed: a directory is never listed into memory before the
+                # scan ceiling has had its say.
+                for entry in iterator:
+                    name = entry.name
+                    if name == ".git" or (not args.show_hidden and name.startswith(".")):
+                        continue
+                    scanned += 1
+                    if scanned > scan_limit or time.monotonic() >= deadline:
+                        truncated = True
+                        stop = True
+                        break
+                    path = os.path.join(directory, name)
+                    relative = os.path.join(relative_directory, name) if relative_directory else name
+                    try:
+                        is_directory = entry.is_dir()
+                        enters = is_directory and entry.is_dir(follow_symlinks=False)
+                    except OSError:
+                        is_directory = enters = False
+                    evidence = matcher.name(name, is_directory, in_year) if terms else None
+                    grades = evidence.grades if evidence else no_grades
+                    if evidence and any(evidence.typed):
+                        grades = matcher.own(evidence, (
+                            "folder" if is_directory else smart_file_kind(name, False)))
+                    if evidence:
+                        spelled = [seen or grade > 0 for seen, grade in zip(spelled, grades)]
+                    named_for = spent_matcher.name(name, is_directory) if spends else None
+                    spent_own = named_for.grades if named_for else no_spent
+                    if enters:
+                        if fold_text(name).strip("._-") not in named and (
+                                name in SMART_PRUNED_DIRECTORIES
+                                or (venv and name in SMART_VENV_DIRECTORIES)
+                                or (library and SMART_PYTHON_LIBRARY.fullmatch(name)
+                                    and os.path.lexists(os.path.join(path, SMART_PYTHON_PACKAGES)))
+                                or os.path.lexists(os.path.join(path, SMART_CACHE_MARKER))):
+                            pruned += 1
+                        elif len(pending) + len(pending_hidden) >= SMART_PENDING_LIMIT:
+                            truncated = True
+                        else:
+                            child_grades = [
+                                max(inherited * SMART_PATH_DECAY, grade * SMART_PATH_FACTOR)
+                                for inherited, grade in zip(path_grades, grades)
+                            ] if evidence or in_matching_path else path_grades
+                            child_spent = [
+                                max(inherited * SMART_PATH_DECAY, grade * SMART_PATH_FACTOR)
+                                for inherited, grade in zip(spent_path, spent_own)
+                            ]
+                            below_dot = hidden or name.startswith(".")
+                            (pending_hidden if below_dot else pending).append(
+                                (path, relative, depth + 1, child_grades, child_spent, below_dot)
+                            )
+                    content: dict[int, float] = {}
+                    reads = False
+                    if required and not is_directory:
+                        # rg's paths are UTF-8; a name that is not is read here.
+                        readable = not answered or path == display_text(path)
+                        found = [
+                            index for index in answered
+                            if readable and path in term_files[index]
+                        ]
+                        if found:
+                            try:
+                                size = entry.stat(follow_symlinks=False).st_size
+                            except OSError:
+                                size = 0
+                            grade = smart_content_grade(size, content_factor)
+                            content = dict.fromkeys(found, grade)
+                        missing = unread if readable else [
+                            index for index, pattern in enumerate(patterns) if pattern is not None
+                        ]
+                        reads = (
+                            bool(missing) and content_byte_limit > 0
+                            and os.path.splitext(name.casefold())[1] not in SMART_BINARY_SUFFIXES
+                            and (content_asked or any(
+                                not grades[index] and not path_grades[index] for index in missing
+                            ))
+                        )
+                    gathering = gathers and is_directory
+                    # A slip matters only while the word is in no name as typed.
+                    typo = evidence is not None and any(
+                        slip and not seen for slip, seen in zip(evidence.typos, spelled)
+                    )
+                    if (required and evidence is None and not in_matching_path and not content
+                            and not reads and not gathering):
+                        # An entry whose type says a keyword may still be
+                        # one ("voice memos from this month" of an audio file).
+                        if not types_asked:
+                            continue
+                        entry_type = "folder" if is_directory else smart_file_kind(name, False)
+                        if not any(entry_type in term.types for term in terms):
+                            continue
+                    item = {
+                        "path": path, "relative": relative, "entry": entry,
+                        "isDir": is_directory, "depth": depth, "name": evidence,
+                        "paths": path_grades, "inConfigHome": in_config_home,
+                        "spent": [max(pair) for pair in zip(spent_own, spent_path)],
+                    }
+                    if gathering and len(folders) < SMART_DEFERRED_LIMIT:
+                        # Ranked once everything inside has been.
+                        item.update({"child": None, "childWeight": 0.0})
+                        folders[path] = item
+                        if any(grades):
+                            lift(path, [grade * SMART_PATH_FACTOR for grade in grades])
+                        continue
+                    if gathering:
+                        truncated = True
+                    if reads:
+                        item.update({"content": content, "missing": missing})
+                        if defer(item):
+                            continue
+                    elif typo and defer(item):
+                        item["content"] = content
+                        continue
+                    keep(item, content, None)
+            except OSError:
+                # A directory that fails part-way, as on a network or FUSE
+                # mount, is searched as far as it could be read.
                 truncated = True
-        if stop:
+
+    # Text is read last and only where it can still matter: files whose name
+    # already has some of the keywords first, then the rest shallowest first,
+    # until the byte budget or the deadline runs out.
+    reading = [item for item in deferred if "missing" in item]
+    reading.sort(key=lambda item: (
+        -sum(item["name"].grades) if item["name"] else 0.0, item["depth"],
+    ))
+    for item in reading:
+        if time.monotonic() >= deadline:
+            truncated = True
             break
-    if matched_count > len(heap):
-        truncated = True
-    rows = [item[2] for item in heap]
-    rows.sort(key=lambda row: (-int(row.get("smartScore", 0)), row["relativePath"].casefold()))
+        try:
+            size = item["entry"].stat(follow_symlinks=False).st_size
+        except OSError:
+            continue
+        remaining = content_byte_limit - content_bytes_scanned
+        # Files past the per-file bound are never read, as rg never reads
+        # them; one the spent budget cannot cover is a file left unsearched.
+        if size > content_file_limit:
+            continue
+        if size > remaining:
+            truncated = True
+            continue
+        wanted = [
+            pattern if index in item["missing"] else None
+            for index, pattern in enumerate(patterns)
+        ]
+        hit, bytes_read, found = smart_content_match(
+            item["path"], wanted, min(content_file_limit, remaining), deadline,
+        )
+        content_bytes_scanned += bytes_read
+        if time.monotonic() >= deadline:
+            # The deadline may have stopped this file part-way.
+            truncated = True
+        if found:
+            grade = smart_content_grade(bytes_read, content_factor)
+            item["content"].update(dict.fromkeys(found, grade))
+        item["hit"] = hit
+    for item in deferred:
+        keep(item, item["content"], item.get("hit"))
+    for item in folders.values():
+        keep(item, {}, None)
+
+    # Between rows the evidence ranks alike, the shallower copy is usually the
+    # one in use; the order is then the name's, which does not shift as new
+    # files arrive.
+    listed = [entry[2] for entry in heap]
+    # rg says which files hold the words, not where: the line shown is read
+    # for the rows returned while the budget lasts, best first by the typed
+    # words and hints, so that a model hint never decides which files are read.
+    for item in sorted(listed, key=lambda item: (
+            -item["firm"], item["depth"], item["relative"].casefold())):
+        match = item["match"]
+        if (match["matchKind"] == "content" and not match["matchLine"]
+                and content_bytes_scanned < content_byte_limit):
+            remaining = content_byte_limit - content_bytes_scanned
+            hit, bytes_read, _found = smart_content_match(
+                item["path"], patterns, min(content_file_limit, remaining), deadline,
+            )
+            content_bytes_scanned += bytes_read
+            item["match"] = hit or match
+    ranked = sorted(
+        listed, key=lambda item: (-item["score"], item["depth"], item["relative"].casefold()),
+    )
+    rows: list[dict[str, Any]] = []
+    for item in ranked:
+        try:
+            row = entry_row(item["path"], item["depth"], git, set())
+        except QuickfileError:
+            continue
+        row["relativePath"] = display_text(item["relative"])
+        row.update(item["match"])
+        row["smartScore"] = round(item["score"] * SMART_SCORE_SCALE)
+        row["smartReasons"] = item["reasons"][:4]
+        rows.append(row)
     metadata = load_metadata_store()
     enrich_rows(rows, metadata)
     smart_payload = {
         "state": smart_state,
         "fallbackReason": fallback_reason,
         "terms": plan["terms"],
+        "formats": formats,
+        "kinds": plan["kinds"],
         "hints": hints,
         "model": str(plan.get("model", "")),
         "device": str(plan.get("device", "")),
@@ -2327,6 +3211,7 @@ def smart_search_command(args: argparse.Namespace, root: str, query: str) -> dic
         "smart": smart_payload,
         "truncated": truncated,
         "scanned": scanned,
+        "pruned": pruned,
         "contentBytesScanned": content_bytes_scanned,
         "contentSearchBackend": content_search_backend,
         "engine": content_search_backend,

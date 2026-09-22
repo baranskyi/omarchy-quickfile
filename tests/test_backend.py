@@ -539,14 +539,14 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(content["matchSnippet"], "hello")
 
     def test_smart_search_extracts_bilingual_rules_and_keeps_hints_soft(self) -> None:
-        plan = quickfile.fallback_plan("PDF с бюджетом за прошлый месяц")
-        self.assertEqual(plan["terms"], ["бюджет"])
+        plan = quickfile.fallback_plan("PDF с графиком за прошлый месяц")
+        self.assertEqual(plan["terms"], ["график"])
         self.assertEqual(plan["hints"]["kind"]["value"], "document")
         self.assertEqual(plan["hints"]["time"]["value"], "last-month")
 
         # The checkpoint's hints below 0.75 were mostly noise when measured.
         low_confidence = quickfile_smart.merge_laya_answers(
-            quickfile.fallback_plan("budget"),
+            quickfile.fallback_plan("garden"),
             {"kind": {"choice": "document", "confidence": 0.74},
              "time": {"choice": "older", "confidence": 0.8}},
         )
@@ -571,17 +571,7 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(result["smart"]["state"], "ready")
         self.assertEqual(result["entries"][0]["matchKind"], "content")
 
-    def test_smart_rules_cover_ukrainian_and_keep_topic_words_out_of_dates(self) -> None:
-        cases = {
-            "подкаст про стартапы": (["стартап"], {"kind": "audio"}),
-            "старые проекты": (["проект"], {"time": "older"}),
-            "недавние скриншоты": ([], {"kind": "image"}),
-            "знайди відео вчора": ([], {"kind": "video", "time": "yesterday"}),
-            "тека з проєктами": (["проєкт"], {"target": "folder"}),
-            "налаштування hyprland": (["hyprland"], {"kind": "config"}),
-            "файлы за прошлый год": ([], {"target": "file", "time": "older"}),
-            "old invoices": (["invoice"], {"time": "older"}),
-        }
+    def assert_plans(self, cases: dict[str, tuple[list[str], dict[str, str]]]) -> None:
         for query, (terms, hints) in cases.items():
             with self.subTest(query=query):
                 plan = quickfile.fallback_plan(query)
@@ -591,24 +581,81 @@ class BackendTests(unittest.TestCase):
                     if hint["value"] != "any"
                 }, hints)
 
+    def test_smart_rules_cover_ukrainian_and_keep_topic_words_out_of_dates(self) -> None:
+        self.assert_plans({
+            "подкаст про стартапы": (["стартап"], {"kind": "audio"}),
+            "старые проекты": (["проект"], {"target": "folder", "time": "older"}),
+            "недавние архивы": ([], {"kind": "archive", "time": "past-month"}),
+            "знайди музику з минулого місяця": ([], {"kind": "audio", "time": "last-month"}),
+            "вчерашние заметки": (["заметк"], {"time": "yesterday"}),
+            "тека з проєктами": (["проєкт"], {"target": "folder"}),
+            "налаштування zorbwm": (["zorbwm"], {"kind": "config"}),
+            "файлы за прошлый год": ([], {"target": "file", "time": "last-year"}),
+            "old invoices": (["invoices"], {"kind": "document", "time": "older"}),
+            # A kind word is a stem and a case ending, never the start of a
+            # longer topic word.
+            "видеонаблюдение камеры": (["видеонаблюден", "камер"], {}),
+            "конфигуратор кухни": (["конфигуратор", "кухн"], {}),
+            "скрининг результаты": (["скрининг", "результат"], {}),
+            "каталог товаров": (["каталог", "товар"], {}),
+            "setting up nginx": (["setting", "up", "nginx"], {}),
+            # The kind named first is asked for; an English compound ends in it.
+            "видео с музыкой": ([], {"kind": "video"}),
+            "photo archive": ([], {"kind": "archive"}),
+            "script for photos": ([], {"kind": "code"}),
+            # A hint word inside a file name belongs to the name.
+            "notes.old": (["notes.old"], {}),
+        })
+
+    def test_smart_hint_phrases_are_spent_on_their_hints(self) -> None:
+        self.assert_plans({
+            "черновик прошлого месяца": (["черновик"], {"time": "last-month"}),
+            "notes that mention pricing": (["notes", "pricing"], {"location": "content"}),
+            "notes mentioning pricing": (["notes", "pricing"], {"location": "content"}),
+            "що згадує оренду офісу": (["оренд", "офіс"], {"location": "content"}),
+            "the memo that discusses the lease": (["memo", "lease"], {"location": "content"}),
+            # A span is blanked where it was found, whatever casefolding does
+            # to the length of the letters before it.
+            "Straße Größe yesterday invoice": (
+                ["Straße", "Größe", "invoice"], {"kind": "document", "time": "yesterday"}),
+            "İİİ last week agenda": (["İİİ", "agenda"], {"time": "last-week"}),
+            # "icon sets" is about sets of icons.
+            "icon sets": (["icon", "sets"], {}),
+        })
+
     def test_smart_terms_trim_only_safe_inflections(self) -> None:
         self.assertEqual(quickfile.fallback_plan("фотки с отпуска")["terms"], ["отпуск"])
         # Quoted phrases, short words and words without an ending stay verbatim.
         self.assertEqual(
-            quickfile.fallback_plan('"отчёт за квартал" Киев договор status class')["terms"],
-            ["отчёт за квартал", "Киев", "договор", "status", "class"],
+            quickfile.fallback_plan('"отчёт за квартал" Львов договор status class')["terms"],
+            ['"отчёт за квартал"', "Львов", "договор", "status", "class"],
+        )
+        # Adjective endings also end names, and -ок/-ек are as often a
+        # nominative as a plural: only long adjectives lose theirs.
+        self.assertEqual(
+            quickfile.fallback_plan("Вадим Кривых станок список годовых техническим")["terms"],
+            ["Вадим", "Кривых", "станок", "список", "годов", "техническ"],
         )
         folder = self.root / "отпуск 2025"
         folder.mkdir()
-        (folder / "бюджет.pdf").write_bytes(b"%PDF-1.4")
+        (folder / "график.pdf").write_bytes(b"%PDF-1.4")
         result = quickfile.search_command(argparse.Namespace(
-            path=str(self.root), path_token=None, query="PDF с бюджетом за прошлый месяц",
+            path=str(self.root), path_token=None, query="PDF с графиком за прошлый месяц",
             mode="smart", smart_plan_json=None, case_sensitive=False,
             show_hidden=False, no_git=True, limit=100, scan_limit=1000,
             timeout=2.0, content_file_limit=1024 * 1024,
             content_byte_limit=8 * 1024 * 1024,
         ))
-        self.assertEqual(result["entries"][0]["name"], "бюджет.pdf")
+        self.assertEqual(result["entries"][0]["name"], "график.pdf")
+        root = self.corpus({
+            "книжка-рецептів.pdf": b"%PDF-1.4", "станок-чпу.pdf": b"%PDF-1.4",
+            "стандарт-качества.pdf": b"%PDF-1.4", "vad-volume.txt": "",
+        })
+        # A word with a fleeting vowel meets its other forms, and nothing else,
+        # and a name keeps the letters that would make it someone else's.
+        self.assertEqual(self.smart_names(root, "книжок"), ["книжка-рецептів.pdf"])
+        self.assertEqual(self.smart_names(root, "станок"), ["станок-чпу.pdf"])
+        self.assertEqual(self.smart_names(root, "Вадим"), [])
 
     def test_smart_search_supports_filters_only_without_hiding_other_rows(self) -> None:
         image = self.root / "photo.png"
@@ -655,6 +702,1135 @@ class BackendTests(unittest.TestCase):
         this_month = quickfile.dt.datetime(2026, 9, 1, 0, 0, tzinfo=zone).timestamp()
         self.assertTrue(quickfile.smart_time_matches(last_month, "last-month", now))
         self.assertFalse(quickfile.smart_time_matches(this_month, "last-month", now))
+
+    def smart_search(self, root: Path, query: str, plan: dict | None = None, **overrides):
+        values = {
+            "path": str(root), "path_token": None, "query": query, "mode": "smart",
+            "smart_plan_json": None if plan is None else json.dumps(plan),
+            "case_sensitive": False, "show_hidden": False, "no_git": True, "limit": 100,
+            "scan_limit": 1000, "timeout": 2.0, "content_file_limit": 1024 * 1024,
+            "content_byte_limit": 8 * 1024 * 1024,
+        }
+        values.update(overrides)
+        return quickfile.search_command(argparse.Namespace(**values))
+
+    def smart_names(self, root: Path, query: str, **overrides) -> list[str]:
+        result = self.smart_search(root, query, **overrides)
+        return [row["relativePath"] for row in result["entries"]]
+
+    def corpus(self, files: dict[str, str | bytes], name: str = "corpus") -> Path:
+        root = self.root / name
+        for relative, body in files.items():
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if isinstance(body, bytes):
+                path.write_bytes(body)
+            else:
+                path.write_text(body, encoding="utf-8")
+        return root
+
+    def test_smart_formats_are_explicit_optional_and_validated(self) -> None:
+        cases = {
+            "network diagram PNGs": (["network", "diagram"], ["png"]),
+            "inventory in excel": (["inventory"], ["xlsx"]),
+            "PDF с графиком": (["график"], ["pdf"]),
+            "презентация pptx отчёт": (["презентаци", "отчёт"], ["pptx"]),
+            # Hyphenated to a word for its own kind, a format is asked for.
+            "pdf-документ": ([], ["pdf"]),
+            "pptx-презентація": ([], ["pptx"]),
+            "notes as .md": (["notes"], ["md"]),
+            "*.png icons": (["icons"], ["png"]),
+            "site backup .tar.gz": (["site", "backup"], ["gz"]),
+            # A format word that describes another word is a keyword.
+            "csv parser": (["csv", "parser"], []),
+            "json schema validator": (["json", "schema", "validator"], []),
+            "pdf merge script": (["pdf", "merge"], []),
+            "mp4 to gif script": (["mp4", "gif"], []),
+            "json-server setup": (["json-server", "setup"], []),
+            # Extensions that are also words or names need their dot.
+            "magnum opus notes": (["magnum", "opus", "notes"], []),
+            "Avi wedding photos": (["Avi", "wedding"], []),
+            "tar pit": (["tar", "pit"], []),
+            "rss feed parser": (["rss", "feed", "parser"], []),
+            # A quoted phrase is searched as typed.
+            '"notes on png compression"': (['"notes on png compression"'], []),
+        }
+        for query, (terms, formats) in cases.items():
+            with self.subTest(query=query):
+                plan = quickfile.fallback_plan(query)
+                self.assertEqual((plan["terms"], plan["formats"]), (terms, formats))
+        self.assertEqual(quickfile.fallback_plan("network diagram PNGs")["hints"]["kind"]["value"],
+                         "image")
+        self.assertEqual(quickfile.fallback_plan("mp4 to gif script")["hints"]["kind"]["value"],
+                         "code")
+        self.assertIn(".jpeg", quickfile_smart.format_suffixes(["jpg"]))
+        self.assertIn(".xls", quickfile_smart.format_suffixes(["xlsx"]))
+
+        legacy = {"version": 1, "terms": ["garden"], "hints": {}}
+        self.assertEqual(quickfile.validate_plan(legacy)["formats"], [])
+        for formats in (["exe"], "pdf", ["pdf", 1], ["pdf", "png", "jpg", "zip", "mp4"]):
+            with self.subTest(formats=formats), self.assertRaises(quickfile.SmartPlanError):
+                quickfile.validate_plan({**legacy, "formats": formats})
+
+    def test_smart_format_words_that_are_topics_rank_as_keywords(self) -> None:
+        root = self.corpus({
+            "tools/mp4_to_gif.py": "", "clips/holiday.mp4": b"\x00",
+            "bin/pdf-merge.sh": "", "merge.pdf": b"%PDF-1.4",
+            "backups/site-backup.tar.gz": b"\x1f\x8b", "backups/site-backup.zip": b"PK",
+        })
+        self.assertEqual(self.smart_names(root, "mp4 converter script")[0], "tools/mp4_to_gif.py")
+        self.assertEqual(self.smart_names(root, "pdf merge script")[0], "bin/pdf-merge.sh")
+        result = self.smart_search(root, "site backup .tar.gz")
+        self.assertEqual(result["entries"][0]["relativePath"], "backups/site-backup.tar.gz")
+        self.assertIn("format", result["entries"][0]["smartReasons"])
+
+    def test_smart_model_fills_only_the_hints_it_is_asked(self) -> None:
+        self.assertEqual(set(quickfile_smart.questions()), set(quickfile_smart.SMART_MODEL_FIELDS))
+        merged = quickfile_smart.merge_laya_answers(
+            quickfile.fallback_plan("договір оренди гаража"),
+            {"kind": {"choice": "video", "confidence": 0.99},
+             "time": {"choice": "older", "confidence": 0.9}},
+        )
+        self.assertEqual(merged["hints"]["kind"]["value"], "document")
+        self.assertEqual(merged["hints"]["kind"]["source"], "rule")
+        self.assertEqual(merged["hints"]["time"]["source"], "laya")
+        merged = quickfile_smart.merge_laya_answers(
+            quickfile.fallback_plan("a garden for bees"),
+            {"kind": {"choice": "config", "confidence": 0.99}},
+        )
+        self.assertEqual(merged["hints"]["kind"]["value"], "any")
+
+    def test_smart_matches_words_not_scattered_letters(self) -> None:
+        root = self.corpus({
+            "zorb-gearbox.svg": "<svg/>\n",
+            "LICENSE": "Copyright 2026 Zorb Labs\n",
+            "golf-echo-alpha-romeo-bravo-oscar-xray.txt": "nothing to see\n",
+            "Sketches/gearbox.md": "Zorb gearbox sketch\n",
+            "syntax.md": "The zor-bright syntax of a haiku\n",
+            "export-report.txt": "", "support.md": "", "ports.txt": "",
+            "controversy.md": "", "rover-photos.md": "",
+            "server/requestHandler.js": "", "server/app.js": "const requestHandler = 1\n",
+            "notes/pets.txt": "my cat sleeps\n", "notes/list.txt": "category list\n",
+            "notes/main.c": "int main(void) { return 0; }\n",
+        })
+        names = self.smart_names(root, "zorb gearbox")
+        # The name with both words, then the one whose text has the other.
+        self.assertEqual(names[:2], ["zorb-gearbox.svg", "Sketches/gearbox.md"])
+        # g..e..a..r..b..o..x is somewhere in that name, but no word of it
+        # matches.
+        self.assertNotIn("golf-echo-alpha-romeo-bravo-oscar-xray.txt", names)
+        # A text that only mentions the name is found, below the named file.
+        result = self.smart_search(root, "zorb")
+        names = [row["relativePath"] for row in result["entries"]]
+        self.assertEqual(names[0], "zorb-gearbox.svg")
+        self.assertIn("LICENSE", names)
+        self.assertEqual(result["entries"][names.index("LICENSE")]["matchKind"], "content")
+        # A short word has to start a word, and a word of three letters may
+        # only add an ending, in text as in names.
+        self.assertNotIn("syntax.md", self.smart_names(root, "tax"))
+        self.assertEqual(self.smart_names(root, "cat"), ["notes/pets.txt"])
+        self.assertEqual(self.smart_names(root, "ai"), [])
+        # Only a long word matches inside another: "port" is not in "report",
+        # nor "rover" in "controversy", but "handler" is in "requestHandler".
+        self.assertEqual(self.smart_names(root, "port"), ["ports.txt"])
+        self.assertEqual(self.smart_names(root, "rover"), ["rover-photos.md"])
+        self.assertEqual(
+            sorted(self.smart_names(root, "handler")),
+            ["server/app.js", "server/requestHandler.js"],
+        )
+
+    def test_smart_spellings_cross_languages_and_scripts(self) -> None:
+        root = self.corpus({
+            "Docs/receipt-scan.pdf": b"%PDF-1.4",
+            "Docs/invoice-scan.pdf": b"%PDF-1.4",
+            "Travel/Lviv trip.md": "",
+            "Travel/Одеса-2025.jpg": b"\xff\xd8",
+            "Travel/Зорбина notes.md": "",
+            "Travel/vine.txt": "", "Travel/vicki.md": "", "Travel/ski.txt": "",
+            "Docs/report-q3.md": "Отчет по складу готов\n",
+        })
+        cases = {
+            "квитанції": "Docs/receipt-scan.pdf",
+            "поездка Львів": "Travel/Lviv trip.md",
+            "фото Одесса": "Travel/Одеса-2025.jpg",
+            "odesa": "Travel/Одеса-2025.jpg",
+            "Зорбіна": "Travel/Зорбина notes.md",
+        }
+        for query, expected in cases.items():
+            with self.subTest(query=query):
+                self.assertEqual(self.smart_names(root, query)[0], expected)
+        # Only words of the other script are transliterated: English words
+        # are not their neighbours' spellings.
+        for query in ("wine", "wiki", "sky"):
+            with self.subTest(query=query):
+                self.assertEqual(self.smart_names(root, query), [])
+        # In text too, ё and е, і and и are one letter, with rg and without.
+        self.assertIn("Docs/report-q3.md", self.smart_names(root, "отчёт"))
+        with mock.patch.object(quickfile.shutil, "which", return_value=None):
+            self.assertIn("Docs/report-q3.md", self.smart_names(root, "отчёт"))
+
+    def test_smart_vocabulary_takes_whole_words_with_their_endings(self) -> None:
+        for word, group in (
+            ("invoices", "invoice"), ("рахунку", "invoice"), ("договору", "contract"),
+            ("наради", "meeting"), ("скріни", "screenshot"), ("cv", "resume"),
+            ("projections", ""), ("projector", ""), ("записки", ""), ("счетчиков", ""),
+            ("insta", ""), ("contractor", ""), ("листопад", ""), ("лист", ""),
+        ):
+            with self.subTest(word=word):
+                self.assertEqual(quickfile_smart.SmartTerm(word).group, group)
+        # A letter is a Ukrainian "лист", which typed alone is not a letter.
+        self.assertIn("лист", [form[0] for form in quickfile_smart.SmartTerm("письмо").forms])
+
+    def test_smart_months_count_only_where_a_date_writes_them(self) -> None:
+        root = self.corpus({
+            "Garden/2024/03/seedlings.md": "", "Garden/2024/04/seedlings.md": "",
+            "seedlings_20240312.txt": "", "export-2024-04-05_15-03-09.csv": "a,b\n",
+            "01 intro.md": "", "jan-notes.md": "", "2026-01-15-plan.md": "",
+            "pricing/2026-05-01.md": "",
+        })
+        # March by a date in the name, or by the month's folder in a year's.
+        names = self.smart_names(root, "seedlings march")
+        self.assertEqual(set(names[:2]), {"Garden/2024/03/seedlings.md", "seedlings_20240312.txt"})
+        # The minutes of a time of day are no month.
+        self.assertNotIn("export-2024-04-05_15-03-09.csv", self.smart_names(root, "march"))
+        self.assertEqual(self.smart_names(root, "январь"), ["2026-01-15-plan.md"])
+        # "may" is a verb; "May" is the month. Neither a planet, a name nor a
+        # number is one.
+        self.assertEqual(quickfile_smart.SmartTerm("may").month, "")
+        self.assertEqual(quickfile_smart.SmartTerm("May").month, "05")
+        for word in ("mars", "Jan", "12", "має"):
+            with self.subTest(word=word):
+                self.assertEqual(quickfile_smart.SmartTerm(word).month, "")
+        self.assertNotIn("pricing/2026-05-01.md", self.smart_names(root, "notes that may"))
+
+    def test_smart_forgives_one_typo_only_in_a_word_no_name_has(self) -> None:
+        for first, second, expected in (
+            ("calender", "calendar", True), ("calendr", "calendar", True), ("teh", "the", True),
+            ("calendar", "calendar", False), ("invoice", "invoke", False),
+        ):
+            with self.subTest(first=first, second=second):
+                self.assertEqual(quickfile_smart.within_one_edit(first, second), expected)
+        root = self.corpus({
+            "calendar/README.md": "", "calculator.md": "", "MoonHarbor.png": b"\x89PNG",
+        })
+        names = self.smart_names(root, "calender")
+        self.assertEqual(names[0], "calendar")
+        self.assertNotIn("calculator.md", names)
+        # A camelCase hump is a word too.
+        self.assertEqual(self.smart_names(root, "moon harbr"), ["MoonHarbor.png"])
+        # A word that some name spells is not a slip of its neighbours.
+        root = self.corpus({"stats.md": "", "state.md": ""}, "typed")
+        self.assertEqual(self.smart_names(root, "state"), ["state.md"])
+        root = self.corpus({"stats.md": ""}, "slipped")
+        self.assertEqual(self.smart_names(root, "state"), ["stats.md"])
+
+    def test_smart_walk_prunes_machine_written_trees_unless_named(self) -> None:
+        root = self.corpus({
+            "docs/lantern.md": "lantern\n",
+            "app/node_modules/pkg/lantern.js": "lantern\n",
+            "app/node_modules/pkg/node-version.txt": "",
+            "app/node_modules/pkg/readme.txt": "a lantern inside\n",
+            "app/venv/pyvenv.cfg": "home = /usr/bin\n",
+            "app/venv/bin/lantern": "#!/bin/sh\n",
+            "app/venv/lib/python3.12/site-packages/lantern.py": "lantern\n",
+            "app/target/CACHEDIR.TAG": "Signature: 8a477f597d28d172789f06886806bc55\n",
+            "app/target/lantern.txt": "lantern\n",
+            # `python -m venv .` in a project: its lib/, share/ and sources
+            # are still searched.
+            "tool/pyvenv.cfg": "home = /usr/bin\n",
+            "tool/lib/python3.12/site-packages/lantern_lib.py": "",
+            "tool/lib/lantern_invoice.js": "",
+            "tool/share/templates/lantern-template.html": "",
+            "tool/src/lantern_parser.py": "",
+        })
+        result = self.smart_search(root, "lantern")
+        self.assertEqual(sorted(row["relativePath"] for row in result["entries"]), [
+            "docs/lantern.md", "tool/lib/lantern_invoice.js",
+            "tool/share/templates/lantern-template.html", "tool/src/lantern_parser.py",
+        ])
+        # node_modules, venv/bin, both python3.12 libraries and target/.
+        self.assertEqual(result["pruned"], 5)
+        # A word of a pruned folder's name does not open it; its name does,
+        # for the walk and for rg alike.
+        self.assertEqual(self.smart_names(root, "node version"), ["app/node_modules"])
+        named = self.smart_names(root, "node_modules lantern")
+        self.assertIn("app/node_modules/pkg/lantern.js", named)
+        self.assertIn("app/node_modules/pkg/readme.txt", named)
+        # The root itself is always searched, whatever it is.
+        packages = root / "app" / "venv" / "lib" / "python3.12" / "site-packages"
+        self.assertEqual(self.smart_names(packages, "lantern"), ["lantern.py"])
+
+    def test_smart_walk_reaches_every_area_before_going_deep(self) -> None:
+        deep = "aaa/" + "/".join(f"level{index}" for index in range(8))
+        root = self.corpus({
+            f"{deep}/filler-{index}.txt": "" for index in range(20)
+        } | {"zzz/needle.txt": ""})
+        # Two entries at the top, one in each folder below: a depth-first walk
+        # into aaa/ would spend this budget before it ever reached zzz/.
+        result = self.smart_search(root, "needle", scan_limit=4)
+        self.assertTrue(result["truncated"])
+        self.assertEqual([row["relativePath"] for row in result["entries"]], ["zzz/needle.txt"])
+
+    def test_smart_walk_keeps_what_a_failing_directory_gave(self) -> None:
+        root = self.corpus({"mount/alpha.txt": "", "local/alpha-notes.txt": ""})
+        scandir = os.scandir
+
+        class Failing:
+            def __init__(self, inner) -> None:
+                self.inner = inner
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc) -> None:
+                self.inner.close()
+
+            def __iter__(self):
+                yield next(iter(self.inner))
+                raise OSError(quickfile.errno.EIO, "Input/output error")
+
+        def flaky(path):
+            listing = scandir(path)
+            return Failing(listing) if os.path.basename(path) == "mount" else listing
+
+        with mock.patch.object(quickfile.os, "scandir", side_effect=flaky):
+            result = self.smart_search(root, "alpha")
+        names = [row["relativePath"] for row in result["entries"]]
+        self.assertIn("local/alpha-notes.txt", names)
+        self.assertIn("mount/alpha.txt", names)
+        self.assertTrue(result["truncated"])
+
+    def test_smart_lists_partial_matches_when_no_row_has_every_word(self) -> None:
+        # Nothing here is called "режим экономии", so every answer is partial,
+        # and a file that names the tool only in its text is one of them.
+        root = self.corpus({
+            "zorbctl/zorbctl.conf": "theme = dark\n",
+            "zorbctl-theme.css": "",
+            "settings/display.conf": "# zorbctl display options\nbrightness = 40\n",
+        })
+        names = self.smart_names(root, "режим экономии zorbctl")
+        self.assertIn("settings/display.conf", names)
+        self.assertNotEqual(names[0], "settings/display.conf")
+        # Asked what a text mentions, the text that has every word comes
+        # before a name that has some of them.
+        root = self.corpus({
+            "log/entry-a.md": "Oiled the quux gearbox again.\n",
+            "log/entry-b.md": "Only weather today.\n",
+            "quux-gearbox.md": "",
+        }, "notes")
+        result = self.smart_search(root, "containing quux gearbox oiled")
+        names = [row["relativePath"] for row in result["entries"]]
+        self.assertEqual(names[:2], ["log/entry-a.md", "quux-gearbox.md"])
+        self.assertEqual(result["entries"][0]["matchKind"], "content")
+        self.assertEqual(result["entries"][0]["matchLine"], 1)
+
+    def test_smart_content_losses_mark_the_result_truncated(self) -> None:
+        body = "zebra\n" + "x" * 3000 + "\n"
+        root = self.corpus({f"t/notes-{index}.txt": body for index in range(1, 4)})
+        with mock.patch.object(quickfile.shutil, "which", return_value=None):
+            result = self.smart_search(root, "zebra", content_byte_limit=6100)
+        self.assertEqual(result["contentSearchBackend"], "python")
+        self.assertEqual(len(result["entries"]), 2)
+        self.assertTrue(result["truncated"])
+        # A keyword too short to mean anything in text reads nothing at all.
+        with mock.patch.object(quickfile.shutil, "which", return_value=None):
+            result = self.smart_search(root, "x")
+        self.assertEqual(result["contentBytesScanned"], 0)
+        self.assertEqual(result["contentSearchBackend"], "none")
+
+    def test_smart_model_hints_never_decide_what_is_read(self) -> None:
+        root = self.corpus({
+            **{f"a/zebra-{index}.txt": "zebra " + "x" * 3007 for index in range(5)},
+            "deep/b/c/savanna.md": "the zebra lives here\n",
+        })
+        plan = quickfile.fallback_plan("zebra")
+        plan["hints"]["location"] = {"value": "content", "confidence": 0.9, "source": "laya"}
+        with mock.patch.object(quickfile.shutil, "which", return_value=None):
+            plain = self.smart_names(root, "zebra", content_byte_limit=15070)
+            hinted = self.smart_names(root, "zebra", plan=plan, content_byte_limit=15070)
+        self.assertIn("deep/b/c/savanna.md", plain)
+        self.assertEqual(sorted(plain), sorted(hinted))
+
+    def test_smart_queries_of_symbols_match_names_that_have_them(self) -> None:
+        root = self.corpus({
+            "hello!!!.txt": "", "plain.txt": "", "smile 😀.png": b"\x89PNG", "user@host.md": "",
+        })
+        self.assertEqual(self.smart_names(root, "!!!"), ["hello!!!.txt"])
+        self.assertEqual(self.smart_names(root, "😀"), ["smile 😀.png"])
+        self.assertEqual(self.smart_names(root, "@"), ["user@host.md"])
+        self.assertEqual(self.smart_names(root, "((("), [])
+
+    def test_smart_finds_dotfiles_and_unspaced_scripts(self) -> None:
+        root = self.corpus({
+            ".gitignore": "*.pyc\n", ".env": "KEY=1\n", ".bashrc": "alias ll=ls\n",
+            "notes.txt": "", "年度报告2024.pdf": b"%PDF-1.4", "会议记录.txt": "今天的会议\n",
+            "docs/summary.txt": "年度报告已完成\n",
+        })
+        for query in (".gitignore", ".env", ".bashrc"):
+            with self.subTest(query=query):
+                self.assertEqual(self.smart_names(root, query, show_hidden=True)[0], query)
+        self.assertEqual(self.smart_names(root, "报告")[:1], ["年度报告2024.pdf"])
+        self.assertIn("docs/summary.txt", self.smart_names(root, "报告"))
+        self.assertEqual(self.smart_names(root, "会议"), ["会议记录.txt"])
+
+    def test_smart_words_an_entry_type_says(self) -> None:
+        root = self.corpus({
+            "zorb/zorb-screenshot.png": b"\x89PNG", "zorb/IMG_0001.PNG": b"\x89PNG",
+            "zorb/notes.txt": "", "IMG_0002.PNG": b"\x89PNG",
+            "projects/quux/README.md": "", "app/main.py": "",
+            "Птахи 3.m4a": b"\x00", "Птахи 3 список.md": "",
+        })
+        # A phone names its screenshots IMG_*: an image says "screenshot",
+        # after the ones named so.
+        names = self.smart_names(root, "zorb screenshots")
+        self.assertEqual(names[:2], ["zorb/zorb-screenshot.png", "zorb/IMG_0001.PNG"])
+        # A recording is audio or video, whatever the app called it.
+        self.assertEqual(self.smart_names(root, "птахи запис")[0], "Птахи 3.m4a")
+        # Alone, the word asks for itself: "my projects" are not all folders.
+        names = self.smart_names(root, "мои проекты")
+        self.assertEqual(names[0], "projects")
+        self.assertNotIn("app", names)
+        # A phrase that names a kind of media is said by every file of it,
+        # and by nothing else.
+        self.assertEqual(quickfile_smart.media_words("voice memo from the lake"),
+                         {"voice": "audio", "memo": "audio"})
+        root = self.corpus({
+            "Recordings/New Recording 3.m4a": b"\x00", "Recordings/New Recording 4.m4a": b"\x00",
+            "quux-memo.md": "", "call.mp4": b"\x00",
+        }, "voice")
+        names = self.smart_names(root, "voice memo")
+        self.assertEqual(names[:3], [
+            "Recordings/New Recording 3.m4a", "Recordings/New Recording 4.m4a", "quux-memo.md",
+        ])
+        self.assertNotIn("call.mp4", names)
+        # A file listed only because its type says the words is listed only
+        # on the date asked for.
+        long_ago = quickfile.time.time() - 400 * 86400
+        os.utime(root / "Recordings" / "New Recording 4.m4a", (long_ago, long_ago))
+        names = self.smart_names(root, "voice memos from this month")
+        self.assertEqual(names[0], "Recordings/New Recording 3.m4a")
+        self.assertNotIn("Recordings/New Recording 4.m4a", names)
+
+    def test_smart_ranks_whole_names_and_phrases_first(self) -> None:
+        root = self.corpus({
+            "TaxReturn2025.pdf": b"%PDF-1.4", "tax-notes.md": "", "return-policy.md": "",
+            "invoice-template-for-others.pdf": b"%PDF-1.4", "billing/invoice.pdf": b"%PDF-1.4",
+            "story.md": "", "cookie-policy.md": "",
+        })
+        self.assertEqual(self.smart_names(root, "tax return")[0], "TaxReturn2025.pdf")
+        self.assertEqual(self.smart_names(root, "invoice")[0], "billing/invoice.pdf")
+        self.assertEqual(self.smart_names(root, "stories"), ["story.md"])
+        self.assertEqual(self.smart_names(root, "INVOICES")[0], "billing/invoice.pdf")
+        self.assertEqual(self.smart_names(root, "cookies"), ["cookie-policy.md"])
+
+    def test_smart_config_lives_in_the_configuration_home(self) -> None:
+        root = self.corpus({
+            "xdg-config/zorbwm.lua": "", "projects/zorbwm.lua": "",
+            "xdg-config/cache.sqlite": b"SQLite format 3\x00",
+        }, "")
+        # The copy in the configuration home is configuration, the one in a
+        # project is not, and only text is: a cache database beside it is not.
+        result = self.smart_search(root, "settings")
+        self.assertEqual([row["relativePath"] for row in result["entries"]],
+                         ["xdg-config/zorbwm.lua"])
+        self.assertIn("config", result["entries"][0]["smartReasons"])
+        # It is still code for a request for code.
+        result = self.smart_search(root, "zorbwm code")
+        self.assertTrue(all("code" in row["smartReasons"] for row in result["entries"][:2]))
+
+    def test_smart_hint_only_query_lists_what_its_specific_hints_accept(self) -> None:
+        root = self.corpus({"new.txt": "", "old.txt": "", "nested/inner.txt": ""})
+        long_ago = quickfile.time.time() - 400 * 86400
+        os.utime(root / "old.txt", (long_ago, long_ago))
+        names = self.smart_names(root, "updated today")
+        # "Updated" implies files, and "today" decides the rows: an old file
+        # is not listed, nor a folder whose date only says a file was added.
+        self.assertEqual(sorted(names), ["nested/inner.txt", "new.txt"])
+        # Asked for folders, a folder's date counts.
+        self.assertEqual(self.smart_names(root, "папки за сегодня")[0], "nested")
+        self.assertEqual(self.smart_names(root, "папки"), ["nested"])
+
+    def test_smart_hint_only_query_shows_rows_with_every_hint_first(self) -> None:
+        root = self.corpus({"now.mp3": b"\x00", "old.mp3": b"\x00", "now.txt": ""})
+        long_ago = quickfile.time.time() - 400 * 86400
+        os.utime(root / "old.mp3", (long_ago, long_ago))
+        names = self.smart_names(root, "music from this month")
+        self.assertEqual(names[0], "now.mp3")
+        self.assertEqual(set(names), {"now.mp3", "now.txt", "old.mp3"})
+
+    def test_smart_full_list_gives_up_the_weakest_rows(self) -> None:
+        root = self.corpus({
+            **{f"notes-{index}.txt": "alpha beta\n" for index in range(3)},
+            **{f"alpha-{index}.txt": "" for index in range(10)},
+        })
+        result = self.smart_search(root, "alpha beta", limit=5)
+        names = [row["name"] for row in result["entries"]]
+        # Every note has both words, if only in its text, so none may be lost
+        # to names that have one; losing any row is truncation.
+        self.assertEqual(sorted(name for name in names if name.startswith("notes")),
+                         [f"notes-{index}.txt" for index in range(3)])
+        self.assertEqual(len(names), 5)
+        self.assertTrue(result["truncated"])
+
+    def test_smart_model_hints_reorder_but_never_hide_rows(self) -> None:
+        root = self.corpus({"alpha-beta.md": "", "alpha/readme.txt": "", "beta-old.txt": ""})
+        plain = self.smart_search(root, "alpha beta")
+        plan = quickfile.fallback_plan("alpha beta")
+        plan["hints"]["target"] = {"value": "folder", "confidence": 0.99, "source": "laya"}
+        plan["hints"]["time"] = {"value": "older", "confidence": 0.99, "source": "laya"}
+        hinted = self.smart_search(root, "alpha beta", plan=plan)
+        self.assertEqual(
+            sorted(row["relativePath"] for row in plain["entries"]),
+            sorted(row["relativePath"] for row in hinted["entries"]),
+        )
+        # Nor may a model hint decide which rows fit in a full list.
+        plan["hints"] = quickfile.fallback_plan("alpha beta")["hints"]
+        plan["hints"]["kind"] = {"value": "code", "confidence": 0.99, "source": "laya"}
+        plain = self.smart_names(root, "alpha beta", limit=2)
+        hinted = self.smart_names(root, "alpha beta", plan=plan, limit=2)
+        self.assertEqual(sorted(plain), sorted(hinted))
+
+    def test_smart_folder_request_gathers_what_one_entry_inside_says(self) -> None:
+        root = self.corpus({
+            "shed/README.md": "Gearbox and pulley parts, as a list\n",
+            "shed/src/main.py": "print('hi')\n",
+            "notes/README.md": "A gearbox in the barn\n",
+            "Work/alpha/notes.md": "gearbox\n",
+            "Work/beta/notes.md": "pulley\n",
+        })
+        result = self.smart_search(root, "gearbox pulley folders")
+        names = [row["relativePath"] for row in result["entries"]]
+        self.assertEqual(names[0], "shed")
+        self.assertIn("folder", result["entries"][0]["smartReasons"])
+        self.assertIn("shed/README.md", names)
+        # A folder is not about both because one entry in it mentions each.
+        scores = {row["relativePath"]: row["smartScore"] for row in result["entries"]}
+        self.assertLess(scores["Work"], scores["shed"])
+        self.assertLess(scores["Work"], scores["Work/alpha"])
+
+    def laya_plan(self, query: str, **answers: tuple[str, float]) -> dict:
+        return quickfile_smart.merge_laya_answers(quickfile.fallback_plan(query), {
+            field: {"choice": choice, "confidence": confidence}
+            for field, (choice, confidence) in answers.items()
+        })
+
+    def test_smart_finds_a_name_typed_with_its_extension(self) -> None:
+        root = self.corpus({
+            "docs/notes.md": "", "docs/invoice.pdf": b"%PDF-1.4", "docs/ledger.xlsx": b"PK",
+            "docs/Ledger 2025.xlsx": b"PK", "docs/minutes.docx": b"PK",
+            "proj/app/package.json": "{}", "docs/zorb-brochure.pdf": b"%PDF-1.4",
+            "docs/site-backup.tar.gz": b"\x1f\x8b", "IMG_0042.PNG": b"\x89PNG",
+            "report.old": "", "notes-1.2": "", "sub/links.txt": "see invoice.pdf\n",
+        })
+        for query, expected in (
+            ("notes.md", "docs/notes.md"), ("invoice.pdf", "docs/invoice.pdf"),
+            ("package.json", "proj/app/package.json"),
+            ("zorb-brochure.pdf", "docs/zorb-brochure.pdf"),
+            ("site-backup.tar.gz", "docs/site-backup.tar.gz"), ("IMG_0042.PNG", "IMG_0042.PNG"),
+            ("report.old", "report.old"), ("notes-1.2", "notes-1.2"),
+            ('"ledger.xlsx"', "docs/ledger.xlsx"),
+            # The extension on disk may be another spelling of the one typed,
+            # and the name alone still names the file.
+            ("ledger.xls", "docs/ledger.xlsx"), ("minutes.doc", "docs/minutes.docx"),
+            ("site-backup.tgz", "docs/site-backup.tar.gz"), ("notes.txt", "docs/notes.md"),
+        ):
+            with self.subTest(query=query):
+                self.assertEqual(self.smart_names(root, query)[:1], [expected])
+        # Below the name as typed, a longer name with it is found too.
+        self.assertEqual(self.smart_names(root, "ledger.xls"),
+                         ["docs/ledger.xlsx", "docs/Ledger 2025.xlsx"])
+
+    def test_smart_model_hints_never_empty_a_query_of_stop_words(self) -> None:
+        root = self.corpus({
+            "IT/servers.txt": "", "wow!!!.txt": "", "last-will.pdf": b"%PDF-1.4",
+            "where-we-were.txt": "", "other.txt": "",
+        })
+        for query in ("IT", "!!!", "last", "where we were"):
+            with self.subTest(query=query):
+                plain = self.smart_names(root, query)
+                plan = self.laya_plan(query, target=("folder", 0.8), time=("older", 0.9))
+                hinted = self.smart_search(root, query, plan=plan)["entries"]
+                self.assertTrue(plain)
+                self.assertEqual(sorted(plain), sorted(row["relativePath"] for row in hinted))
+
+    def test_smart_change_words_are_keywords_unless_someone_did_them(self) -> None:
+        self.assert_plans({
+            "CHANGES": (["CHANGES"], {}),
+            "change log": (["change", "log"], {}),
+            "climate change report": (["climate", "change", "report"], {}),
+            "updated": (["updated"], {}),
+            "edit account page": (["edit", "account", "page"], {}),
+            "all we updated": ([], {"target": "file"}),
+            "the notes we updated": (["notes"], {"target": "file"}),
+            "recently changed configs": (
+                [], {"target": "file", "kind": "config", "time": "past-month"}),
+            # "Edited" and "modified" also name folders, as a photo editor's
+            # Edited/ does.
+            "Edited": (["Edited"], {}),
+            "modified": (["modified"], {}),
+            "edited files": ([], {"target": "file"}),
+            "they edited zorb": (["zorb"], {"target": "file"}),
+            "files they modified": ([], {"target": "file"}),
+        })
+        root = self.corpus({
+            "proj/CHANGES.md": "", "proj/CHANGELOG.md": "", "proj/a.txt": "", "b.txt": "",
+            "Photos/Edited/IMG_1.jpg": b"\xff\xd8", "Photos/Raw/IMG_2.jpg": b"\xff\xd8",
+        })
+        self.assertEqual(self.smart_names(root, "change log")[0], "proj/CHANGELOG.md")
+        self.assertEqual(self.smart_names(root, "changes")[0], "proj/CHANGES.md")
+        self.assertEqual(self.smart_names(root, "Edited")[:2],
+                         ["Photos/Edited", "Photos/Edited/IMG_1.jpg"])
+        # Spent on what someone did, the word still names a folder on the way.
+        names = self.smart_names(root, "edited photos")
+        self.assertLess(names.index("Photos/Edited/IMG_1.jpg"), names.index("Photos/Raw/IMG_2.jpg"))
+
+    def test_smart_ordinary_words_do_not_name_media(self) -> None:
+        root = self.corpus({
+            "music/track01.mp3": b"\x00", "music/track02.mp3": b"\x00", "clips/party.mp4": b"\x00",
+            "docs/результаты-голосования.pdf": b"%PDF-1.4", "docs/запись-к-врачу.pdf": b"%PDF-1.4",
+        })
+        # A vote is not a voice message, nor a doctor's appointment a recording.
+        self.assertEqual(self.smart_names(root, "голосование"), ["docs/результаты-голосования.pdf"])
+        self.assertEqual(self.smart_names(root, "запись к врачу"), ["docs/запись-к-врачу.pdf"])
+        self.assertEqual(self.smart_names(root, "recording"), [])
+        # An entry named with the word is still listed.
+        self.assertEqual(self.smart_names(root, "запис до лікаря"), ["docs/запись-к-врачу.pdf"])
+        # "Голосовые" is one.
+        self.assertEqual(quickfile.fallback_plan("голосовые")["hints"]["kind"]["value"], "audio")
+
+    def test_smart_rolling_and_yearly_windows(self) -> None:
+        self.assert_plans({
+            "музыка за последнюю неделю": ([], {"kind": "audio", "time": "past-week"}),
+            "archives from the past week": ([], {"kind": "archive", "time": "past-week"}),
+            "музика за останній тиждень": ([], {"kind": "audio", "time": "past-week"}),
+            "documents from last 7 days": ([], {"kind": "document", "time": "past-week"}),
+            "документы за последний месяц": ([], {"kind": "document", "time": "past-month"}),
+            "within the last month": ([], {"time": "past-month"}),
+            "архивы в этом году": ([], {"kind": "archive", "time": "this-year"}),
+            "архіви цього року": ([], {"kind": "archive", "time": "this-year"}),
+            "files from last week": ([], {"target": "file", "time": "last-week"}),
+            # A rolling window of another length is the shortest one that
+            # holds it, and a word for what is recent is the past month.
+            "notes from the past 3 days": (["notes"], {"time": "past-week"}),
+            "заметки за последние три дня": (["заметк"], {"time": "past-week"}),
+            "нотатки за останні 10 днів": (["нотатк"], {"time": "past-month"}),
+            "archives from the last two weeks": ([], {"kind": "archive", "time": "past-month"}),
+            "заметки за позавчера": (["заметк"], {"time": "past-week"}),
+            "recent archives": ([], {"kind": "archive", "time": "past-month"}),
+            "покажи недавние": ([], {"time": "past-month"}),
+            # Last year is the calendar year before this one.
+            "archives from last year": ([], {"kind": "archive", "time": "last-year"}),
+            "архивы за прошлый год": ([], {"kind": "archive", "time": "last-year"}),
+            "архіви за минулий рік": ([], {"kind": "archive", "time": "last-year"}),
+            # A longer word that begins like a time word is a topic.
+            "эта годовщина": (["годовщин"], {}),
+            "прошлый неделимый остаток": (["неделим", "остаток"], {}),
+            # Windows longer than a month are the past year, the shortest one
+            # that holds them.
+            "archives from the past year": ([], {"kind": "archive", "time": "past-year"}),
+            "архивы за последний год": ([], {"kind": "archive", "time": "past-year"}),
+            "архіви за останній рік": ([], {"kind": "archive", "time": "past-year"}),
+            "заметки за последние 3 месяца": (["заметк"], {"time": "past-year"}),
+            "notes from the past 2 months": (["notes"], {"time": "past-year"}),
+            "notes from the last few days": (["notes"], {"time": "past-week"}),
+            "заметки за неделю": (["заметк"], {"time": "past-week"}),
+            "notes this morning": (["notes"], {"time": "today"}),
+            # A verb of searching is no keyword.
+            "hunting for png": ([], {"kind": "image"}),
+            "i am looking for pdf": ([], {"kind": "document"}),
+        })
+        zone = quickfile.dt.datetime.now().astimezone().tzinfo
+        now = quickfile.dt.datetime(2026, 9, 22, 15, 0, tzinfo=zone)
+
+        def day(month: int, date: int) -> float:
+            return quickfile.dt.datetime(2026, month, date, 9, 0, tzinfo=zone).timestamp()
+
+        self.assertTrue(quickfile.smart_time_matches(day(9, 16), "past-week", now))
+        self.assertFalse(quickfile.smart_time_matches(day(9, 15), "past-week", now))
+        self.assertTrue(quickfile.smart_time_matches(day(8, 24), "past-month", now))
+        self.assertFalse(quickfile.smart_time_matches(day(8, 23), "past-month", now))
+        self.assertTrue(quickfile.smart_time_matches(day(1, 1), "this-year", now))
+        autumn = quickfile.dt.datetime(2025, 9, 23, 9, 0, tzinfo=zone).timestamp()
+        self.assertTrue(quickfile.smart_time_matches(autumn, "past-year", now))
+        autumn = quickfile.dt.datetime(2025, 9, 22, 9, 0, tzinfo=zone).timestamp()
+        self.assertFalse(quickfile.smart_time_matches(autumn, "past-year", now))
+        last_year = quickfile.dt.datetime(2025, 6, 14, 9, 0, tzinfo=zone).timestamp()
+        self.assertTrue(quickfile.smart_time_matches(last_year, "last-year", now))
+        self.assertFalse(quickfile.smart_time_matches(day(6, 14), "last-year", now))
+        root = self.corpus({
+            "Music/track-01.mp3": b"\x00", "Music/track-02.mp3": b"\x00", "notes.txt": "",
+        })
+        long_ago = quickfile.time.time() - 40 * 86400
+        os.utime(root / "Music" / "track-02.mp3", (long_ago, long_ago))
+        self.assertEqual(self.smart_names(root, "музыка за последнюю неделю")[0],
+                         "Music/track-01.mp3")
+        # Recent files are listed for a request of nothing else.
+        self.assertIn("notes.txt", self.smart_names(root, "покажи недавние"))
+        self.assertNotIn("Music/track-02.mp3", self.smart_names(root, "покажи недавние"))
+
+    def test_smart_months_are_month_forms_only(self) -> None:
+        root = self.corpus({
+            "scans/SCAN_20250214_1200.pdf": b"%PDF-1.4", "docs/2025-03-10-inventory.xlsx": b"PK",
+            "docs/2025-10-01-minutes.md": "", "docs/Мартынов переулок.pdf": b"%PDF-1.4",
+            "Ledger/2025/10/quux.txt": "", "Ledger/2025/09/10/quux.txt": "",
+            "Course/10/quux.txt": "",
+        })
+        for query in ("лютий", "за лютого", "по лютому"):
+            with self.subTest(query=query):
+                self.assertEqual(self.smart_names(root, query)[0], "scans/SCAN_20250214_1200.pdf")
+        # Names that begin like a month are names.
+        self.assertEqual(self.smart_names(root, "Мартынов"), ["docs/Мартынов переулок.pdf"])
+        self.assertEqual(self.smart_names(root, "Августин"), [])
+        for word in ("Мартин", "Мартыненко", "Августина"):
+            with self.subTest(word=word):
+                term = quickfile.fallback_plan(word)["terms"][0]
+                self.assertEqual(quickfile_smart.SmartTerm(term).month, "")
+        # A folder named "10" is October in a year's folder, not a lecture or
+        # a day.
+        self.assertEqual(self.smart_names(root, "quux october")[0], "Ledger/2025/10/quux.txt")
+        names = self.smart_names(root, "october")
+        for other in ("Course/10", "Ledger/2025/09/10", "Ledger/2025/09/10/quux.txt"):
+            self.assertNotIn(other, names)
+
+    def test_smart_short_words_meet_their_other_forms(self) -> None:
+        root = self.corpus({
+            "Дача 2019/grill.jpg": b"\xff\xd8", "Игры/list.txt": "",
+            "photos/море.jpg": b"\xff\xd8", "photos/мороз.jpg": b"\xff\xd8",
+        })
+        for query, expected in (
+            ("фото с дачи", "Дача 2019"), ("дачу", "Дача 2019"), ("фото з дачі", "Дача 2019"),
+            ("игра", "Игры"),
+        ):
+            with self.subTest(query=query):
+                self.assertEqual(self.smart_names(root, query)[0], expected)
+        self.assertEqual(self.smart_names(root, "фото моря"), ["photos/море.jpg"])
+
+    def test_smart_kinds_joined_by_and_are_all_asked_for(self) -> None:
+        for query, kinds in (
+            ("photos and videos", ["image", "video"]), ("фото и видео", ["image", "video"]),
+            ("документы и фото", ["document", "image"]), ("видео с музыкой", ["video"]),
+        ):
+            with self.subTest(query=query):
+                self.assertEqual(quickfile.fallback_plan(query)["kinds"], kinds)
+        root = self.corpus({
+            "media/holiday.jpg": b"\xff\xd8", "media/beach.png": b"\x89PNG",
+            "media/holiday.mp4": b"\x00", "media/clip.mov": b"\x00", "media/notes.txt": "",
+        })
+        self.assertEqual(sorted(self.smart_names(root, "photos and videos")), [
+            "media/beach.png", "media/clip.mov", "media/holiday.jpg", "media/holiday.mp4",
+        ])
+        result = self.smart_search(root, "фото и видео")
+        self.assertEqual(result["smart"]["kinds"], ["image", "video"])
+        # Optional, bounded and validated like formats.
+        legacy = {"version": 1, "terms": ["garden"], "hints": {}}
+        self.assertEqual(quickfile.validate_plan(legacy)["kinds"], [])
+        for kinds in (["any"], ["photo"], "image", [["image"]], ["image"] * 5):
+            with self.subTest(kinds=kinds), self.assertRaises(quickfile.SmartPlanError):
+                quickfile.validate_plan({**legacy, "kinds": kinds})
+
+    def test_smart_a_format_named_first_is_the_kind_asked_for(self) -> None:
+        cases = {
+            "mp4 with music": ([], ["mp4"], "video"),
+            "mp4 з музикою": ([], ["mp4"], "video"),
+            "pdf з фото паспорта": (["паспорт"], ["pdf"], "document"),
+            # A conversion and what something is for are topics.
+            "mp3 to wav": (["mp3", "wav"], [], "any"),
+            "tools for pdf": (["tools", "pdf"], [], "any"),
+        }
+        for query, (terms, formats, kind) in cases.items():
+            with self.subTest(query=query):
+                plan = quickfile.fallback_plan(query)
+                self.assertEqual(
+                    (plan["terms"], plan["formats"], plan["hints"]["kind"]["value"]),
+                    (terms, formats, kind),
+                )
+        root = self.corpus({
+            "mp4/holiday-2025.mp4": b"\x00", "mp4/mp4-codecs.md": "",
+            "pdf-tools/merge.py": "", "docs/garden-tools.pdf": b"%PDF-1.4",
+        })
+        self.assertEqual(self.smart_names(root, "mp4 with music")[0], "mp4/holiday-2025.mp4")
+        self.assertEqual(self.smart_names(root, "tools for pdf")[0], "pdf-tools")
+
+    def test_smart_a_format_narrows_the_kind_it_implies(self) -> None:
+        root = self.corpus({
+            "garden-plan.pdf": b"%PDF-1.4", "quarterly-report.pdf": b"%PDF-1.4",
+            "readings.csv": "a,b\n", "notes.md": "", "todo.txt": "", "beach.png": b"\x89PNG",
+            "pdf-tools/merge.py": "",
+        })
+        pdfs = ["garden-plan.pdf", "quarterly-report.pdf"]
+        self.assertEqual(sorted(self.smart_names(root, "pdf")), pdfs)
+        self.assertEqual(sorted(self.smart_names(root, "pdf and photos")),
+                         sorted(pdfs + ["beach.png"]))
+        # After a verb of searching, "for" says what is searched for.
+        for query in ("looking for pdf", "search for pdf files", "looking for a pdf"):
+            with self.subTest(query=query):
+                self.assertEqual(quickfile.fallback_plan(query)["formats"], ["pdf"])
+                self.assertEqual(sorted(self.smart_names(root, query)), pdfs)
+        self.assertEqual(quickfile.fallback_plan("look for png images")["formats"], ["png"])
+
+    def test_smart_exact_word_outranks_a_longer_word_it_begins(self) -> None:
+        root = self.corpus({
+            "portal.txt": "", "port_scan_results.txt": "",
+            "планшет.txt": "", "план_на_неделю.txt": "",
+        })
+        self.assertEqual(self.smart_names(root, "port")[0], "port_scan_results.txt")
+        self.assertEqual(self.smart_names(root, "план")[0], "план_на_неделю.txt")
+
+    def test_smart_an_extension_is_what_a_file_is_not_what_it_is_about(self) -> None:
+        root = self.corpus({
+            "garden-plan.pdf": b"\x00", "zorb-brochure.pdf": b"\x00",
+            "pdf_parser.py": "", "data.csv": "a,b\n", "notes.md": "", "quux.lua": "",
+        })
+        self.assertEqual(self.smart_names(root, "pdf parser"), ["pdf_parser.py"])
+        self.assertNotIn("data.csv", self.smart_names(root, "csv parser"))
+        self.assertEqual(self.smart_names(root, "md table formatter"), [])
+        # Alone, the word asks for files of its type.
+        self.assertEqual(self.smart_names(root, "lua"), ["quux.lua"])
+        # An extension says what a file is in either script.
+        root = self.corpus({
+            "zorb-installer.torrent": "", "zorb-notes.md": "", "typo-fix.patch": "",
+            "patchwork.md": "",
+        }, "types")
+        self.assertEqual(self.smart_names(root, "торрент zorb")[0], "zorb-installer.torrent")
+        self.assertEqual(self.smart_names(root, "патч"), ["typo-fix.patch"])
+
+    def test_smart_hidden_trees_wait_for_the_visible_folders(self) -> None:
+        root = self.corpus({
+            **{f".appstate/cache-{index}/x/y/entry-{index}.txt": "" for index in range(30)},
+            "Projects/app/src/lib/deep/zorb-locale.ts": "",
+        })
+        result = self.smart_search(root, "zorb locale", show_hidden=True, scan_limit=40)
+        self.assertTrue(result["truncated"])
+        self.assertEqual([row["relativePath"] for row in result["entries"]],
+                         ["Projects/app/src/lib/deep/zorb-locale.ts"])
+
+    def test_smart_folders_named_for_a_kind_are_listed_for_it(self) -> None:
+        root = self.corpus({"Videos/trip.mp4": b"\x00", "Music/song.mp3": b"\x00", "notes.txt": ""})
+        self.assertEqual(self.smart_names(root, "Videos"), ["Videos", "Videos/trip.mp4"])
+        self.assertEqual(self.smart_names(root, "Музыка"), ["Music", "Music/song.mp3"])
+
+    def test_smart_query_words_keep_their_meaning(self) -> None:
+        self.assert_plans({
+            # An apostrophe inside a word quotes nothing: it is part of the
+            # word, and an English possessive is the word it follows.
+            "Alice's recipes and Bob's notes": (["Alice", "recipes", "Bob", "notes"], {}),
+            "м'ясо на п'ятницю": (["м'ясо", "п'ятниц"], {}),
+            "'garden draft' notes": (['"garden draft"', "notes"], {}),
+            # A full stop is not part of the word before it.
+            "графиком.": (["график"], {}),
+            # A projector is not a project.
+            "инструкция проектора": (["инструкци", "проектор"], {}),
+        })
+        root = self.corpus({
+            "docs/invoice.pdf": b"%PDF-1.4", "docs/invoices-2024.txt": "",
+            "lang/c-quux.txt": "", "books/C++ Primer.pdf": b"%PDF-1.4",
+            "zorblabs-app/main.kt": "", "docs/Zorb-notes.txt": "",
+            "pics/cat.jpg": b"\xff\xd8", "pics/catch.txt": "",
+        })
+        # Quoted, a word is matched as typed.
+        self.assertEqual(self.smart_names(root, '"invoice"'), ["docs/invoice.pdf"])
+        self.assertEqual(self.smart_names(root, '"calender"'), [])
+        # A language is its symbols, not its letter.
+        self.assertEqual(self.smart_names(root, "C++"), ["books/C++ Primer.pdf"])
+        # A transliterated name and a short singular add only an ending.
+        self.assertEqual(self.smart_names(root, "Зорб"), ["docs/Zorb-notes.txt"])
+        self.assertEqual(self.smart_names(root, "cats"), ["pics/cat.jpg"])
+
+    def test_smart_text_matches_alike_with_and_without_rg(self) -> None:
+        root = self.corpus({
+            "a.txt": "Meeting at Hauptstraße 5\n", "trip.txt": "Встреча в Одеса, порт.\n",
+        })
+        for query, expected in (("hauptstraße", ["a.txt"]), ("Одесса", ["trip.txt"])):
+            with self.subTest(query=query):
+                self.assertEqual(self.smart_names(root, query), expected)
+                with mock.patch.object(quickfile.shutil, "which", return_value=None):
+                    self.assertEqual(self.smart_names(root, query), expected)
+
+    def test_smart_model_hints_never_decide_which_lines_are_read(self) -> None:
+        root = self.corpus({"a.txt": "the zebra lives here\n", "b.txt": "the zebra lives here\n"})
+        long_ago = quickfile.time.time() - 400 * 86400
+        os.utime(root / "a.txt", (long_ago, long_ago))
+
+        def lines(plan: dict | None) -> dict[str, int]:
+            result = self.smart_search(root, "zebra", plan=plan, content_byte_limit=30)
+            return {row["relativePath"]: row["matchLine"] for row in result["entries"]}
+
+        plain = lines(None)
+        self.assertEqual(sorted(plain.values()), [0, 1])
+        self.assertEqual(lines(self.laya_plan("zebra", time=("today", 0.9))), plain)
+
+    def test_smart_a_read_the_deadline_cut_short_marks_the_result(self) -> None:
+        root = self.corpus({"notes.txt": "the zebra lives here\n"})
+        read = quickfile.smart_content_match
+
+        def slow(*args):
+            answer = read(*args)
+            quickfile.time.sleep(0.3)
+            return answer
+
+        with mock.patch.object(quickfile.shutil, "which", return_value=None), \
+                mock.patch.object(quickfile, "smart_content_match", side_effect=slow):
+            result = self.smart_search(root, "zebra", timeout=0.25)
+        self.assertTrue(result["truncated"])
+
+    def test_smart_entries_named_with_a_framing_word_are_listed(self) -> None:
+        root = self.corpus({
+            "Videos/recording-03.mp4": b"\x00", "Videos/Запис 03.mp4": b"\x00",
+            "Videos/party.mp4": b"\x00", "notes/physics.md": "", "docs/recording-notes.txt": "",
+            "docs/setup-guide.md": "", "Studio/recordings/take-1.m4a": b"\x00",
+        })
+        # "Recording" only frames a request, but an entry named with it is
+        # what the word asks for, below the entries with the other words, and
+        # so is a folder named for them.
+        names = self.smart_names(root, "physics recording")
+        self.assertEqual(names[0], "notes/physics.md")
+        self.assertIn("Videos/recording-03.mp4", names)
+        self.assertIn("docs/recording-notes.txt", self.smart_names(root, "recording guide"))
+        self.assertIn("Videos/Запис 03.mp4", self.smart_names(root, "zorb запис"))
+        self.assertIn("Studio/recordings", self.smart_names(root, "physics recordings"))
+        # A video that only its type makes a recording is not enough.
+        self.assertNotIn("Videos/party.mp4", names)
+
+    def test_smart_translations_of_a_type_word_name_only_that_type(self) -> None:
+        root = self.corpus({
+            "docs/запис-до-стоматолога.pdf": b"%PDF-1.4", "docs/recording-notes.txt": "",
+            "Videos/Запис 03.mp4": b"\x00", "Записи/list.txt": "",
+        })
+        # "Запис" is an appointment as often as a recording: a translation of
+        # "recording" finds a video or a folder of them, not a document.
+        names = self.smart_names(root, "recording")
+        self.assertIn("Videos/Запис 03.mp4", names)
+        self.assertIn("Записи", names)
+        self.assertNotIn("docs/запис-до-стоматолога.pdf", names)
+        # The word as typed still names anything.
+        self.assertIn("docs/запис-до-стоматолога.pdf", self.smart_names(root, "запис"))
+
+    def test_smart_apostrophes_stay_inside_words(self) -> None:
+        root = self.corpus({
+            "d/мясо.txt": "", "d/пятница.txt": "", "d/обєкт.txt": "", "d/мята.txt": "",
+            "d/мʼята.md": "", "d/м'ята-чай.txt": "", "d/dartagnan-notes.md": "",
+            "d/D'Artagnan letters.pdf": b"%PDF-1.4", "t/list.txt": "Купити м’ясо на суботу\n",
+        })
+        for query, expected in (
+            ("м'ясо", ["d/мясо.txt", "t/list.txt"]), ("п'ятниця", ["d/пятница.txt"]),
+            ("об'єкт", ["d/обєкт.txt"]), ("объект", ["d/обєкт.txt"]),
+            ("мясо", ["d/мясо.txt", "t/list.txt"]),
+            ("м'ята", ["d/m'ята-чай.txt", "d/мʼята.md", "d/мята.txt"]),
+            ("мята", ["d/m'ята-чай.txt", "d/мʼята.md", "d/мята.txt"]),
+            ("D'Artagnan", ["d/D'Artagnan letters.pdf", "d/dartagnan-notes.md"]),
+        ):
+            with self.subTest(query=query):
+                self.assertEqual(sorted(self.smart_names(root, query)),
+                                 sorted(path.replace("m'", "м'") for path in expected))
+                with mock.patch.object(quickfile.shutil, "which", return_value=None):
+                    self.assertEqual(sorted(self.smart_names(root, query)),
+                                     sorted(path.replace("m'", "м'") for path in expected))
+
+    def test_smart_short_names_with_a_doubled_letter_keep_their_length(self) -> None:
+        root = self.corpus({
+            "d/Инна-план.pdf": b"%PDF-1.4", "d/письмо Инны.txt": "", "d/иначе.txt": "",
+            "d/инаугурация.md": "", "t/talk.txt": "иначе говоря\n", "t/call.txt": "Звонок Инне\n",
+            "d/Жанна.pdf": b"%PDF-1.4", "d/жанр.txt": "", "d/Элла-рецепты.pdf": b"%PDF-1.4",
+            "d/елань.jpg": b"\xff\xd8", "d/Одесса-2019.jpg": b"\xff\xd8", "t/trip.txt": "Одеса\n",
+        })
+        # Folding "Инна" to "ина" must not let it run on into any letters:
+        # it meets its own case forms only.
+        self.assertEqual(sorted(self.smart_names(root, "Инна")),
+                         ["d/Инна-план.pdf", "d/письмо Инны.txt", "t/call.txt"])
+        self.assertEqual(self.smart_names(root, "Жанна"), ["d/Жанна.pdf"])
+        self.assertEqual(self.smart_names(root, "Элла"), ["d/Элла-рецепты.pdf"])
+        # A longer word still meets its spelling with one letter.
+        self.assertEqual(sorted(self.smart_names(root, "Одесса")),
+                         ["d/Одесса-2019.jpg", "t/trip.txt"])
+
+    def test_smart_a_projects_own_python_folder_is_searched(self) -> None:
+        root = self.corpus({
+            "engine/lib/python3/zorb_bindings.py": "", "engine/src/zorb.c": "",
+            "env/pyvenv.cfg": "home = /usr/bin\n",
+            "env/lib/python3.12/site-packages/zorb_pkg.py": "",
+        })
+        result = self.smart_search(root, "zorb bindings")
+        self.assertEqual(result["entries"][0]["relativePath"], "engine/lib/python3/zorb_bindings.py")
+        # A Python library, which holds site-packages, is still skipped.
+        self.assertNotIn("env/lib/python3.12/site-packages/zorb_pkg.py",
+                         self.smart_names(root, "zorb"))
+
+    def test_smart_loanwords_meet_their_english_spelling(self) -> None:
+        root = self.corpus({
+            "music/jazz-standards.txt": "", "docs/computer-setup.md": "",
+            "docs/method-notes.md": "", "docs/position-paper.md": "", "docs/graphics-notes.md": "",
+            "docs/vine.txt": "",
+        })
+        for query, expected in (
+            ("джаз", "music/jazz-standards.txt"), ("компьютер", "docs/computer-setup.md"),
+            ("метод", "docs/method-notes.md"), ("позиция", "docs/position-paper.md"),
+            ("графика", "docs/graphics-notes.md"),
+        ):
+            with self.subTest(query=query):
+                self.assertEqual(self.smart_names(root, query)[:1], [expected])
+        self.assertEqual(self.smart_names(root, "вино"), [])
+
+    def test_smart_words_spent_on_a_kind_still_name_things(self) -> None:
+        root = self.corpus({
+            "garden/photos/IMG_1.jpg": b"\xff\xd8", "garden/IMG_2.jpg": b"\xff\xd8",
+            "tools/zorb/config.toml": "", "tools/zorb.toml": "",
+        })
+        names = self.smart_names(root, "photos of the garden")
+        self.assertLess(names.index("garden/photos/IMG_1.jpg"), names.index("garden/IMG_2.jpg"))
+        # Beside one keyword a spent word says a lot: the file named config is
+        # the one asked for.
+        self.assertEqual(self.smart_names(root, "zorb config")[0], "tools/zorb/config.toml")
+
+    def test_smart_a_name_word_abbreviates_a_long_keyword(self) -> None:
+        root = self.corpus({
+            "dev-notes.md": "", "development-plan.md": "", "calc-zorb.md": "", "calc-sheet.md": "",
+            "d/and-studio-tips.md": "", "d/android-notes.md": "",
+            "d/budget-new.xlsx": b"PK", "d/newsletter.md": "",
+            "d/sales-rep-list.md": "", "d/reporting-guide.md": "",
+        })
+        # "dev" is "development" beside another keyword, in the query's order.
+        self.assertEqual(self.smart_names(root, "development notes")[0], "dev-notes.md")
+        # Alone, a clip is nothing.
+        self.assertEqual(self.smart_names(root, "calculator"), [])
+        # In the other script, by the Latin spelling.
+        self.assertEqual(self.smart_names(root, "калькулятор zorb")[0], "calc-zorb.md")
+        # A word that frames a request abbreviates nothing, nor does a clip of
+        # three letters in another order than the query's: the entry with the
+        # keyword itself comes first.
+        for query, expected in (
+            ("android studio", "d/android-notes.md"), ("newsletter budget", "d/newsletter.md"),
+            ("reporting sales", "d/reporting-guide.md"),
+        ):
+            with self.subTest(query=query):
+                self.assertEqual(self.smart_names(root, query)[0], expected)
+
+    def test_smart_a_long_text_answers_a_long_request_less_firmly(self) -> None:
+        filler = "\n".join(f"line {index:05} of an unrelated log" for index in range(3500))
+        root = self.corpus({
+            "a/short.conf": "alpha beta gamma\n",
+            "b/long.log": f"alpha\n{filler}\nbeta gamma delta\n",
+        })
+        # Every word of the request somewhere in a long text says less than
+        # most of them in a short one.
+        self.assertEqual(self.smart_names(root, "alpha beta gamma delta")[0], "a/short.conf")
+
+    def test_smart_names_meet_their_transliteration_either_way(self) -> None:
+        root = self.corpus({
+            "en/Zorbiuk-contract.pdf": b"%PDF-1.4", "en/Dzhorbyn-notes.md": "",
+            "ru/Зорбюк-договор.pdf": b"%PDF-1.4", "ru/Джорбин.md": "",
+        })
+        # A name keeps its transliteration beside the borrowed-word spelling:
+        # "юк" is "iuk" and "дж" "dzh" as well as "uk" and "j".
+        for query, expected in (
+            ("Зорбюк", ["en/Zorbiuk-contract.pdf", "ru/Зорбюк-договор.pdf"]),
+            ("Zorbiuk", ["en/Zorbiuk-contract.pdf", "ru/Зорбюк-договор.pdf"]),
+            ("Джорбин", ["en/Dzhorbyn-notes.md", "ru/Джорбин.md"]),
+            ("Dzhorbyn", ["en/Dzhorbyn-notes.md", "ru/Джорбин.md"]),
+        ):
+            with self.subTest(query=query):
+                self.assertEqual(sorted(self.smart_names(root, query)), expected)
+
+    def test_smart_short_common_words_are_not_their_transliteration(self) -> None:
+        root = self.corpus({
+            "en/most-used.md": "", "en/dom-utils.ts": "", "en/net-config.json": "{}",
+            "en/sad-songs.mp3": b"\x00", "en/UIKit.swift": "", "en/lists.csv": "a\n",
+            "en/listen-later.md": "", "domain/readme.md": "", "sms/zorb.txt": "",
+            "ru/мост через реку.md": "", "ru/отчёт.txt": "Мост закрыт на ремонт\n",
+        })
+        # A short word typed in lower case meets the other script only as the
+        # same whole word or its plural, one of three letters not at all...
+        for query in ("дом", "нет", "сад", "кит"):
+            with self.subTest(query=query):
+                self.assertEqual(self.smart_names(root, query), [])
+        self.assertNotIn("domain", self.smart_names(root, "дома"))
+        self.assertNotIn("en/listen-later.md", self.smart_names(root, "лист"))
+        # ... and for less than the word itself, in a name or in a text.
+        self.assertEqual(self.smart_names(root, "мост"),
+                         ["ru/мост через реку.md", "ru/отчёт.txt", "en/most-used.md"])
+        # An abbreviation has no vowel, and keeps its transliteration.
+        self.assertEqual(self.smart_names(root, "смс")[0], "sms")
+
+    def test_smart_a_spent_kind_word_names_only_its_kind(self) -> None:
+        root = self.corpus({
+            "Photos/beach.jpg": b"\xff\xd8", "Videos/trip.mp4": b"\x00",
+            "inbox/IMG_1.jpg": b"\xff\xd8", "inbox/clip.mp4": b"\x00",
+            "inbox/video-still.jpg": b"\xff\xd8",
+        })
+        long_ago = quickfile.time.time() - 400 * 86400
+        for old in ("Photos/beach.jpg", "Videos/trip.mp4"):
+            os.utime(root / old, (long_ago, long_ago))
+        # The folder named for the kind asked for, of any date, does not come
+        # before what has the kind and the date...
+        self.assertEqual(self.smart_names(root, "photos this month")[0], "inbox/IMG_1.jpg")
+        names = self.smart_names(root, "videos this month")
+        self.assertEqual(names[0], "inbox/clip.mp4")
+        # ... nor a JPG called video before a video.
+        self.assertGreater(names.index("inbox/video-still.jpg"), names.index("Videos/trip.mp4"))
+        # Nor the folder before the files a typed target asks for.
+        self.assertEqual(self.smart_names(root, "edited photos")[0], "Photos/beach.jpg")
+
+    def test_smart_a_kind_asked_alone_comes_before_its_date(self) -> None:
+        root = self.corpus({
+            "Pictures/IMG_0001.jpg": b"\xff\xd8", "Pictures/IMG_0002.jpg": b"\xff\xd8",
+            "Pictures/IMG_0003.jpg": b"\xff\xd8", "docs/report.pdf": b"%PDF-1.4",
+            "docs/table.xlsx": b"PK", "docs/todo.txt": "",
+        })
+        for name, days in (("IMG_0001.jpg", 3), ("IMG_0002.jpg", 40), ("IMG_0003.jpg", 400)):
+            stamp = quickfile.time.time() - days * 86400
+            os.utime(root / "Pictures" / name, (stamp, stamp))
+        images = ["Pictures/IMG_0001.jpg", "Pictures/IMG_0002.jpg", "Pictures/IMG_0003.jpg"]
+        documents = ["docs/report.pdf", "docs/table.xlsx", "docs/todo.txt"]
+        for query in ("latest photos", "недавние фото", "свежие фото"):
+            with self.subTest(query=query):
+                names = self.smart_names(root, query)
+                self.assertEqual(names[0], "Pictures/IMG_0001.jpg")
+                # Every photo, of any date, before a file that has only the date.
+                self.assertLess(max(names.index(name) for name in images),
+                                min(names.index(name) for name in documents))
+
+    def test_smart_rows_with_a_keyword_come_before_rows_only_their_type_says(self) -> None:
+        root = self.corpus({
+            **{f"pics/IMG_000{index}.png": b"\x89PNG" for index in range(1, 7)},
+            "research/quux-survey/notes.md": "", "research/quux-survey/data/answers.json": "{}",
+        })
+        # Only its type makes an image a screenshot, and beside a keyword it
+        # lacks that ranks below a file under a folder named with the keyword.
+        result = self.smart_search(root, "quux screenshots", limit=6)
+        names = [row["relativePath"] for row in result["entries"]]
+        self.assertIn("research/quux-survey/data/answers.json", names)
+        self.assertTrue(result["truncated"])
+
+    def test_smart_an_extension_is_one_word_after_the_last_dot(self) -> None:
+        matcher = quickfile.SmartMatcher(quickfile_smart.smart_terms(["final", "lua"], False))
+        # After a version's dot the rest of the name is the name's.
+        evidence = matcher.name("Budget v1.5 final", False)
+        self.assertEqual((evidence.grades[0], evidence.suffix[0]), (1.0, False))
+        evidence = matcher.name("quux.lua", False)
+        self.assertEqual((evidence.grades[1], evidence.suffix[1]), (0.0, True))
+        root = self.corpus({"d/release-notes": "", "d/release-2.0-notes": ""})
+        scores = {row["relativePath"]: row["smartScore"]
+                  for row in self.smart_search(root, "notes")["entries"]}
+        self.assertEqual(scores["d/release-2.0-notes"], scores["d/release-notes"])
+        # "Лист" typed is as often a sheet as a letter.
+        root = self.corpus({
+            "d/лист бюджета.xlsx": b"PK", "d/letter-to-bank.pdf": b"%PDF-1.4",
+            "d/письмо-банку.docx": b"PK",
+        }, "sheets")
+        self.assertEqual(self.smart_names(root, "лист бюджета"), ["d/лист бюджета.xlsx"])
+
+    def test_smart_chips_know_the_kind_of_every_format(self) -> None:
+        panel = (ROOT / "Panel.qml").read_text(encoding="utf-8")
+        body = panel[panel.index("function smartFormatKind("):
+                     panel.index("function smartSummaryLabels(")]
+        rules = [
+            (quickfile.re.compile(pattern), kind)
+            for pattern, kind in quickfile.re.findall(r'match\(/(.+?)/\)\) return "(\w+)"', body)
+        ]
+        self.assertTrue(rules)
+        for value, kind in quickfile_smart.SMART_FORMATS.items():
+            with self.subTest(format=value):
+                self.assertEqual(
+                    next((named for pattern, named in rules if pattern.search(value)), ""), kind)
 
     def test_semantic_helper_status_is_dependency_free(self) -> None:
         semantic_home = self.root / "semantic"
@@ -1709,24 +2885,31 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(argv[-2:], ["--", str(self.root)])
         self.assertNotIn("sh", argv)
 
-    def test_smart_rg_prefilter_scans_once_for_all_terms(self) -> None:
+    def test_smart_rg_passes_use_fixed_bounded_argv(self) -> None:
         matched = self.root / "notes.txt"
-        terms = ["budget", "month; touch /tmp/no"]
+        spellings = [["garden"], ["c++ (draft); touch /tmp/no"], []]
         with mock.patch.object(quickfile.shutil, "which", return_value="/usr/bin/rg"), \
                 mock.patch.object(
                     quickfile, "run_bounded", return_value=(0, str(matched) + "\0", "")
                 ) as runner:
-            candidates = quickfile.rg_smart_content_candidates(
-                str(self.root), terms, False, False, 4096,
+            found = quickfile.rg_smart_term_files(
+                str(self.root), spellings, frozenset({"node_modules"}), False, 4096,
                 quickfile.time.monotonic() + 2,
             )
-        self.assertEqual(candidates, {str(matched)})
-        argv = runner.call_args.args[0]
-        self.assertEqual(argv.count("-e"), 2)
-        self.assertIn("--fixed-strings", argv)
-        self.assertIn(terms[1], argv)
-        self.assertEqual(argv[-2:], ["--", str(self.root)])
-        self.assertNotIn("sh", argv)
+        # One pass per keyword with a spelling; a keyword without one is left
+        # for Python, which never reads for it either.
+        self.assertEqual(found, [{str(matched)}, {str(matched)}, None])
+        self.assertEqual(runner.call_count, 2)
+        patterns = []
+        for call in runner.call_args_list:
+            argv = call.args[0]
+            self.assertEqual(argv.count("-e"), 1)
+            self.assertIn("!node_modules", argv)
+            self.assertEqual(argv[-2:], ["--", str(self.root)])
+            self.assertNotIn("sh", argv)
+            patterns.append(argv[argv.index("-e") + 1])
+        # rg reads a regular expression: the spelling's own symbols are escaped.
+        self.assertEqual(sorted(patterns), [r"c\+\+ \(draft\); touch /tmp/no", "garden"])
 
     def test_search_transparently_falls_back_without_rg(self) -> None:
         args = argparse.Namespace(

@@ -33,7 +33,7 @@ MODEL_REPO = "convaiinnovations/laya"
 MODEL_SUBFOLDER = "multilingual"
 MODEL_REVISION = "1c5edc17a7acd8701df6fc341c0d179f1c62c982"
 # PyPI's Linux torch wheel pulls several gigabytes of CUDA libraries. The
-# classifier answers four short questions per query, so the CPU build is fast
+# classifier answers three short questions per query, so the CPU build is fast
 # enough and never wakes a discrete GPU for a file-manager search.
 TORCH_INDEX_URL = "https://download.pytorch.org/whl/cpu"
 INFERENCE_DEVICE = "cpu"

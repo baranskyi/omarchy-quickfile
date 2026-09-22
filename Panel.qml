@@ -1658,6 +1658,9 @@ Item {
     property int interactionRevision: 0
     property bool rememberLocations: false
     property bool navigationResetPending: false
+    // Only the file list shows search results; the side modules keep theirs.
+    property bool resetsOnNewResults: false
+    property bool resultsResetPending: false
     property bool locationRestorePending: false
     property var locationStates: ({})
     property var locationStateOrder: []
@@ -1821,11 +1824,19 @@ Item {
         if (stableView.navigationResetPending) {
           stableView.navigationResetPending = false
           stableView.viewportAnchor = null
+        } else if (stableView.resetsOnNewResults && root.service.listingIsNewResults) {
+          // Holding the old top row would scroll the new best matches away.
+          stableView.viewportAnchor = null
+          stableView.resultsResetPending = true
         } else stableView.rememberViewport()
       }
       function onModelChanged() {
         stableView.restoreViewport()
         stableView.restoreLocation()
+        if (stableView.resultsResetPending) {
+          stableView.resultsResetPending = false
+          stableView.positionViewAtBeginning()
+        }
       }
     }
   }
@@ -4656,6 +4667,7 @@ Item {
           id: fileList
           objectName: "quickfileFileList"
           rememberLocations: true
+          resetsOnNewResults: true
           anchors.top: contextStrip.bottom
           anchors.left: parent.left
           anchors.right: parent.right

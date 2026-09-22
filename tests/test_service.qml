@@ -318,8 +318,16 @@ ShellRoot {
     var smartListing = JSON.parse(response(synthetic.entries))
     smartListing.smart = { state: "ready", model: "laya-multilingual", device: "cpu",
       terms: ["config"], hints: synthetic.semanticPlan.hints }
+    synthetic.listInFlightBackground = false
     check(synthetic.applyListing(JSON.stringify(smartListing)),
       "Smart listing metadata was rejected")
+    check(synthetic.listingIsNewResults,
+      "A foreground search answered by a new command was not marked as new results")
+    synthetic.listInFlightBackground = false
+    check(synthetic.applyListing(JSON.stringify(smartListing))
+        && !synthetic.listingIsNewResults,
+      "Re-applying the same search command was marked as new results")
+    synthetic.listInFlightBackground = true
     check(synthetic.semanticResult && synthetic.semanticResult.state === "ready"
       && synthetic.semanticModel === "laya-multilingual" && synthetic.semanticDevice === "cpu",
       "Smart listing metadata was not published")

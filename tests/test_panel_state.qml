@@ -1169,6 +1169,26 @@ ShellRoot {
     check(Math.abs(fileView.contentY - userScroll) < 1,
       "a user scroll during an update was overwritten")
 
+    // A new answer to a search (a SMART plan arriving for the same query)
+    // starts at its best match instead of holding the old top row in place.
+    fileView.interactionRevision++
+    fileView.positionViewAtIndex(35, ListView.Beginning)
+    fileView.forceLayout()
+    fixture.listingIsNewResults = true
+    fixture.listingAboutToChange()
+    var ranked = fixture.entries.slice()
+    var best = ranked.splice(60, 1)[0]
+    ranked.unshift(best)
+    fixture.entries = ranked
+    fixture.entriesModel.move(60, 0, 1)
+    fixture.modelChanged()
+    fileView.forceLayout()
+    fixture.listingIsNewResults = false
+    check(fileView.indexAt(1, fileView.contentY + 1) === 0,
+      "new search results kept the old top row instead of showing the best match")
+    fileView.positionViewAtIndex(35, ListView.Beginning)
+    fileView.forceLayout()
+
     panel.keyboardIndex = 70
     select(fixture.entries[70])
     panel.moveSelection(1, Qt.NoModifier)

@@ -229,6 +229,12 @@ Item {
   property bool reloadPendingForeground: false
   property bool listInFlightBackground: false
   property string listInFlightCommand: ""
+  // The command whose rows are on screen. A foreground search answered by a
+  // different command is a new result set, not a refresh of the old one: a
+  // new query, or the same SMART query once its analysis arrives. The panel
+  // shows such a set from its top instead of holding the old top row in place.
+  property string appliedListingCommand: ""
+  property bool listingIsNewResults: false
   property string listInFlightRootToken: ""
   property string listInFlightRootPath: ""
   property double navigationBlockedUntil: 0
@@ -1206,6 +1212,9 @@ Item {
       || !sameData(semanticResult, nextSemanticResult)
     var anchorToken = selectionAnchorIndex >= 0 && selectionAnchorIndex < entries.length
       ? String(entries[selectionAnchorIndex].token || "") : ""
+    listingIsNewResults = !listInFlightBackground && String(query || "").trim() !== ""
+      && listInFlightCommand !== appliedListingCommand
+    appliedListingCommand = listInFlightCommand
     if (changed) listingAboutToChange()
     if (parsed.root) {
       rootPath = String(parsed.root.path || rootPath)

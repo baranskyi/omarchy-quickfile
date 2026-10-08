@@ -421,8 +421,10 @@ under `$XDG_DATA_HOME/omarchy/quickfile/semantic/`, installs
 only the multilingual checkpoint pinned at
 [revision `1c5edc17a7acd8701df6fc341c0d179f1c62c982`][smart-model]. PyTorch's
 CPU build comes from `download.pytorch.org`, the other Python packages from
-PyPI, and the model weights from Hugging Face: about 1 GB to download and 1.8 GB
-on disk. The CPU build avoids several gigabytes of CUDA libraries and never
+PyPI. Installer temporary files stay in the private staging directory on the
+same filesystem as the model, avoiding limited space in `/tmp`.
+The model weights come from Hugging Face. Setup downloads about 1 GB and uses
+1.8 GB on disk after cleanup. The CPU build avoids several gigabytes of CUDA libraries and never
 wakes a discrete GPU. Once setup finishes, inference runs on the CPU with the
 model hub and Transformers in offline mode; the model loads in roughly 15–20
 seconds when SMART is first used and then answers in about 0.3–0.5 seconds. It

@@ -1910,6 +1910,61 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(package[-1], "laya==0.3.5")
         self.assertNotIn("--index-url", package)
 
+    def test_semantic_install_keeps_child_temp_files_private_and_cleans_them(self) -> None:
+        loader = importlib.machinery.SourceFileLoader(
+            "quickfile_semantic_temp_test", str(ROOT / "bin" / "quickfile-semantic"),
+        )
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        real_process = module.bounded_process
+        for fail in (False, True):
+            with self.subTest(fail=fail):
+                semantic_home = self.root / ("failure" if fail else "success") / "semantic"
+                calls = []
+
+                def fake_step(argv, timeout, *, env):
+                    temporary = Path(env["TMPDIR"])
+                    staging = temporary.parent
+                    self.assertEqual(staging.parent, semantic_home)
+                    self.assertEqual(env["TEMP"], str(temporary))
+                    self.assertEqual(env["TMP"], str(temporary))
+                    self.assertEqual(temporary.stat().st_mode & 0o777, 0o700)
+                    # Verify a real child uses this directory even when /tmp
+                    # or an inherited TMPDIR would normally be selected.
+                    code, error = real_process([
+                        sys.executable, "-c",
+                        "import os, tempfile; from pathlib import Path; "
+                        "assert tempfile.gettempdir() == os.environ['TMPDIR']; "
+                        "fd, path = tempfile.mkstemp(); os.close(fd); "
+                        "Path(path).write_text('wheel')",
+                    ], timeout=10, env=env)
+                    self.assertEqual((code, error), (0, ""))
+                    calls.append(argv)
+                    if fail:
+                        return 1, "simulated pip failure"
+                    python = staging / "venv" / "bin" / "python"
+                    python.parent.mkdir(parents=True, exist_ok=True)
+                    python.touch()
+                    model = staging / "model" / "multilingual"
+                    model.mkdir(parents=True, exist_ok=True)
+                    (model / "rl_agent_config.json").touch()
+                    (model / "model.safetensors").touch()
+                    return 0, ""
+
+                with mock.patch.dict(os.environ, {
+                    "QUICKFILE_SEMANTIC_HOME": str(semantic_home),
+                    "TMPDIR": "/nonexistent-inherited-temp",
+                }), mock.patch.object(module, "bounded_process", side_effect=fake_step), \
+                        mock.patch.object(module, "emit"):
+                    self.assertEqual(module.install_command(), 1 if fail else 0)
+                    self.assertEqual(module.status_payload()["installed"], not fail)
+                self.assertEqual(len(calls), 1 if fail else 4)
+                self.assertFalse(list(semantic_home.glob(".staging-*")))
+                self.assertFalse(list(semantic_home.glob("laya-*/.tmp")))
+                if fail:
+                    self.assertEqual(list(semantic_home.iterdir()), [])
+
     def test_semantic_helper_refuses_an_unsafe_data_root(self) -> None:
         unsafe_home = self.root / "unrelated-data"
         unsafe_home.mkdir()

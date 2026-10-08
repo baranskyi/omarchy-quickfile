@@ -171,13 +171,15 @@ def status_payload() -> dict[str, Any]:
     }
 
 
-def bounded_process(argv: list[str], timeout: float) -> tuple[int, str]:
+def bounded_process(
+    argv: list[str], timeout: float, *, env: dict[str, str] | None = None,
+) -> tuple[int, str]:
     """Run an installer child with fixed argv and a bounded stderr tail."""
     global ACTIVE_CHILD
     try:
         process = subprocess.Popen(
             argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE, start_new_session=True,
+            stderr=subprocess.PIPE, start_new_session=True, env=env,
         )
     except OSError as exc:
         return 127, str(exc)
@@ -278,10 +280,17 @@ def install_command() -> int:
     published = False
     try:
         staging.mkdir(mode=0o700)
+        # pip downloads and unpacks large wheels in its temporary directory.
+        # Keep those files on the model's filesystem, not a small /tmp tmpfs.
+        temporary = staging / ".tmp"
+        temporary.mkdir(mode=0o700)
+        install_env = {**os.environ, **{
+            key: str(temporary) for key in ("TMPDIR", "TEMP", "TMP")
+        }}
         venv = staging / "venv"
         emit({"event": "progress", "phase": "environment", "progress": 0.05})
         code, error = bounded_process(
-            [sys.executable, "-m", "venv", str(venv)], timeout=180,
+            [sys.executable, "-m", "venv", str(venv)], timeout=180, env=install_env,
         )
         if code != 0:
             raise RuntimeError(error or "Python could not create the isolated environment")
@@ -289,12 +298,12 @@ def install_command() -> int:
 
         runtime, package = dependency_commands(python)
         emit({"event": "progress", "phase": "runtime", "progress": 0.15})
-        code, error = bounded_process(runtime, timeout=INSTALL_TIMEOUT)
+        code, error = bounded_process(runtime, timeout=INSTALL_TIMEOUT, env=install_env)
         if code != 0:
             raise RuntimeError(error or "Could not install the PyTorch CPU runtime")
 
         emit({"event": "progress", "phase": "dependencies", "progress": 0.45})
-        code, error = bounded_process(package, timeout=INSTALL_TIMEOUT)
+        code, error = bounded_process(package, timeout=INSTALL_TIMEOUT, env=install_env)
         if code != 0:
             raise RuntimeError(error or "Could not install Laya dependencies")
 
@@ -303,7 +312,7 @@ def install_command() -> int:
         code, error = bounded_process([
             str(python), str(Path(__file__).resolve()), "_download",
             "--destination", str(model),
-        ], timeout=INSTALL_TIMEOUT)
+        ], timeout=INSTALL_TIMEOUT, env=install_env)
         if code != 0:
             raise RuntimeError(error or "Could not download the multilingual model")
 
@@ -315,6 +324,7 @@ def install_command() -> int:
         )
         if not all(path.is_file() for path in required):
             raise RuntimeError("The downloaded smart-search model is incomplete")
+        shutil.rmtree(temporary)
         os.replace(staging, destination)
         marker = {
             "version": INSTALL_MARKER_VERSION,

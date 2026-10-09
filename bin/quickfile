@@ -3268,14 +3268,16 @@ class SmartHeap:
     """The best rows a SMART search has been offered, at most `limit`."""
 
     def __init__(self, limit: int) -> None:
-        self.entries: list[tuple[float, int, dict[str, Any]]] = []
+        self.entries: list[tuple[float, Any, dict[str, Any]]] = []
         self.limit = limit
         self.truncated = False
 
-    def offer(self, entry: tuple[float, int, dict[str, Any]]) -> None:
+    def offer(self, entry: tuple[float, Any, dict[str, Any]]) -> None:
         # A full heap gives up the rows the typed words and hints rank
         # lowest — never because of a model hint — and between equals keeps
-        # the one found first, which is the shallower one.
+        # the one its second field ranks higher: for the walk the one found
+        # first, which is the shallower one, and for a catalog the one listed
+        # first (see CatalogTie).
         if self.limit <= 0:
             self.truncated = True
         elif len(self.entries) < self.limit:
@@ -3313,6 +3315,27 @@ class CatalogEntry:
 
     def stat(self, *, follow_symlinks: bool = True) -> CatalogStat:
         return self.details
+
+
+def catalog_rank(item: dict[str, Any]) -> tuple[Any, ...]:
+    """Where a catalogued SMART row is listed among those that score the same."""
+    return (item["depth"], item["relative"].casefold(), item["relative"],
+            item["catalog"][0]["volumeId"])
+
+
+class CatalogTie:
+    """A catalogued row's place among equals in a SmartHeap, which keeps the
+    one listed first. A catalog gives its rows in the order the drive's
+    folders listed them when it was indexed, which the filesystem decides,
+    so the order they are read in cannot say."""
+
+    __slots__ = ("rank",)
+
+    def __init__(self, item: dict[str, Any]) -> None:
+        self.rank = catalog_rank(item)
+
+    def __lt__(self, other: CatalogTie) -> bool:
+        return self.rank > other.rank
 
 
 def catalog_mode(is_dir: Any, is_link: Any) -> int:
@@ -4310,8 +4333,11 @@ def smart_search_command(args: argparse.Namespace, root: str, query: str) -> dic
         else:
             match = {"matchKind": "smart", "matchLine": 0, "matchSnippet": ""}
         item.update({"score": firm + model, "firm": firm, "reasons": reasons, "match": match})
-        serial += 1
-        (heap if pool is None else pool).offer((firm, -serial, item))
+        if pool is None:
+            serial += 1
+            heap.offer((firm, -serial, item))
+        else:
+            pool.offer((firm, CatalogTie(item), item))
 
     def defer(item: dict[str, Any]) -> bool:
         nonlocal truncated
@@ -4354,8 +4380,7 @@ def smart_search_command(args: argparse.Namespace, root: str, query: str) -> dic
             keep(item, {}, None, offline, offline_spelled)
         catalog["truncated"] = catalog["truncated"] or offline.truncated
         ranked = sorted((entry[2] for entry in offline.entries), key=lambda item: (
-            -item["score"], item["depth"], item["relative"].casefold(),
-            item["catalog"][0]["volumeId"]))
+            -item["score"], *catalog_rank(item)))
         for index, row in catalog_entry_rows(
                 [item["catalog"] for item in ranked], offline_deadline, catalog):
             item = ranked[index]

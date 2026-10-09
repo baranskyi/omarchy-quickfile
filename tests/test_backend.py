@@ -1216,30 +1216,46 @@ class BackendTests(unittest.TestCase):
     def test_live_rows_come_first_and_each_side_keeps_its_own_cap(self) -> None:
         drive = self.drive()
         (drive / "Photos" / "beach-2.jpg").write_bytes(b"j")
-        self.index_drive(drive)
         local = self.elsewhere()
         for name in ("beach-a.txt", "beach-b.txt", "beach-c.txt"):
             (local / name).write_text("", encoding="utf-8")
-        for mode in ("contains", "smart"):
-            with self.subTest(mode=mode):
-                result = self.search(local, "beach", mode, limit=2)
-                origins = [row.get("origin", "live") for row in result["entries"]]
-                # The walk's cap holds its own rows to two and says so; the
-                # catalog's rows come after them, all of them.
-                self.assertEqual(origins, ["live", "live", "catalog", "catalog"])
-                self.assertTrue(result["truncated"])
-                self.assertFalse(result["catalog"]["truncated"])
-                self.assertEqual(result["catalog"]["offlineMatches"], 2)
-                with mock.patch.object(quickfile, "CATALOG_RESULT_LIMIT", 1):
-                    capped = self.search(local, "beach", mode)
-                origins = [row.get("origin", "live") for row in capped["entries"]]
-                self.assertEqual(origins, ["live", "live", "live", "catalog"])
-                self.assertTrue(capped["catalog"]["truncated"])
-                self.assertTrue(capped["truncated"])
-                self.assertEqual(capped["catalog"]["offlineMatches"], 1)
-                # The best of them is the one kept.
-                self.assertEqual(capped["entries"][-1]["relativePath"],
-                                 result["entries"][2]["relativePath"])
+        real_scandir = os.scandir
+
+        @contextlib.contextmanager
+        def reversed_scandir(target):
+            with real_scandir(target) as iterator:
+                yield reversed(list(iterator))
+
+        # A catalog holds a drive's rows in the order its folders listed
+        # them, which is the filesystem's: beach.jpg and beach-2.jpg score
+        # the same, and whichever was read first, the one kept is the one
+        # listed first.
+        read = []
+        for order, listing in (("listed", real_scandir), ("reversed", reversed_scandir)):
+            with mock.patch.object(quickfile.os, "scandir", listing):
+                self.index_drive(drive)
+            read.append([rel for rel in self.catalog_rows() if rel.startswith(b"Photos/beach")])
+            for mode in ("contains", "smart"):
+                with self.subTest(order=order, mode=mode):
+                    result = self.search(local, "beach", mode, limit=2)
+                    origins = [row.get("origin", "live") for row in result["entries"]]
+                    # The walk's cap holds its own rows to two and says so; the
+                    # catalog's rows come after them, all of them.
+                    self.assertEqual(origins, ["live", "live", "catalog", "catalog"])
+                    self.assertTrue(result["truncated"])
+                    self.assertFalse(result["catalog"]["truncated"])
+                    self.assertEqual(result["catalog"]["offlineMatches"], 2)
+                    with mock.patch.object(quickfile, "CATALOG_RESULT_LIMIT", 1):
+                        capped = self.search(local, "beach", mode)
+                    origins = [row.get("origin", "live") for row in capped["entries"]]
+                    self.assertEqual(origins, ["live", "live", "live", "catalog"])
+                    self.assertTrue(capped["catalog"]["truncated"])
+                    self.assertTrue(capped["truncated"])
+                    self.assertEqual(capped["catalog"]["offlineMatches"], 1)
+                    # The best of them is the one kept.
+                    self.assertEqual(capped["entries"][-1]["relativePath"],
+                                     result["entries"][2]["relativePath"])
+        self.assertEqual(read[1], read[0][::-1])
 
     def test_a_drive_mounted_around_the_root_is_left_to_the_walk(self) -> None:
         drive = self.drive()

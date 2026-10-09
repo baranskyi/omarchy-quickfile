@@ -3077,6 +3077,10 @@ class BackendTests(unittest.TestCase):
                     self.assertEqual(self.smart_names(root, query), expected)
 
     def test_smart_model_hints_never_decide_which_lines_are_read(self) -> None:
+        # rg lists both files whatever the budget, which then covers the line
+        # of one; without rg the budget decides which files are found at all.
+        if shutil.which("rg") is None:
+            self.skipTest("rg is not installed")
         root = self.corpus({"a.txt": "the zebra lives here\n", "b.txt": "the zebra lives here\n"})
         long_ago = quickfile.time.time() - 400 * 86400
         os.utime(root / "a.txt", (long_ago, long_ago))
@@ -3088,6 +3092,24 @@ class BackendTests(unittest.TestCase):
         plain = lines(None)
         self.assertEqual(sorted(plain.values()), [0, 1])
         self.assertEqual(lines(self.laya_plan("zebra", time=("today", 0.9))), plain)
+
+    def test_smart_model_hints_never_decide_which_files_python_reads(self) -> None:
+        text = "the zebra lives here\n"
+        root = self.corpus({"a.txt": text, "sub/b.txt": text})
+        long_ago = quickfile.time.time() - 400 * 86400
+        os.utime(root / "a.txt", (long_ago, long_ago))
+
+        def lines(plan: dict | None) -> tuple[dict[str, int], bool]:
+            result = self.smart_search(root, "zebra", plan=plan, content_byte_limit=30)
+            found = {row["relativePath"]: row["matchLine"] for row in result["entries"]}
+            return found, result["truncated"]
+
+        # Without rg the budget covers the shallower file though the hint
+        # favours the other, which goes unsearched, and the result says so.
+        with mock.patch.object(quickfile.shutil, "which", return_value=None):
+            self.assertEqual(lines(None), ({"a.txt": 1}, True))
+            hinted = self.laya_plan("zebra", time=("today", 0.9))
+            self.assertEqual(lines(hinted), ({"a.txt": 1}, True))
 
     def test_smart_a_read_the_deadline_cut_short_marks_the_result(self) -> None:
         root = self.corpus({"notes.txt": "the zebra lives here\n"})

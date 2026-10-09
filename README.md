@@ -600,7 +600,8 @@ The QML harness runs isolated offscreen service and UI regression checks against
 the plugin exactly as shipped — there is no test-only window adapter to keep in
 step with the panel. Compositor placement and focus still need a live Omarchy
 check. GitHub Actions runs backend and native watcher tests on pushes and pull
-requests.
+requests, with ripgrep installed; tests of the ripgrep content path skip where
+`rg` is missing, and the Python fallback is tested with it hidden.
 
 ## Architecture
 

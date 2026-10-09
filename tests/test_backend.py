@@ -339,6 +339,17 @@ class BackendTests(unittest.TestCase):
         process = subprocess.Popen(
             [sys.executable, "-c", "import time; time.sleep(60)", "catalog-index"])
         try:
+            # Popen returns once exec begins, before the kernel has set up the
+            # new argv: until then /proc/<pid>/cmdline reads empty and the
+            # backend would rightly see no indexer.
+            deadline = time.monotonic() + 5
+            while True:
+                with open(f"/proc/{process.pid}/cmdline", "rb") as stream:
+                    if b"catalog-index" in stream.read().split(b"\0"):
+                        break
+                if time.monotonic() > deadline:
+                    self.fail("the stand-in indexer never showed its command line")
+                time.sleep(0.005)
             yield process.pid
         finally:
             process.kill()

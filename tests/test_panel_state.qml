@@ -1,6 +1,7 @@
 import QtQuick
 import QtTest
 import Quickshell
+import qs.Commons
 import "plugin" as Quickfile
 import "plugin/components/plaintext.js" as PlainText
 
@@ -110,6 +111,17 @@ ShellRoot {
     function forgetCatalog(volumeId) { forgottenCatalogs.push(String(volumeId)); return true }
     function unmountVolume(volume) { unmountedDevices.push(String(volume.device || "")); return true }
     function openVolume(volume) { openedVolumes.push(String(volume.id || "")); return true }
+    // An offline row asks for a fresh drive list and may mount; settings
+    // saves would reach the backend.
+    property int volumeReloads: 0
+    property var volumeActionRequests: []
+    property int settingsSaves: 0
+    function reloadVolumes() { volumeReloads++; return true }
+    function runVolumeAction(kind, volume, navigateAfter) {
+      volumeActionRequests.push(kind + ":" + String(volume.device || ""))
+      return true
+    }
+    function persistSettings() { settingsSaves++; return true }
   }
 
   Quickfile.Panel {
@@ -1336,6 +1348,278 @@ ShellRoot {
     fixture.applyModuleCollapseFlags()
   }
 
+  // A search row from the catalog of OLD DRIVE, which is away.
+  function catalogEntry(name, extra) {
+    var relative = "Photos/" + name
+    var token = "catalog:dXVpZDpPRkY:" + relative.replace(/[^A-Za-z0-9]/g, "_")
+    return Object.assign(entry(token, ""), { name: name, path: "OLD DRIVE:/" + relative,
+      relativePath: relative, uri: "", shellQuotedPath: "", kind: "file", mime: "image/jpeg",
+      size: 2048, sizeText: "2.0 KiB", matchKind: "name", origin: "catalog", available: false,
+      catalogToken: token, volumeId: "uuid:OFF", volumeName: "OLD DRIVE", volumeModel: "Stick",
+      volumeSizeText: "2 TB", volumeState: "disconnected", indexedAt: "2026-10-09T08:00:00",
+      indexedEpoch: Date.now() / 1000 - 2 * 3600, catalogState: "complete" }, extra || ({}))
+  }
+
+  function propertyValue(rows, label) {
+    for (var i = 0; i < rows.length; i++) if (rows[i].label === label) return String(rows[i].value)
+    return null
+  }
+
+  property var offlineSaved: null
+  property var offlinePulses: []
+  property var offlineRevealItem: null
+
+  function offlineSearchChecks() {
+    offlineSaved = { rows: fixture.entries.slice(), query: fixture.query,
+      message: fixture.actionMessage, tab: fixture.inspectorTab }
+
+    // One switch in the settings, worded like the AI Sessions opt-in.
+    var settingsPopup = objectFinder.findChild(panel, "quickfileModuleSettings")
+    settingsPopup.open()
+    var caption = objectFinder.findChild(panel, "quickfileOfflineSearchCaption")
+    var toggleMouse = objectFinder.findChild(panel, "quickfileOfflineSearchToggleMouse")
+    check(caption !== null && toggleMouse !== null, "the offline-search switch was not rendered")
+    check(caption.text === "2 drives indexed · 41.3k files",
+      "the offline-search switch did not count the indexed drives: " + caption.text)
+    var volumesBefore = fixture.volumes
+    fixture.volumes = []
+    check(caption.text === "Names, paths, sizes and dates only · stored privately",
+      "the offline-search switch did not say what a catalog holds: " + caption.text)
+    fixture.volumes = volumesBefore
+    fixture.settingsLoaded = true
+    fixture.query = ""
+    var saves = fixture.settingsSaves
+    toggleMouse.clicked(null)
+    check(!fixture.offlineSearchEnabled && fixture.settingsSaves === saves + 1,
+      "the offline-search switch did not turn offline rows off")
+    toggleMouse.clicked(null)
+    check(fixture.offlineSearchEnabled && fixture.settingsSaves === saves + 2,
+      "the offline-search switch did not turn offline rows back on")
+    settingsPopup.close()
+
+    // A live row, two rows on a drive that is away, one on a drive that is here.
+    var live = entry("beach-notes.txt", "")
+    live.matchKind = "name"
+    live.starred = true
+    var away = catalogEntry("beach.jpg", { starred: true })
+    var locked = catalogEntry("beach-2.jpg", { volumeState: "locked", catalogState: "partial" })
+    var here = catalogEntry("beach-3.jpg", { available: true, volumeState: "mounted",
+      token: "real-beach-3", path: "/run/media/test/ARCHIVE/Photos/beach-3.jpg",
+      volumeId: "uuid:A1", volumeName: "ARCHIVE", volumeSizeText: "64 GB" })
+    var rows = [live, away, locked, here]
+    fixture.query = "beach"
+    fixture.actionMessage = ""
+    fixture.clearSelection()
+    fixture.listingAboutToChange()
+    fixture.reconcileRows(fixture.entriesModel, fixture.entries, rows)
+    fixture.entries = rows
+    fixture.offlineMatchCount = 2
+    fixture.modelChanged()
+    fileView.forceLayout()
+    fileView.positionViewAtBeginning()
+    fileView.forceLayout()
+    var liveItem = fileView.itemAtIndex(0)
+    var awayItem = fileView.itemAtIndex(1)
+    var lockedItem = fileView.itemAtIndex(2)
+    var hereItem = fileView.itemAtIndex(3)
+    check(liveItem !== null && awayItem !== null && lockedItem !== null && hereItem !== null,
+      "the catalog rows were not realised")
+    check(liveItem.height === Style.space(29) && awayItem.height === Style.space(44)
+        && hereItem.height === Style.space(44),
+      "a catalog row did not make room for its drive line: " + awayItem.height)
+
+    function child(item, name) { return objectFinder.findChild(item, name) }
+    check(child(awayItem, "quickfileFileIcon").opacity === 0.55
+        && child(awayItem, "quickfileFileNameLabel").opacity === 0.58
+        && child(awayItem, "quickfileFileSizeBadge").opacity === 0.58,
+      "an offline row was not dimmed like a hidden file")
+    check(child(awayItem, "quickfileMatchBadge").visible
+        && child(awayItem, "quickfileMatchBadgeText").text === "OFFLINE"
+        && String(child(awayItem, "quickfileMatchBadgeText").color) === String(panel.muted),
+      "an offline row did not wear the muted OFFLINE pill")
+    check(child(awayItem, "quickfileRowDetail").visible
+        && child(awayItem, "quickfileRowDetail").text === "󰋊  OLD DRIVE · 2 TB · not connected",
+      "an offline row did not name its drive: " + child(awayItem, "quickfileRowDetail").text)
+    check(child(lockedItem, "quickfileRowDetail").text
+        === "󰋊  OLD DRIVE · 2 TB · locked · may be incomplete",
+      "a row on a locked, partly indexed drive did not say so: "
+        + child(lockedItem, "quickfileRowDetail").text)
+    check(child(liveItem, "quickfileRowStar").visible && !child(awayItem, "quickfileRowStar").visible,
+      "an offline row offered its star")
+    check(child(awayItem, "quickfileDirectoryDropTarget").destinationEntry === null
+        && child(hereItem, "quickfileDirectoryDropTarget").destinationEntry !== null,
+      "an offline row accepted drops")
+    check(Object.keys(panel.dragMimeData(away)).length === 0,
+      "an offline row could be dragged out")
+    check(child(hereItem, "quickfileRowDetail").text === "󰋊  ARCHIVE · 64 GB · connected"
+        && child(hereItem, "quickfileMatchBadgeText").text === "NAME"
+        && child(hereItem, "quickfileFileIcon").opacity === 0.9,
+      "a catalog row on a connected drive did not read as a normal row with its drive")
+    var footer = objectFinder.findChild(panel, "quickfileFooterStatus")
+    check(footer.text === "4 items · 2 offline",
+      "the footer did not count the offline matches: " + footer.text)
+
+    // The inspector shows what the catalog knows, and offers nothing to do.
+    panel.keyboardIndex = 1
+    select(away)
+    fixture.selectedProperties = fixture.offlineProperties(away)
+    check(fixture.selectedOffline, "an offline selection was not recognised")
+    var properties = panel.propertyRows()
+    check(propertyValue(properties, "Drive") === "OLD DRIVE · Stick · 2 TB"
+        && propertyValue(properties, "Path on drive") === "/Photos/beach.jpg"
+        && propertyValue(properties, "Indexed") === "2h ago"
+        && propertyValue(properties, "Catalog") === "Complete"
+        && propertyValue(properties, "Status") === "Not connected · plug in to open"
+        && propertyValue(properties, "Owner") === null,
+      "the inspector did not show the catalog's view: " + JSON.stringify(properties))
+    check(panel.gitRows().length === 0, "an offline file borrowed the folder's Git status")
+    fixture.inspectorTab = "notes"
+    panel.inspectorOpen = true
+    check(!objectFinder.findChild(panel, "quickfileNotesTab").visible
+        && !objectFinder.findChild(panel, "quickfileNoteEditor").visible
+        && objectFinder.findChild(panel, "quickfileOfflineNotes").visible,
+      "the Notes editor was offered for a file on a drive that is away")
+    fixture.inspectorTab = "properties"
+    panel.inspectorOpen = false
+
+    // Keys that would act on it only say where it is.
+    var hint = "Connect “OLD DRIVE” to open beach.jpg"
+    check(panel.handleTrashShortcut(Qt.Key_Delete) && panel.editorMode === ""
+        && fixture.actionMessage === hint, "Delete on an offline row asked to trash it")
+    fixture.actionMessage = ""
+    check(panel.handleLetterShortcut(Qt.Key_R, Qt.NoModifier) && panel.editorMode === ""
+        && fixture.actionMessage === hint, "R on an offline row opened the rename sheet")
+    fixture.actionMessage = ""
+    var reloads = fixture.volumeReloads
+    check(!panel.previewHoveredOrSelected(false) && !panel.inlinePreviewOpen
+        && fixture.actionMessage === hint && fixture.volumeReloads === reloads + 1,
+      "Space on an offline row opened a preview: " + fixture.actionMessage)
+    fixture.actionMessage = ""
+    fixture.activateIndex(1)
+    check(fixture.actionMessage === hint && fixture.volumeActionRequests.length === 0
+        && fixture.lastOfflineRequest && fixture.lastOfflineRequest.catalogToken === away.catalogToken,
+      "Enter on an offline row did not say which drive to connect: " + fixture.actionMessage)
+
+    // The hint is shown over a clipboard that is still holding a copy, until
+    // something newer is said.
+    fixture.clipboardMode = "copy"
+    fixture.clipboardName = "notes.txt"
+    fixture.clipboardToken = "notes-token"
+    check(footer.text === "Copy: notes.txt",
+      "the standing clipboard line was not shown: " + footer.text)
+    fixture.activateIndex(1)
+    check(footer.text === hint, "an offline hint was hidden behind the clipboard: " + footer.text)
+    fixture.actionMessage = "Saved"
+    check(footer.text === "Copy: notes.txt",
+      "an ordinary message took the clipboard's place: " + footer.text)
+    fixture.clipboardToken = ""
+    fixture.actionMessage = ""
+
+    // A mixed selection: the buttons act on its live rows, as the keys do,
+    // and the trash sheet says what stays.
+    fixture.selectedTokens = [live.token, away.token]
+    var copyButton = objectFinder.findChild(panel, "quickfileFooterCopy")
+    var trashButton = objectFinder.findChild(panel, "quickfileFooterTrash")
+    check(copyButton.available && trashButton.available,
+      "the footer refused a mixed selection whose primary row is offline")
+    check(panel.trashSummary()
+        === "“beach-notes.txt” can be restored from Trash. 1 offline item stays where it is.",
+      "the trash sheet did not say the offline row stays: " + panel.trashSummary())
+    fixture.selectedTokens = [away.token]
+    check(!copyButton.available && !trashButton.available,
+      "the footer offered to copy or trash an offline row alone")
+
+    // An open sheet or an unsaved draft holds the selection against a reveal.
+    check(!fixture.selectionHeld, "the selection was held with nothing open")
+    panel.editorMode = "rename"
+    check(fixture.selectionHeld, "an open sheet did not hold the selection")
+    panel.editorMode = ""
+    panel.noteDraft = panel.noteBaseline + "draft"
+    check(fixture.selectionHeld, "an unsaved note did not hold the selection")
+    panel.noteDraft = panel.noteBaseline
+    check(!fixture.selectionHeld, "the selection stayed held once nothing was open")
+
+    // The drive arrives: the row comes alive in place under a still viewport.
+    var viewportBefore = fileView.contentY
+    var alive = Object.assign({}, away, { available: true, volumeState: "mounted",
+      token: "real-beach", path: "/run/media/test/OLD/Photos/beach.jpg" })
+    var nextRows = [live, alive, locked, here]
+    fixture.listingAboutToChange()
+    fixture.reconcileRows(fixture.entriesModel, fixture.entries, nextRows)
+    fixture.entries = nextRows
+    fixture.offlineMatchCount = 1
+    fixture.modelChanged()
+    fileView.forceLayout()
+    check(fileView.itemAtIndex(1) === awayItem && fileView.count === 4
+        && Math.abs(fileView.contentY - viewportBefore) < 1,
+      "the row that came alive rebuilt its delegate or moved the viewport")
+    check(child(awayItem, "quickfileMatchBadgeText").text === "NAME"
+        && child(awayItem, "quickfileRowDetail").text.indexOf("· connected") > 0
+        && child(awayItem, "quickfileFileIcon").opacity === 0.9,
+      "the row that came alive still read as offline")
+    fixture.actionMessage = ""
+    check(footer.text === "4 items · 1 offline", "the offline count did not follow: " + footer.text)
+
+    // The service reveals it: the cursor lands on it and it marks itself.
+    panel.keyboardIndex = 0
+    offlinePulses = []
+    offlineRevealItem = awayItem
+    panel.rowPulseRequested.connect(recordOfflinePulse)
+    fixture.revealRequested("real-beach")
+    check(panel.keyboardIndex === 1 && fixture.selectedToken === "real-beach",
+      "a revealed row did not take the cursor and the selection")
+  }
+
+  function recordOfflinePulse(token) { offlinePulses.push(token) }
+
+  function offlineRevealChecks() {
+    panel.rowPulseRequested.disconnect(recordOfflinePulse)
+    // Earlier checks parked pulses of their own; the reveal's is the last word.
+    check(offlinePulses[offlinePulses.length - 1] === "real-beach"
+        && objectFinder.findChild(offlineRevealItem, "quickfileRowPulse").active,
+      "a revealed row did not mark itself: " + offlinePulses)
+
+    // A row the listing gave a new token and key keeps the cursor wherever
+    // it lands, as when a drive the walk listed is unplugged.
+    var first = entry("first.txt", "")
+    var other = entry("other.txt", "")
+    var walkedRow = entry("walk-photo", "")
+    var walkedRows = [first, walkedRow, other]
+    fixture.listingAboutToChange()
+    fixture.reconcileRows(fixture.entriesModel, fixture.entries, walkedRows)
+    fixture.entries = walkedRows
+    fixture.modelChanged()
+    select(walkedRow)
+    panel.keyboardIndex = 1
+    var unplugged = catalogEntry("beach.jpg")
+    var unpluggedRows = [first, other, unplugged]
+    fixture.listingAboutToChange()
+    fixture.reconcileRows(fixture.entriesModel, fixture.entries, unpluggedRows)
+    fixture.entries = unpluggedRows
+    fixture.listingTokenMoves = { "walk-photo": unplugged.token }
+    select(unplugged)
+    fixture.modelChanged()
+    check(panel.keyboardIndex === 2,
+      "the cursor did not follow a walked row to its catalog row: " + panel.keyboardIndex)
+    fixture.listingTokenMoves = ({})
+    // Mounted, but not read in time: listed from the catalog, its drive here.
+    check(panel.catalogRowDetail(catalogEntry("late.jpg", { volumeState: "mounted" }))
+        === "󰋊  OLD DRIVE · 2 TB · connected",
+      "a row on a mounted drive that was not read in time read as not connected")
+    var saved = offlineSaved
+    fixture.listingAboutToChange()
+    fixture.reconcileRows(fixture.entriesModel, fixture.entries, saved.rows)
+    fixture.entries = saved.rows
+    fixture.offlineMatchCount = 0
+    fixture.query = saved.query
+    fixture.actionMessage = saved.message
+    fixture.inspectorTab = saved.tab
+    fixture.lastOfflineRequest = null
+    fixture.clearSelection()
+    fixture.modelChanged()
+    fileView.forceLayout()
+  }
+
   function prepareViewport() {
     var rows = []
     for (var i = 0; i < 80; i++) {
@@ -1777,6 +2061,23 @@ ShellRoot {
         testRoot.focusPulseChecks()
         testRoot.shortcutChecks()
         testRoot.devicesChecks()
+        testRoot.offlineSearchChecks()
+        // The revealed row marks itself once the view has scrolled to it.
+        offlineRevealTimer.start()
+        return
+      } catch (error) {
+        console.error("QUICKFILE_TESTS_FAILED panel-state: " + error + "\n" + error.stack)
+      }
+      Qt.quit()
+    }
+  }
+
+  Timer {
+    id: offlineRevealTimer
+    interval: 50
+    onTriggered: {
+      try {
+        testRoot.offlineRevealChecks()
         if (testRoot.captureIfRequested()) return
         console.log("QUICKFILE_TESTS_PASSED panel-state " + testRoot.assertions + " assertions")
       } catch (error) {

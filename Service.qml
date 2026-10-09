@@ -192,6 +192,40 @@ Item {
   readonly property bool catalogForgetBusy: catalogForgetProcess.running
   property string catalogForgetStdout: ""
   property string catalogForgetStderr: ""
+  // Every search also lists matches from the catalogs of drives that are
+  // away, after the live rows. One switch turns them off; DEVICES keeps its
+  // offline drives either way.
+  property bool offlineSearchEnabled: true
+  property var catalogResult: null
+  // Search rows on drives that are away, not the drives (offlineVolumeCount).
+  property int offlineMatchCount: 0
+  // The offline row the user last tried to open. When its drive arrives the
+  // row is selected and announced, never opened: a drive that turns up later
+  // is the desktop's to mount.
+  property var lastOfflineRequest: null
+  readonly property bool selectedOffline: isOfflineEntry(selectedEntry)
+    || isCatalogToken(selectedToken)
+  // The presence of every catalogued drive, so a plug, unplug, mount or
+  // unlock refreshes the offline rows of a search that is on screen.
+  property string catalogPresenceKey: ""
+  // Where each catalogued drive was last mounted: a row the walk listed on
+  // it is still known for the same file once the drive is gone.
+  property var catalogMountPaths: ({})
+  // The panel holds the selection still while a sheet is open or a draft is
+  // unsaved; the reveal of an offline row waits for it to let go.
+  property bool selectionHeld: false
+  // Old token → new token for the rows the last listing gave a new token,
+  // for the panel's keyboard cursor to follow them.
+  property var listingTokenMoves: ({})
+  // The full search whose catalog rows are on screen, and the drives it saw:
+  // a refresh for a file event asks the walk alone while both still hold.
+  property string catalogRowsCommand: ""
+  property string catalogRowsPresence: ""
+  property bool listInFlightReusesCatalog: false
+  property bool reloadPendingCatalog: false
+  // A message the user's own action asked for: the footer shows it over the
+  // standing clipboard line until anything newer is said or copied.
+  property bool actionNoticeFresh: false
   property string query: ""
   // Plain-language search is the default; without its optional model it
   // still ranks the typed keywords, and a one-time tip offers the model.
@@ -300,6 +334,8 @@ Item {
   property string volumeActionKind: ""
   property string volumeActionDevice: ""
   property string volumeActionMountPath: ""
+  // A mount asked for by an offline row keeps the search on screen.
+  property bool volumeActionNavigate: true
   property string knowledgeStdout: ""
   property string knowledgeStderr: ""
   property string knowledgeLinkStdout: ""
@@ -316,6 +352,17 @@ Item {
   signal actionFinished(string kind, bool ok, string message)
   signal knowledgeLinksFinished(bool ok, bool applied, string message)
   signal conflictRequested(var conflicts)
+  // The offline row the user asked for has come alive under this token.
+  signal revealRequested(string token)
+
+  onActionMessageChanged: actionNoticeFresh = false
+  onClipboardTokenChanged: actionNoticeFresh = false
+  onSelectionHeldChanged: if (!selectionHeld) Qt.callLater(root.revealRequestedEntry)
+
+  function announce(text) {
+    actionMessage = String(text || "")
+    actionNoticeFresh = actionMessage !== ""
+  }
 
   function setPanelVisible(value) {
     if (panelVisible === (value === true)) return
@@ -489,9 +536,12 @@ Item {
   }
 
   // Drive rows carry an id that survives unplug, replug and unlock, so one
-  // delegate follows the drive instead of whichever /dev node it got.
+  // delegate follows the drive instead of whichever /dev node it got. A
+  // search row from a drive catalog is keyed the same way: its token turns
+  // real when the drive is plugged in, its catalog token stays.
   function rowKey(row) {
-    return String(row.token || row.id || row.device || row.sessionKey || "")
+    return String(row.catalogToken || row.token || row.id || row.device
+      || row.sessionKey || "")
   }
 
   function reconcileRows(model, previous, next) {
@@ -836,7 +886,9 @@ Item {
     return false
   }
 
-  function buildListCommand() {
+  // Without the catalogs when switched off, or when withoutCatalog keeps the
+  // catalog rows already on screen (catalogReusable).
+  function buildListCommand(withoutCatalog) {
     var trimmed = String(query || "").trim()
     var command = ["/usr/bin/env", "python3", cliPath,
       trimmed === "" ? "tree" : "search"]
@@ -860,17 +912,31 @@ Item {
         command.push(JSON.stringify(semanticPlan))
       }
       if (caseSensitive) command.push("--case-sensitive")
+      if (!offlineSearchEnabled || withoutCatalog === true) command.push("--no-catalog")
     }
     return command
   }
 
-  function reload(background) {
+  // What the catalogs answer changes only with the query, its flags, the
+  // drives or a catalog itself (each of which searches in full), never with
+  // a file event, so the refresh for one can keep the catalog rows on screen.
+  function catalogReusable() {
+    return offlineSearchEnabled && catalogResult !== null && catalogRowsCommand !== ""
+      && catalogRowsCommand === JSON.stringify(buildListCommand())
+      && catalogRowsPresence === catalogPresenceKey
+  }
+
+  // reuseCatalog: a background refresh that asks the walk alone while the
+  // catalog rows on screen still answer the search.
+  function reload(background, reuseCatalog) {
     var silent = background === true
+    var reuse = silent && reuseCatalog === true
     if (silent && !panelVisible) return false
     if (!silent) foregroundListingPending = true
     if (listingProcess.running) {
       reloadPending = true
       reloadPendingForeground = reloadPendingForeground || !silent
+      reloadPendingCatalog = reloadPendingCatalog || !reuse
       return false
     }
     listStdout = ""
@@ -880,15 +946,16 @@ Item {
     listInFlightRootPath = rootPath
     listInFlightBackground = silent
     listInFlightRevision = metadataRevision
-    listingProcess.command = buildListCommand()
+    listInFlightReusesCatalog = reuse && catalogReusable()
+    listingProcess.command = buildListCommand(listInFlightReusesCatalog)
     listInFlightCommand = JSON.stringify(listingProcess.command)
     listingRequests++
     listingProcess.running = true
     return true
   }
 
-  function refreshAll(background) {
-    var listingStarted = reload(background === true)
+  function refreshAll(background, reuseCatalog) {
+    var listingStarted = reload(background === true, reuseCatalog === true)
     var knowledgeStarted = reloadKnowledge()
     var volumesStarted = reloadVolumes()
     return listingStarted || knowledgeStarted || volumesStarted
@@ -1014,6 +1081,12 @@ Item {
     var storedFormat = String(parsed.settings.dateFormat || "")
     if (dateFormats.indexOf(storedFormat) >= 0) dateFormat = storedFormat
     smartOnboardingDone = parsed.settings.smartOnboardingDone === true
+    // On unless switched off: a store written before the switch existed has no key.
+    var storedOffline = parsed.settings.offlineSearchEnabled !== false
+    if (storedOffline !== offlineSearchEnabled) {
+      offlineSearchEnabled = storedOffline
+      if (String(query || "").trim() !== "") Qt.callLater(function() { root.reload() })
+    }
     applyModuleCollapseFlags()
     settingsLoaded = true
     settingsError = ""
@@ -1031,14 +1104,29 @@ Item {
     settingsStdout = ""
     settingsStderr = ""
     settingsError = ""
-    settingsSaveProcess.command = ["/usr/bin/env", "python3", cliPath, "settings",
+    settingsSaveProcess.command = buildSettingsCommand()
+    settingsSaveProcess.running = true
+    return true
+  }
+
+  // Every setting on every save: the store is replaced whole.
+  function buildSettingsCommand() {
+    return ["/usr/bin/env", "python3", cliPath, "settings",
       "--active-sessions", activeSessionsEnabled ? "true" : "false",
       "--inspector-tab", inspectorTab,
       "--sort-order", sortOrder,
       "--date-format", dateFormat,
       "--smart-onboarding-done", smartOnboardingDone ? "true" : "false",
+      "--offline-search", offlineSearchEnabled ? "true" : "false",
       "--module-layout-json", JSON.stringify(moduleLayout)]
-    settingsSaveProcess.running = true
+  }
+
+  function setOfflineSearchEnabled(enabled) {
+    var value = enabled === true
+    if (!settingsLoaded || offlineSearchEnabled === value) return false
+    offlineSearchEnabled = value
+    persistSettings()
+    if (String(query || "").trim() !== "") reload()
     return true
   }
 
@@ -1148,12 +1236,58 @@ Item {
       ? reportedOffline : offline
     volumesError = ""
     if (volumesSnapshotReady && changed) queueRemountedCatalogs(previousVolumes, nextVolumes)
+    // A drive arriving, leaving, mounting or unlocking changes what its search
+    // rows say and whether they open. The first snapshot only sets the
+    // baseline: the search on screen already looked for itself.
+    var presence = catalogPresence(nextVolumes)
+    if (volumesSnapshotReady && presence !== catalogPresenceKey
+        && String(query || "").trim() !== "") scheduleSearchRefresh()
+    catalogPresenceKey = presence
+    rememberCatalogMounts(nextVolumes)
+    // An offline row's inspector says where its drive is now, before the
+    // search catches up.
+    if (isCatalogToken(selectedToken)) inspect(selectedToken)
     volumesSnapshotReady = true
     // A queued drive held back by its mount or unmount goes once the
     // snapshot that follows the action says what became of it.
     startNextAutoIndex()
     return true
   }
+
+  // Kept past an unplug, replaced by the next mount.
+  function rememberCatalogMounts(rows) {
+    var next = Object.assign({}, catalogMountPaths)
+    for (var i = 0; i < rows.length; i++) {
+      var id = String(rows[i].catalogVolumeId || "")
+      if (id !== "" && rows[i].mounted === true && String(rows[i].mountPath || "") !== "")
+        next[id] = String(rows[i].mountPath)
+    }
+    if (!sameData(catalogMountPaths, next)) catalogMountPaths = next
+  }
+
+  // A connected catalogued drive and how it is reachable; a drive that is
+  // away has no entry, which is its own state.
+  function catalogPresence(rows) {
+    var states = []
+    for (var i = 0; i < rows.length; i++) {
+      var row = rows[i]
+      var id = String(row.catalogVolumeId || "")
+      if (id === "" || row.catalogued !== true || row.offline === true) continue
+      states.push(id + "=" + (row.locked === true ? "locked"
+        : row.mounted === true ? "mounted" : "unmounted"))
+    }
+    return states.sort().join("\n")
+  }
+
+  // The one place a drive change refreshes the search, in the background so
+  // the rows change in place under a still viewport and selection. Several
+  // changes in one turn coalesce into one listing.
+  function scheduleSearchRefresh() {
+    Qt.callLater(root.reloadInBackground)
+    return true
+  }
+
+  function reloadInBackground() { return reload(true) }
 
   function volumeForCatalogId(volumeId) {
     var id = String(volumeId || "")
@@ -1359,6 +1493,8 @@ Item {
     }
     actionFinished("catalog-index", ok, message)
     Qt.callLater(root.reloadVolumes)
+    // A search on screen may have rows in the catalog just replaced.
+    if (ok && String(query || "").trim() !== "") scheduleSearchRefresh()
     if (parkedDevice !== "") {
       var parked = volumeForDevice(parkedDevice)
       if (parked) unmountVolume(parked)
@@ -1401,6 +1537,12 @@ Item {
     actionMessage = message
     actionFinished("catalog-forget", ok, message)
     Qt.callLater(root.reloadVolumes)
+    if (ok) {
+      // Its rows on screen are of a catalog that no longer exists, and the
+      // drive list will not say so: an offline drive leaves no presence.
+      if (lastOfflineRequest && lastOfflineRequest.volumeId === id) lastOfflineRequest = null
+      if (String(query || "").trim() !== "") scheduleSearchRefresh()
+    }
   }
 
   function pathInsideMount(path, mountPath) {
@@ -1417,11 +1559,11 @@ Item {
     // two same-named drives apart, which the row already shows.
     var name = String(volume.label || volume.name || "this drive")
     if (volume.offline === true) {
-      actionMessage = "Connect “" + name + "” to browse it"
+      announce("Connect “" + name + "” to browse it")
       return false
     }
     if (volume.locked === true) {
-      actionMessage = "Unlock “" + name + "” to browse it"
+      announce("Unlock “" + name + "” to browse it")
       return false
     }
     if (volumeActionProcess.running) return false
@@ -1445,11 +1587,13 @@ Item {
     return runVolumeAction("unmount", volume)
   }
 
-  function runVolumeAction(kind, volume) {
+  // A mount opens the drive unless navigateAfter is false.
+  function runVolumeAction(kind, volume, navigateAfter) {
     if (volumeActionProcess.running || !volume || !volume.device) return false
     volumeActionKind = String(kind || "")
     volumeActionDevice = String(volume.device || "")
     volumeActionMountPath = String(volume.mountPath || "")
+    volumeActionNavigate = navigateAfter !== false
     volumeActionStdout = ""
     volumeActionStderr = ""
     actionMessage = ""
@@ -1457,6 +1601,103 @@ Item {
       "volume-action", volumeActionKind, "--device", volumeActionDevice]
     volumeActionProcess.running = true
     return true
+  }
+
+  // A search row from the catalog of a drive that is away. Its token names
+  // the catalog, not a path, and the backend refuses it: every action is
+  // turned into a hint here before it gets that far.
+  function isCatalogToken(token) {
+    return String(token || "").indexOf("catalog:") === 0
+  }
+
+  function isOfflineEntry(entry) {
+    return !!entry && (entry.available === false || isCatalogToken(entry.token))
+  }
+
+  // The drive list is fresher than the search that produced the row: a drive
+  // plugged in since then is not "disconnected" any more.
+  function offlineVolumeState(entry) {
+    var volume = volumeForCatalogId(entry ? entry.volumeId : "")
+    if (volume && volume.offline === true) return "disconnected"
+    if (volume) return volume.locked === true ? "locked"
+      : volume.mounted === true ? "mounted" : "unmounted"
+    return String(entry && entry.volumeState || "disconnected")
+  }
+
+  function offlineHintText(entry, state) {
+    var drive = "“" + String(entry.volumeName || "this drive") + "”"
+    var target = (entry.isDir === true ? " to browse " : " to open ")
+      + String(entry.name || "it")
+    if (state === "locked") return "Unlock " + drive + target
+    if (state === "unmounted") return "Mount " + drive + target
+    return "Connect " + drive + target
+  }
+
+  // Copying, starring or trashing an offline row only says where it is.
+  function offlineHint(entry) {
+    if (!isOfflineEntry(entry)) return false
+    var state = offlineVolumeState(entry)
+    if (state === "mounted") refreshStaleOfflineRow(entry)
+    else announce(offlineHintText(entry, state))
+    return true
+  }
+
+  // Mounted since this search ran: the refresh brings the row alive, and
+  // its reveal replaces this message.
+  function refreshStaleOfflineRow(entry) {
+    rememberOfflineRequest(entry)
+    announce("Finding " + String(entry.name || "it") + " on “"
+      + String(entry.volumeName || "this drive") + "”…")
+    if (String(query || "").trim() !== "") scheduleSearchRefresh()
+  }
+
+  function rememberOfflineRequest(entry) {
+    lastOfflineRequest = { catalogToken: String(entry.catalogToken || entry.token || ""),
+      volumeId: String(entry.volumeId || ""), name: String(entry.name || ""),
+      relativePath: String(entry.relativePath || ""),
+      volumeName: String(entry.volumeName || "") }
+  }
+
+  // Opening one names the drive to plug in. A drive that is here but not
+  // mounted is mounted where the search is; one that turns up later is left
+  // to the desktop, and its row comes alive by itself (applyListing).
+  function requestOfflineEntry(entry) {
+    if (!isOfflineEntry(entry)) return false
+    rememberOfflineRequest(entry)
+    // The snapshot can predate a drive the automounter did not touch.
+    reloadVolumes()
+    var state = offlineVolumeState(entry)
+    var volume = volumeForCatalogId(entry.volumeId)
+    if (state === "mounted") {
+      refreshStaleOfflineRow(entry)
+      return false
+    }
+    if (state === "unmounted" && volume && volume.canMount === true
+        && runVolumeAction("mount", volume, false)) {
+      announce("Mounting “" + String(entry.volumeName || "this drive") + "”…")
+      return false
+    }
+    announce(offlineHintText(entry, state))
+    return false
+  }
+
+  // The inspector's view of an offline row: what the catalog knows, without
+  // asking the backend about a path it cannot reach.
+  function offlineProperties(entry) {
+    if (!entry) return null
+    return { offline: true, token: String(entry.token || ""),
+      catalogToken: String(entry.catalogToken || entry.token || ""),
+      name: String(entry.name || ""), path: String(entry.path || ""),
+      relativePath: String(entry.relativePath || ""), isDir: entry.isDir === true,
+      kind: String(entry.kind || ""), mime: String(entry.mime || ""),
+      size: Number(entry.size || 0), sizeText: String(entry.sizeText || ""),
+      modified: String(entry.modified || ""), modifiedEpoch: Number(entry.modifiedEpoch || 0),
+      volumeId: String(entry.volumeId || ""), volumeName: String(entry.volumeName || ""),
+      volumeModel: String(entry.volumeModel || ""),
+      volumeSizeText: String(entry.volumeSizeText || ""),
+      indexedAt: String(entry.indexedAt || ""), indexedEpoch: Number(entry.indexedEpoch || 0),
+      catalogState: String(entry.catalogState || ""),
+      volumeState: offlineVolumeState(entry) }
   }
 
   function reloadKnowledge() {
@@ -1535,20 +1776,54 @@ Item {
       reloadPending = true
       return true
     }
+    var reusedCatalog = listInFlightReusesCatalog
     if (listInFlightRevision !== metadataRevision
-        || listInFlightCommand !== JSON.stringify(buildListCommand())) {
+        || listInFlightCommand !== JSON.stringify(buildListCommand(reusedCatalog))) {
       reloadPending = true
       reloadPendingForeground = reloadPendingForeground || !listInFlightBackground
+      return true
+    }
+    // A drive came or went while the walk ran: the catalog rows on screen
+    // no longer answer, so the search runs again in full.
+    if (reusedCatalog && !catalogReusable()) {
+      reloadPending = true
+      reloadPendingCatalog = true
       return true
     }
     var nextEntries = Array.isArray(parsed.entries) ? parsed.entries : []
     var nextFavorites = Array.isArray(parsed.favorites) ? parsed.favorites : []
     var nextGit = parsed.git || ({ root: "", branch: "" })
     var nextSemanticResult = parsed.smart || null
+    var nextCatalog = parsed.catalog || null
+    var nextTruncated = parsed.truncated === true
+    if (reusedCatalog) {
+      // The walk's rows are new; the catalog's are those on screen, less any
+      // the walk now lists itself.
+      var walked = ({})
+      for (var w = 0; w < nextEntries.length; w++) {
+        walked["token:" + String(nextEntries[w].token || "")] = true
+        walked["path:" + String(nextEntries[w].path || "")] = true
+      }
+      var carried = entries.filter(function(entry) {
+        return entry.origin === "catalog" && !walked["token:" + String(entry.token || "")]
+          && !walked["path:" + String(entry.path || "")]
+      })
+      var carriedHere = carried.filter(function(entry) { return entry.available === true }).length
+      nextEntries = nextEntries.concat(carried)
+      nextCatalog = Object.assign({}, catalogResult, {
+        offlineMatches: carried.length - carriedHere, availableMatches: carriedHere })
+      nextTruncated = nextTruncated || catalogResult.truncated === true
+    }
+    var reportedOffline = Number(nextCatalog ? nextCatalog.offlineMatches : 0)
+    var nextOfflineCount = isFinite(reportedOffline) && reportedOffline >= 0
+      ? reportedOffline
+      : nextEntries.filter(function(entry) { return entry.available === false }).length
     var changed = !sameData(entries, nextEntries) || !sameData(favorites, nextFavorites)
-      || !sameData(git, nextGit) || truncated !== (parsed.truncated === true)
+      || !sameData(git, nextGit) || truncated !== nextTruncated
       || searchEngine !== String(parsed.engine || "")
       || !sameData(semanticResult, nextSemanticResult)
+      || !sameData(catalogResult, nextCatalog) || offlineMatchCount !== nextOfflineCount
+    var previousEntries = entries
     var anchorToken = selectionAnchorIndex >= 0 && selectionAnchorIndex < entries.length
       ? String(entries[selectionAnchorIndex].token || "") : ""
     listingIsNewResults = !listInFlightBackground && String(query || "").trim() !== ""
@@ -1570,8 +1845,14 @@ Item {
       favorites = nextFavorites
     }
     if (!sameData(git, nextGit)) git = nextGit
-    truncated = parsed.truncated === true
+    truncated = nextTruncated
     searchEngine = String(parsed.engine || "")
+    if (!sameData(catalogResult, nextCatalog)) catalogResult = nextCatalog
+    if (!reusedCatalog) {
+      catalogRowsCommand = nextCatalog ? listInFlightCommand : ""
+      catalogRowsPresence = catalogPresenceKey
+    }
+    offlineMatchCount = nextOfflineCount
     semanticResult = nextSemanticResult
     if (nextSemanticResult) {
       semanticFallback = String(nextSemanticResult.state || "") === "fallback"
@@ -1581,6 +1862,19 @@ Item {
       semanticFallback = false
     }
     errorMessage = ""
+
+    // A catalog row changes token when its drive comes or goes. It is still
+    // the row the user picked, found again by the catalog token both carry.
+    var moves = catalogTokenMoves(previousEntries, entries)
+    listingTokenMoves = moves
+    var previousSelection = selectedToken
+    if (moves[selectedToken] !== undefined) selectedToken = moves[selectedToken]
+    if (moves[anchorToken] !== undefined) anchorToken = moves[anchorToken]
+    var followedSelection = selectedTokens.map(function(token) {
+      var value = String(token || "")
+      return moves[value] !== undefined ? moves[value] : value
+    })
+    if (!sameData(selectedTokens, followedSelection)) selectedTokens = followedSelection
 
     var selected = null
     var visibleTokens = ({})
@@ -1606,7 +1900,8 @@ Item {
       if (visibleTokens[retainedToken]) retainedSelection.push(retainedToken)
     }
     if (!sameData(selectedTokens, retainedSelection)) selectedTokens = retainedSelection
-    if (!sameData(selectedEntry, selected)) selectedEntry = selected
+    var selectedChanged = !sameData(selectedEntry, selected)
+    if (selectedChanged) selectedEntry = selected
     if (anchorToken !== "") {
       selectionAnchorIndex = -1
       for (var anchorIndex = 0; anchorIndex < entries.length; anchorIndex++)
@@ -1618,11 +1913,18 @@ Item {
       selectedToken = ""
       selectedProperties = null
       selectionAnchorIndex = -1
+    } else if (selectedToken !== previousSelection
+        || (selectedChanged && isCatalogToken(selectedToken))) {
+      // The inspector shows the catalog's view or the drive's, whichever is
+      // true now; an offline row's own view says where its drive is now.
+      if (previewToken !== "") clearPreview()
+      inspect(selectedToken)
     }
     if (changed) {
       listingChanges++
       modelChanged()
     }
+    revealRequestedEntry()
     listWatch = parsed.watch || null
     syncWatchConfiguration()
     if (recordNavigationOnListing) {
@@ -1633,6 +1935,81 @@ Item {
     return true
   }
 
+  // Old token → new token for every catalog row whose token changed, keyed
+  // both by its old token and by its catalog token. A drive mounted inside
+  // the searched folder is listed by the walk, whose row has no catalog
+  // token: it is the same file as the catalog row at its path on the drive.
+  function catalogTokenMoves(previous, next) {
+    var current = ({})
+    var walkedNow = ({})
+    for (var i = 0; i < next.length; i++) {
+      var key = String(next[i].catalogToken || "")
+      if (key !== "") current[key] = String(next[i].token || "")
+      else if (next[i].origin === undefined)
+        walkedNow[String(next[i].path || "")] = String(next[i].token || "")
+    }
+    var moves = ({})
+    for (var catalogToken in current)
+      if (current[catalogToken] !== catalogToken) moves[catalogToken] = current[catalogToken]
+    var walkedBefore = ({})
+    for (var j = 0; j < previous.length; j++) {
+      var before = String(previous[j].token || "")
+      var previousKey = String(previous[j].catalogToken || "")
+      var target = current[previousKey]
+      if (target !== undefined && target !== before) moves[before] = target
+      if (previousKey === "" && previous[j].origin === undefined)
+        walkedBefore[String(previous[j].path || "")] = before
+      var walkedTarget = previousKey !== "" ? walkedNow[catalogRowPath(previous[j])] : undefined
+      if (target === undefined && walkedTarget !== undefined) moves[before] = walkedTarget
+    }
+    for (var k = 0; k < next.length; k++) {
+      var walkedToken = String(next[k].catalogToken || "") !== ""
+        ? walkedBefore[catalogRowPath(next[k])] : undefined
+      if (walkedToken !== undefined && walkedToken !== String(next[k].token || ""))
+        moves[walkedToken] = String(next[k].token || "")
+    }
+    return moves
+  }
+
+  // Where the walk lists a catalog row while its drive is mounted, or "".
+  function catalogRowPath(row) {
+    var mount = String(catalogMountPaths[String(row.volumeId || "")] || "")
+    var relative = String(row.relativePath || "")
+    return mount === "" || relative === "" ? "" : mount.replace(/\/+$/, "") + "/" + relative
+  }
+
+  // The row the user tried to open is on a drive that has just arrived: put
+  // the cursor on it and say so. Opening it is still the user's next Enter.
+  function revealRequestedEntry() {
+    var request = lastOfflineRequest
+    if (!request || request.catalogToken === "") return false
+    // A rename or trash sheet acts on the selection, and a draft belongs to
+    // it: the cursor moves once the panel lets go (onSelectionHeldChanged).
+    if (selectionHeld) return false
+    // A drive mounted inside the searched folder is listed by the walk
+    // itself, whose row has no catalog token: it is found by its path.
+    var volume = volumeForCatalogId(request.volumeId)
+    var mountPath = volume && volume.mounted === true ? String(volume.mountPath || "") : ""
+    var walkedPath = mountPath !== "" && String(request.relativePath || "") !== ""
+      ? mountPath.replace(/\/+$/, "") + "/" + request.relativePath : ""
+    for (var i = 0; i < entries.length; i++) {
+      var entry = entries[i]
+      var byCatalog = entry.available === true
+        && String(entry.catalogToken || "") === request.catalogToken
+      var byPath = walkedPath !== "" && entry.origin === undefined
+        && String(entry.path || "") === walkedPath
+      if (!byCatalog && !byPath) continue
+      lastOfflineRequest = null
+      // Usually already selected: the selection followed the row to its new token.
+      if (selectedToken !== String(entry.token || "")) selectIndex(i)
+      announce("“" + String(entry.volumeName || request.volumeName || "The drive")
+        + "” connected · " + String(entry.name || request.name) + " is ready")
+      revealRequested(String(entry.token || ""))
+      return true
+    }
+    return false
+  }
+
   function location() {
     return ({ path: rootPath, token: rootToken })
   }
@@ -1640,7 +2017,7 @@ Item {
   function navigate(path, token, recordHistory) {
     var nextPath = String(path || "")
     var nextToken = String(token || "")
-    if (!nextPath && !nextToken) return false
+    if ((!nextPath && !nextToken) || isCatalogToken(nextToken)) return false
     navigationAboutToChange(rootPath, rootToken)
     if (recordHistory !== false && rootPath !== "") {
       var back = backStack.slice()
@@ -1686,6 +2063,9 @@ Item {
     sessionsError = ""
     errorMessage = ""
     truncated = false
+    catalogResult = null
+    offlineMatchCount = 0
+    lastOfflineRequest = null
     modelChanged()
     var started = reload()
     if (activeSessionsEnabled && panelVisible) Qt.callLater(reloadSessions)
@@ -1729,6 +2109,8 @@ Item {
   }
 
   function setSearch(text, mode) {
+    // A different question: the row asked for earlier is no longer on screen.
+    if (String(text || "").trim() !== String(query || "").trim()) lastOfflineRequest = null
     query = String(text || "")
     if (mode) searchMode = String(mode)
     if (searchMode === "smart" && String(query || "").trim() !== "")
@@ -1746,7 +2128,7 @@ Item {
 
   function toggleExpanded(token) {
     var value = String(token || "")
-    if (!value) return
+    if (!value || isCatalogToken(value)) return
     var next = expandedTokens.slice()
     var index = next.indexOf(value)
     if (index >= 0) next.splice(index, 1)
@@ -1846,15 +2228,47 @@ Item {
     selectedProperties = null
   }
 
+  // What an action on the selection acts on. Rows on a drive that is away
+  // are left out rather than failing the whole batch; callers say so.
   function effectiveSelectionTokens(anchorToken) {
     var hasExplicitAnchor = anchorToken !== undefined && anchorToken !== null
       && String(anchorToken) !== ""
     var anchor = String(hasExplicitAnchor ? anchorToken : (selectedToken || ""))
-    if (!hasExplicitAnchor && selectedTokens.length > 0)
-      return selectedTokens.slice()
-    if (anchor !== "" && isSelected(anchor) && selectedTokens.length > 0)
-      return selectedTokens.slice()
-    return anchor === "" ? [] : [anchor]
+    var tokens = anchor === "" ? [] : [anchor]
+    if ((!hasExplicitAnchor || (anchor !== "" && isSelected(anchor)))
+        && selectedTokens.length > 0)
+      tokens = selectedTokens.slice()
+    return tokens.filter(function(token) { return !root.isCatalogToken(token) })
+  }
+
+  // Nothing to act on but rows on a drive that is away: say where they are.
+  function refuseOffline(entry) {
+    offlineHint(entry)
+    return false
+  }
+
+  function refuseOfflineSelection() { return refuseOffline(selectedEntry) }
+
+  // The offline rows a selection action leaves out.
+  function offlineSelectionCount() {
+    var all = selectedTokens.length > 0 ? selectedTokens : [selectedToken]
+    return all.filter(function(token) { return root.isCatalogToken(token) }).length
+  }
+
+  // The same, as a suffix to the action's message.
+  function offlineSelectionNote() {
+    var left = offlineSelectionCount()
+    if (left === 0) return ""
+    return " · " + left + (left === 1 ? " offline item" : " offline items") + " left out"
+  }
+
+  // A trash or duplicate of a mixed selection: its outcome says what it left out.
+  function runSelectionOperation(kind, tokens) {
+    var note = offlineSelectionNote()
+    if (!runOperation(kind, tokens)) return false
+    if (pendingOperation)
+      pendingOperation = Object.assign({}, pendingOperation, { offlineNote: note })
+    return true
   }
 
   function visibleEntryForToken(token) {
@@ -1898,14 +2312,16 @@ Item {
     if (index < 0 || index >= entries.length) return
     var entry = entries[index]
     selectIndex(index)
-    if (entry.isDir === true) toggleExpanded(entry.token)
+    if (isOfflineEntry(entry)) requestOfflineEntry(entry)
+    else if (entry.isDir === true) toggleExpanded(entry.token)
     else runAction("open", entry.token)
   }
 
   function enterIndex(index) {
     if (index < 0 || index >= entries.length) return
     var entry = entries[index]
-    if (entry.isDir === true) {
+    if (isOfflineEntry(entry)) requestOfflineEntry(entry)
+    else if (entry.isDir === true) {
       var now = Date.now()
       if (now < navigationBlockedUntil) return
       navigationBlockedUntil = now + 450
@@ -1917,6 +2333,7 @@ Item {
   function enterEntry(entry) {
     if (!entry) return false
     setActiveEntry(entry)
+    if (isOfflineEntry(entry)) return requestOfflineEntry(entry)
     if (entry.isDir === true) {
       var now = Date.now()
       if (now < navigationBlockedUntil) return false
@@ -1926,8 +2343,20 @@ Item {
     return runAction("open", entry.token)
   }
 
+  // The background refresh re-inspects the selection on every tick, so an
+  // offline row has to be answered here or it would reach the backend.
   function inspect(token) {
-    propertyPendingToken = String(token || "")
+    var value = String(token || "")
+    if (isCatalogToken(value)) {
+      propertyPendingToken = ""
+      var entry = visibleEntryForToken(value)
+      if (!entry && selectedEntry && String(selectedEntry.token || "") === value)
+        entry = selectedEntry
+      var properties = offlineProperties(entry)
+      if (!sameData(selectedProperties, properties)) selectedProperties = properties
+      return
+    }
+    propertyPendingToken = value
     if (!propertyProcess.running) startPendingInspection()
   }
 
@@ -1945,6 +2374,12 @@ Item {
 
   function runAction(kind, token, name) {
     if (actionBusy || !token) return false
+    if (isCatalogToken(token)) {
+      var offline = visibleEntryForToken(token)
+      if (["open", "preview", "reveal"].indexOf(String(kind)) >= 0) requestOfflineEntry(offline)
+      else offlineHint(offline)
+      return false
+    }
     actionKind = String(kind || "")
     actionStdout = ""
     actionStderr = ""
@@ -1977,6 +2412,11 @@ Item {
     if (!entry || String(entry.token || "") === "") {
       clearPreview()
       previewError = "Select an item to preview"
+      return false
+    }
+    if (isOfflineEntry(entry)) {
+      clearPreview()
+      requestOfflineEntry(entry)
       return false
     }
     var token = String(entry.token)
@@ -2023,8 +2463,9 @@ Item {
   }
 
   function runBatchAction(kind, tokens, destinationToken) {
-    var values = Array.isArray(tokens) ? tokens : []
-    if (actionBusy || values.length === 0) return false
+    var values = (Array.isArray(tokens) ? tokens : [])
+      .filter(function(token) { return !root.isCatalogToken(token) })
+    if (actionBusy || values.length === 0 || isCatalogToken(destinationToken)) return false
     actionKind = String(kind || "")
     actionStdout = ""
     actionStderr = ""
@@ -2083,8 +2524,16 @@ Item {
 
   function startOperationRequest(request) {
     if (actionBusy || !request) return false
+    // Nothing on a drive that is away can be moved, copied or trashed, and
+    // nothing can land in it; the rest of a mixed batch still runs.
+    var requested = request.tokens || []
+    var tokens = requested.filter(function(token) { return !root.isCatalogToken(token) })
+    if (isCatalogToken(request.destinationToken)) return false
+    if (requested.length > 0 && tokens.length === 0
+        && (request.trashUris || []).length === 0 && (request.sourceUris || []).length === 0)
+      return false
     pendingOperation = Object.assign({}, request, {
-      tokens: (request.tokens || []).slice(),
+      tokens: tokens,
       trashUris: (request.trashUris || []).slice(),
       sourceUris: (request.sourceUris || []).slice()
     })
@@ -2152,14 +2601,16 @@ Item {
   function dropOnDirectory(destinationToken, sourceTokens, move) {
     var destination = String(destinationToken || "")
     var values = boundedArgumentValues(sourceTokens, 8192)
-    if (destination === "" || destination.length > 8192 || values === null) return false
+    if (destination === "" || destination.length > 8192 || values === null
+        || isCatalogToken(destination)) return false
     return runOperation(move === true ? "move" : "copy", values, destination)
   }
 
   function dropExternalUrisOnDirectory(destinationToken, sourceUris, move) {
     var destination = String(destinationToken || "")
     var supplied = boundedArgumentValues(sourceUris, 16384)
-    if (destination === "" || destination.length > 8192 || supplied === null) return false
+    if (destination === "" || destination.length > 8192 || supplied === null
+        || isCatalogToken(destination)) return false
     var localUris = []
     for (var i = 0; i < supplied.length; i++) {
       var value = String(supplied[i] || "").trim()
@@ -2205,7 +2656,7 @@ Item {
 
   function measureFolder(token) {
     var value = String(token || "")
-    if (value === "" || !initialized) return false
+    if (value === "" || !initialized || isCatalogToken(value)) return false
     if (folderSizeProcess.running) {
       if (folderSizeToken === value) return false
       cancelFolderSize()
@@ -2310,26 +2761,28 @@ Item {
   function copySelected() {
     if (!selectedEntry || !selectedToken) return false
     var tokens = effectiveSelectionTokens()
+    if (tokens.length === 0) return refuseOfflineSelection()
     clipboardMode = "copy"
     clipboardTokens = tokens
     clipboardToken = tokens.length > 0 ? String(tokens[0]) : ""
     var copiedEntry = tokens.length === 1 ? visibleEntryForToken(tokens[0]) : null
     clipboardName = tokens.length === 1 ? String(copiedEntry ? copiedEntry.name : "item")
       : tokens.length + " items"
-    actionMessage = "Copied “" + clipboardName + "”"
+    announce("Copied “" + clipboardName + "”" + offlineSelectionNote())
     return true
   }
 
   function cutSelected() {
     if (!selectedEntry || !selectedToken) return false
     var tokens = effectiveSelectionTokens()
+    if (tokens.length === 0) return refuseOfflineSelection()
     clipboardMode = "cut"
     clipboardTokens = tokens
     clipboardToken = tokens.length > 0 ? String(tokens[0]) : ""
     var cutEntry = tokens.length === 1 ? visibleEntryForToken(tokens[0]) : null
     clipboardName = tokens.length === 1 ? String(cutEntry ? cutEntry.name : "item")
       : tokens.length + " items"
-    actionMessage = "Cut “" + clipboardName + "”"
+    announce("Cut “" + clipboardName + "”" + offlineSelectionNote())
     return true
   }
 
@@ -2349,9 +2802,14 @@ Item {
   function createFile(name) { return runAction("touch", rootToken, name) }
   function createFolder(name) { return runAction("mkdir", rootToken, name) }
   function renameSelected(name) {
+    if (isCatalogToken(selectedToken)) return refuseOfflineSelection()
     return runOperation("rename", [selectedToken], "", name)
   }
-  function trashSelected() { return runOperation("trash", effectiveSelectionTokens()) }
+  function trashSelected() {
+    var tokens = effectiveSelectionTokens()
+    return tokens.length === 0 ? refuseOfflineSelection()
+      : runSelectionOperation("trash", tokens)
+  }
   function openSelected() { return runAction("open", selectedToken) }
   function revealSelected() { return runAction("reveal", selectedToken) }
   function previewSelected() {
@@ -2363,16 +2821,21 @@ Item {
   }
   function openPreviewExternally(entry) {
     var target = entry || selectedEntry
+    if (isOfflineEntry(target)) return requestOfflineEntry(target)
     return target && target.isDir !== true
       ? runAction("preview", String(target.token || "")) : false
   }
   function copySelectedPath() { return runAction("copy-path", selectedToken) }
   function duplicateSelected() {
-    return runOperation("duplicate", effectiveSelectionTokens())
+    var tokens = effectiveSelectionTokens()
+    return tokens.length === 0 ? refuseOfflineSelection()
+      : runSelectionOperation("duplicate", tokens)
   }
 
+  // Colours, notes and stars are kept per path; a drive that is away has none.
   function saveEntryMetadata(entry, color, note, starred) {
     if (actionBusy || !entry || !entry.token) return false
+    if (isOfflineEntry(entry)) return refuseOffline(entry)
     actionKind = "metadata"
     actionMetadataToken = String(entry.token)
     actionStdout = ""
@@ -2394,6 +2857,7 @@ Item {
   function saveEntryKnowledge(entry, registered, agents) {
     if (actionBusy || !entry || !entry.token || entry.isDir === true)
       return false
+    if (isOfflineEntry(entry)) return refuseOffline(entry)
     var values = Array.isArray(agents) ? agents : []
     actionKind = "metadata"
     actionMetadataToken = String(entry.token)
@@ -2425,6 +2889,7 @@ Item {
   function previewSelectedKnowledgeLinks() {
     if (actionBusy || !selectedEntry || !selectedEntry.token
         || selectedEntry.isDir === true) return false
+    if (isOfflineEntry(selectedEntry)) return refuseOfflineSelection()
     knowledgeLinkPlan = null
     knowledgeLinkError = ""
     knowledgeLinkStdout = ""
@@ -2456,6 +2921,7 @@ Item {
 
   function toggleFavoriteEntry(entry) {
     if (!entry) return false
+    if (isOfflineEntry(entry)) return refuseOffline(entry)
     return saveEntryMetadata(entry, String(entry.color || ""), String(entry.note || ""),
       entry.starred !== true)
   }
@@ -2487,7 +2953,8 @@ Item {
     interval: 100
     onTriggered: {
       if (!root.panelVisible || root.operationBusy) return
-      root.refreshAll(true)
+      // A file event changes no catalog: the catalog rows on screen stay.
+      root.refreshAll(true, true)
       if (root.selectedToken !== "") root.inspect(root.selectedToken)
     }
   }
@@ -2532,7 +2999,7 @@ Item {
     repeat: true
     running: root.panelVisible && root.initialized
       && (!root.watcherReady || root.watcherDegraded || root.watchTruncated)
-    onTriggered: root.refreshAll(true)
+    onTriggered: root.refreshAll(true, true)
   }
 
   Timer {
@@ -2670,6 +3137,8 @@ Item {
         offlineVolumes: root.offlineVolumeCount,
         catalogIndexBusy: root.catalogIndexBusy,
         catalogIndexDevice: root.catalogIndexDevice,
+        offlineMatches: root.offlineMatchCount,
+        offlineSearchEnabled: root.offlineSearchEnabled,
         moduleLayout: root.moduleLayout
       })
     }
@@ -2758,9 +3227,11 @@ Item {
         root.foregroundListingPending = false
       if (root.reloadPending) {
         var foreground = root.reloadPendingForeground
+        var withCatalog = root.reloadPendingCatalog
         root.reloadPending = false
         root.reloadPendingForeground = false
-        Qt.callLater(function() { root.reload(!foreground) })
+        root.reloadPendingCatalog = false
+        Qt.callLater(function() { root.reload(!foreground, !withCatalog) })
       }
     }
   }
@@ -2825,6 +3296,7 @@ Item {
     onExited: function(exitCode) {
       var kind = root.volumeActionKind
       var previousMountPath = root.volumeActionMountPath
+      var navigateAfter = root.volumeActionNavigate
       var parsed = null
       try { parsed = JSON.parse(root.volumeActionStdout) } catch (error) {}
       var ok = exitCode === 0 && parsed && parsed.ok === true
@@ -2835,7 +3307,8 @@ Item {
       root.volumeActionKind = ""
       root.volumeActionDevice = ""
       root.volumeActionMountPath = ""
-      if (ok && kind === "mount" && parsed.volume
+      root.volumeActionNavigate = true
+      if (ok && kind === "mount" && navigateAfter && parsed.volume
           && String(parsed.volume.mountPath || "") !== "") {
         root.navigate(String(parsed.volume.mountPath),
           String(parsed.volume.mountToken || ""), true)
@@ -3038,7 +3511,9 @@ Item {
       var parsed = root.operationResult
       var kind = root.actionKind
       var ok = exitCode === 0 && parsed && parsed.ok === true
-      var message = ok ? String(parsed.message || "Done")
+      var offlineNote = root.pendingOperation
+        ? String(root.pendingOperation.offlineNote || "") : ""
+      var message = ok ? String(parsed.message || "Done") + offlineNote
         : (parsed && parsed.error ? String(parsed.error)
           : (root.operationStderr.trim() || (root.operationCancelling
             ? "Operation cancelled" : "Action failed")))

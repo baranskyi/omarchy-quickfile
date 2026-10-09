@@ -97,12 +97,15 @@ walk is a bounded, cancellable scan like measuring a folder.
 - [x] Index and Forget from `DEVICES`, automatic re-index when an indexed drive
   is mounted again, footer progress and Cancel, dimmed offline rows with their
   index age; an unreadable catalog stays listed so it can be forgotten.
-- Offline rows in search, both the deterministic modes and SMART, after the
+- [x] Offline rows in search, both the deterministic modes and SMART, after the
   live rows and within a time budget, with an `OFFLINE` badge and the drive to
   connect.
-- A setting to keep offline rows out of search.
-- An offline row comes alive in place, with its selection kept, when its drive
+- [x] A setting to keep offline rows out of search.
+- [x] An offline row comes alive in place, with its selection kept, when its drive
   is connected.
+- [x] Enter on an offline row names the drive to connect, unlock or mount, and
+  mounts a connected drive in place; when the drive arrives the row is
+  selected, pulsed and announced, never opened.
 
 Deferred:
 

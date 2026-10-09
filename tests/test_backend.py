@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import errno
 import importlib.machinery
@@ -15,6 +16,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -42,6 +45,9 @@ class BackendTests(unittest.TestCase):
                 "QUICKFILE_NAV_FILE": str(self.root / "quickfile-recent.json"),
                 "QUICKFILE_SETTINGS_FILE": str(self.root / "quickfile-settings.json"),
                 "QUICKFILE_CATALOG_DIR": str(self.root / "quickfile-catalog"),
+                # No drive is plugged in unless a test says so.
+                "QUICKFILE_DEV_DISK_DIR": str(self.root / "dev-disk"),
+                "QUICKFILE_MOUNTINFO": str(self.root / "mountinfo"),
                 "QUICKFILE_HOME": str(self.root),
                 "XDG_CONFIG_HOME": str(self.root / "xdg-config"),
                 "XDG_DATA_HOME": str(self.root / "xdg-data"),
@@ -954,6 +960,751 @@ class BackendTests(unittest.TestCase):
             with self.subTest(raw=raw):
                 token = quickfile.encode_path(raw)
                 self.assertEqual(os.fsencode(quickfile.decode_path(token)), raw)
+
+    # Offline rows in search. A drive's presence is read from /dev/disk and
+    # the mount table, both pointed at files of this test: a catalogued drive
+    # is disconnected until `plug` gives it a node, and mounted once that node
+    # is the source of a mountinfo line.
+
+    def plug(self, uuid: str = "DRIVE-1", mount: Path | None = None, *, node: str = "sdb1",
+             root: str = "/") -> Path:
+        device = self.root / "dev nodes" / node
+        device.parent.mkdir(exist_ok=True)
+        device.touch()
+        links = Path(os.environ["QUICKFILE_DEV_DISK_DIR"]) / "by-uuid"
+        links.mkdir(parents=True, exist_ok=True)
+        (links / uuid).symlink_to(device)
+        if mount is not None:
+            self.mount_line(device, mount, root=root)
+        return device
+
+    def mount_line(self, device: Path, mount: Path | bytes, *, root: str = "/") -> None:
+        def escaped(value: bytes) -> bytes:
+            for raw, code in ((b"\\", b"\\134"), (b" ", b"\\040"), (b"\t", b"\\011"),
+                              (b"\n", b"\\012")):
+                value = value.replace(raw, code)
+            return value
+
+        line = b" ".join((
+            b"36 25 8:17", escaped(root.encode()), escaped(os.fsencode(mount)),
+            b"rw,relatime shared:1 - exfat", escaped(os.fsencode(device)), b"rw",
+        )) + b"\n"
+        with open(os.environ["QUICKFILE_MOUNTINFO"], "ab") as stream:
+            stream.write(line)
+
+    def search(self, root: Path, query: str, mode: str = "contains", **overrides):
+        values = {
+            "path": str(root), "path_token": None, "query": query, "mode": mode,
+            "smart_plan_json": None, "case_sensitive": False, "show_hidden": False,
+            "no_git": True, "limit": 100, "scan_limit": 1000, "timeout": 2.0,
+            "content_file_limit": 1024 * 1024, "content_byte_limit": 8 * 1024 * 1024,
+        }
+        values.update(overrides)
+        return quickfile.search_command(argparse.Namespace(**values))
+
+    def elsewhere(self) -> Path:
+        # A folder with nothing in it to find: a search there lists only what
+        # the catalogs answer.
+        root = self.root / "elsewhere"
+        root.mkdir(exist_ok=True)
+        return root
+
+    def parity_drive(self) -> Path:
+        # Built so that every answer is in a name or a path: an offline row
+        # has no content, no insides of a pruned tree, and cannot tell where
+        # a symlink points.
+        drive = self.corpus({
+            "Invoices/invoice-2024-03.pdf": b"",
+            "Invoices/old/invoice-2019.pdf": b"",
+            "Invoices/receipt.txt": b"",
+            "Photos/2024/03/beach.jpg": b"",
+            "Photos/2024/03/IMG_0042.PNG": b"",
+            "Photos/sunset beach.png": b"",
+            "Projects/QuickFile/notes.md": b"",
+            "Projects/QuickFile/src/main.py": b"",
+            "Отпуск 2025/график.pdf": b"",
+            "Отпуск 2025/Программа поездки.docx": b"",
+            "Documents/D'Artagnan letters.txt": b"",
+            "Documents/report-final.docx": b"",
+            "Documents/Report Draft.odt": b"",
+            "Documents/invocie scan.pdf": b"",
+            "Music/song.mp3": b"",
+            "notes.txt": b"",
+            "README.md": b"",
+            ".hidden-notes.txt": b"",
+        }, name="drive")
+        now = quickfile.dt.datetime.now().astimezone()
+        last_month = now.replace(day=1) - quickfile.dt.timedelta(days=10)
+        dated = {
+            "Invoices/old/invoice-2019.pdf": quickfile.dt.datetime(2019, 6, 1, tzinfo=now.tzinfo),
+            "Invoices/invoice-2024-03.pdf": last_month,
+            "Photos/2024/03/beach.jpg": quickfile.dt.datetime(2024, 3, 9, tzinfo=now.tzinfo),
+            "Photos/2024/03/IMG_0042.PNG": last_month,
+            "Documents/report-final.docx": quickfile.dt.datetime(2020, 1, 5, tzinfo=now.tzinfo),
+        }
+        for relative, when in dated.items():
+            os.utime(drive / relative, (when.timestamp(), when.timestamp()))
+        return drive
+
+    def scored_search(self, root: Path, query: str, mode: str, **overrides):
+        # Pattern rows carry no score, so it is read where it is given: the
+        # one helper the walk and the catalog both rank with.
+        recorded: dict[str, tuple[str, int]] = {}
+        real = quickfile.keyword_match
+
+        def record(name, relative, is_directory, *rest):
+            found = real(name, relative, is_directory, *rest)
+            if found is not None:
+                recorded[relative] = (found[0]["matchKind"], found[1])
+            return found
+
+        with mock.patch.object(quickfile, "keyword_match", side_effect=record):
+            result = self.search(root, query, mode, **overrides)
+        return result, [
+            (row["relativePath"], row["matchKind"], recorded[row["relativePath"]][1])
+            for row in result["entries"]
+        ]
+
+    def test_offline_rows_rank_exactly_as_a_live_search_of_the_drive(self) -> None:
+        drive = self.parity_drive()
+        self.index_drive(drive)
+        elsewhere = self.elsewhere()
+        pattern_queries = [
+            ("inv", "fuzzy", {}), ("ntxt", "fuzzy", {}), ("пргрм", "fuzzy", {}),
+            ("beach", "contains", {}), ("report", "contains", {}), ("отпуск", "contains", {}),
+            ("d'art", "contains", {}), ("Report", "contains", {"case_sensitive": True}),
+            ("report", "prefix", {}), ("img", "prefix", {}), ("notes.txt", "exact", {}),
+            (".pdf", "suffix", {}), (r"^invoice-\d{4}", "regex", {}), (r"\.pdf$", "regex", {}),
+            (r"(?i)REPORT", "regex", {}), (r"o.e", "regex", {}),
+        ]
+        for query, mode, overrides in pattern_queries:
+            with self.subTest(query=query, mode=mode):
+                live, live_scores = self.scored_search(
+                    drive, query, mode, no_catalog=True, **overrides)
+                offline, offline_scores = self.scored_search(elsewhere, query, mode, **overrides)
+                self.assertTrue(live_scores, "the corpus must answer every query")
+                self.assertEqual(offline_scores, live_scores)
+                self.assertEqual(
+                    [(row["name"], row["isDir"], row["depth"]) for row in offline["entries"]],
+                    [(row["name"], row["isDir"], row["depth"]) for row in live["entries"]])
+                self.assertTrue(all(
+                    row["origin"] == "catalog" and row["available"] is False
+                    for row in offline["entries"]))
+                self.assertEqual(offline["catalog"]["offlineMatches"], len(live["entries"]))
+
+        def ranked(result):
+            return [
+                (row["relativePath"], row["matchKind"], row["smartScore"], row["smartReasons"],
+                 row["isDir"])
+                for row in result["entries"]
+            ]
+
+        # A slip counts only while its word is in no name ("reciept"), and
+        # not once one name has it as typed ("invocie"); a month is found
+        # where a date writes it, and as a folder inside a year's.
+        smart_queries = [
+            "old invoices", "show images from this month", "beach photos", "invoice",
+            "invocie", "reciept", "march", "отпуск", "программа поездки", "quickfile notes",
+            "pdf from last month", "projects", "screenshots from last month",
+        ]
+        for query in smart_queries:
+            with self.subTest(query=query, mode="smart"):
+                live = self.search(drive, query, "smart", no_catalog=True)
+                offline = self.search(elsewhere, query, "smart")
+                self.assertEqual(live["smart"]["state"], "fallback")
+                self.assertTrue(ranked(live), "the corpus must answer every query")
+                self.assertEqual(ranked(offline), ranked(live))
+        # The hints the comparison leans on were in the plans it compared.
+        hints = quickfile.fallback_plan("old invoices")["hints"]
+        self.assertEqual((hints["kind"]["value"], hints["time"]["value"]), ("document", "older"))
+        hints = quickfile.fallback_plan("show images from this month")["hints"]
+        self.assertEqual((hints["kind"]["value"], hints["time"]["value"]), ("image", "this-month"))
+
+    def test_offline_rows_have_no_content_to_match(self) -> None:
+        drive = self.corpus({"memo.txt": "the budget for next year", "budget.md": ""},
+                            name="drive")
+        self.index_drive(drive)
+        live = self.search(drive, "budget", "contains", no_catalog=True)
+        self.assertEqual({row["relativePath"]: row["matchKind"] for row in live["entries"]},
+                         {"memo.txt": "content", "budget.md": "name"})
+        offline = self.search(self.elsewhere(), "budget", "contains")
+        self.assertEqual([row["relativePath"] for row in offline["entries"]], ["budget.md"])
+        smart = self.search(self.elsewhere(), "budget", "smart")
+        self.assertEqual([row["relativePath"] for row in smart["entries"]], ["budget.md"])
+
+    def test_catalog_prefilters_never_drop_a_true_match(self) -> None:
+        # SQL narrows a catalog by its folded columns before matches() has
+        # its say on the displayed names, so every folding the two disagree
+        # on must still leave the row in: apostrophes between letters, ß, a
+        # ligature, a decomposed accent, a doubled Cyrillic letter, a soft
+        # sign, the dotless ı re matches as i, LIKE's own wildcards, and a
+        # byte that is no UTF-8.
+        drive = self.corpus({
+            "rock'n'roll.mp3": b"", "Straße.txt": b"", "ﬁle.txt": b"", "cafe\u0301.txt": b"",
+            "программа.txt": b"", "бульвар.txt": b"", "k\u0131t.txt": b"", "100%_done.txt": b"",
+            "wedd\u0131ngs.txt": b"",
+        }, name="drive")
+        with open(os.path.join(os.fsencode(drive), b"caf\xe9.txt"), "wb"):
+            pass
+        self.index_drive(drive)
+        cases = [
+            ("'n'", "contains"), ("n'r", "contains"), ("SS", "contains"), ("fi", "prefix"),
+            ("e", "contains"), ("мм", "contains"), ("мм", "fuzzy"), ("ьв", "contains"),
+            ("caf?", "contains"), ("caf?.txt", "exact"), ("kit", "regex"),
+            ("k[i\u0131]t", "regex"), ("%_", "contains"), ("%_d", "fuzzy"), ("rock'n", "fuzzy"),
+            ("STRASSE", "prefix"), ("weddings", "regex"),
+        ]
+        for query, mode in cases:
+            with self.subTest(query=query, mode=mode):
+                live = self.search(drive, query, mode, no_catalog=True)
+                offline = self.search(self.elsewhere(), query, mode)
+                expected = [row["relativePath"] for row in live["entries"]]
+                self.assertTrue(expected)
+                self.assertEqual([row["relativePath"] for row in offline["entries"]], expected)
+
+    def test_offline_tokens_are_never_path_tokens(self) -> None:
+        drive = self.drive()
+        self.index_drive(drive)
+        result = self.search(self.elsewhere(), "caf", "contains")
+        [row] = result["entries"]
+        stem = quickfile.catalog_stem("uuid:DRIVE-1")
+        self.assertEqual(row["token"],
+                         "catalog:" + stem + ":" + quickfile.encode_path(b"caf\xe9.txt"))
+        self.assertEqual(row["catalogToken"], row["token"])
+        encoded = row["token"].split(":")[2]
+        self.assertEqual(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)),
+                         b"caf\xe9.txt")
+        with self.assertRaises(quickfile.QuickfileError) as raised:
+            quickfile.decode_path(row["token"])
+        self.assertEqual(raised.exception.code, "invalid-path-token")
+        # Every key a live row has, and what a row without its drive can say.
+        live = quickfile.entry_row(str(self.root / "notes.txt"), 0, {"statuses": {}}, set())
+        self.assertEqual(set(live) - set(row), set())
+        self.assertEqual(row, dict(row, **{
+            "name": "caf?.txt", "path": "ARCHIVE:/caf?.txt", "uri": "", "shellQuotedPath": "",
+            "depth": 0, "kind": "file", "isDir": False, "isSymlink": False, "isHidden": False,
+            "isExecutable": False, "hasChildren": False, "expanded": False, "size": 7,
+            "sizeText": "7 B", "permissions": "", "mode": "", "mime": "text/plain", "git": "",
+            "relativePath": "caf?.txt", "matchKind": "name", "matchLine": 0, "matchSnippet": "",
+            "origin": "catalog", "available": False, "volumeId": "uuid:DRIVE-1",
+            "volumeName": "ARCHIVE", "volumeModel": "Pocket Drive",
+            "volumeSizeText": quickfile.human_size(63 * 1024**3), "volumeState": "disconnected",
+            "catalogState": "complete", "starred": False,
+        }))
+        self.assertGreater(row["indexedEpoch"], 0)
+        self.assertTrue(row["indexedAt"])
+        self.assertAlmostEqual(row["modifiedEpoch"],
+                               (drive / os.fsdecode(b"caf\xe9.txt")).lstat().st_mtime)
+        link = self.search(self.elsewhere(), "photos-link", "exact")["entries"]
+        self.assertEqual([(entry["kind"], entry["isSymlink"], entry["mime"]) for entry in link],
+                         [("symlink", True, "inode/symlink")])
+        folder = self.search(self.elsewhere(), "Photos", "exact")["entries"]
+        self.assertEqual([(entry["kind"], entry["isDir"], entry["matchKind"]) for entry in folder],
+                         [("directory", True, "folder")])
+
+    def test_live_rows_come_first_and_each_side_keeps_its_own_cap(self) -> None:
+        drive = self.drive()
+        (drive / "Photos" / "beach-2.jpg").write_bytes(b"j")
+        self.index_drive(drive)
+        local = self.elsewhere()
+        for name in ("beach-a.txt", "beach-b.txt", "beach-c.txt"):
+            (local / name).write_text("", encoding="utf-8")
+        for mode in ("contains", "smart"):
+            with self.subTest(mode=mode):
+                result = self.search(local, "beach", mode, limit=2)
+                origins = [row.get("origin", "live") for row in result["entries"]]
+                # The walk's cap holds its own rows to two and says so; the
+                # catalog's rows come after them, all of them.
+                self.assertEqual(origins, ["live", "live", "catalog", "catalog"])
+                self.assertTrue(result["truncated"])
+                self.assertFalse(result["catalog"]["truncated"])
+                self.assertEqual(result["catalog"]["offlineMatches"], 2)
+                with mock.patch.object(quickfile, "CATALOG_RESULT_LIMIT", 1):
+                    capped = self.search(local, "beach", mode)
+                origins = [row.get("origin", "live") for row in capped["entries"]]
+                self.assertEqual(origins, ["live", "live", "live", "catalog"])
+                self.assertTrue(capped["catalog"]["truncated"])
+                self.assertTrue(capped["truncated"])
+                self.assertEqual(capped["catalog"]["offlineMatches"], 1)
+                # The best of them is the one kept.
+                self.assertEqual(capped["entries"][-1]["relativePath"],
+                                 result["entries"][2]["relativePath"])
+
+    def test_a_drive_mounted_around_the_root_is_left_to_the_walk(self) -> None:
+        drive = self.drive()
+        self.index_drive(drive)
+        self.plug(mount=drive)
+        inside = self.search(drive / "Photos", "beach", "contains")
+        self.assertEqual([row.get("origin") for row in inside["entries"]], [None])
+        self.assertEqual(inside["catalog"], quickfile.catalog_stats())
+        smart = self.search(drive, "beach", "smart")
+        self.assertTrue(smart["entries"])
+        self.assertTrue(all("origin" not in row for row in smart["entries"]))
+        self.assertEqual(smart["catalog"]["searched"], 0)
+
+    def test_a_mounted_drive_answers_with_live_rows(self) -> None:
+        drive = self.drive()
+        self.index_drive(drive)
+        offline = self.search(self.elsewhere(), "beach", "contains")["entries"]
+        self.plug(mount=drive)
+        for mode in ("contains", "smart"):
+            with self.subTest(mode=mode):
+                result = self.search(self.elsewhere(), "beach", mode)
+                [row] = result["entries"]
+                beach = drive / "Photos" / "beach.jpg"
+                self.assertEqual(row["token"], quickfile.encode_path(str(beach)))
+                self.assertEqual(row["path"], str(beach))
+                self.assertEqual(row["uri"], beach.as_uri())
+                self.assertEqual(row["permissions"], quickfile.stat.filemode(beach.lstat().st_mode))
+                self.assertTrue(row["available"])
+                self.assertEqual(row["volumeState"], "mounted")
+                self.assertEqual(row["relativePath"], "Photos/beach.jpg")
+                # The row the panel showed offline, by the key that outlives
+                # its token.
+                self.assertEqual(row["catalogToken"], offline[0]["catalogToken"])
+                self.assertEqual(result["catalog"]["availableMatches"], 1)
+                self.assertEqual(result["catalog"]["offlineMatches"], 0)
+
+        # Gone since the drive was indexed: dropped, as any stale row is.
+        (drive / "Photos" / "2024" / "trip.mov").unlink()
+        self.assertEqual(self.search(self.elsewhere(), "trip", "contains")["entries"], [])
+        self.assertEqual(self.search(self.elsewhere(), "trip", "smart")["entries"], [])
+
+        # A root above the mount walks the drive itself: its rows are listed
+        # once, by the walk.
+        for mode in ("contains", "smart"):
+            with self.subTest(mode=mode, root="above"):
+                result = self.search(self.root, "beach", mode)
+                tokens = [row["token"] for row in result["entries"]]
+                beach = quickfile.encode_path(str(drive / "Photos" / "beach.jpg"))
+                self.assertEqual(tokens.count(beach), 1)
+                self.assertTrue(all("origin" not in row for row in result["entries"]))
+                self.assertEqual(result["catalog"]["availableMatches"], 0)
+
+        # The same through a link above the mount (~/Drives -> /run/media/me):
+        # the walk's paths go through the link, the catalog's do not, and the
+        # file is still listed once.
+        (self.root / "drives").symlink_to(self.root)
+        for mode in ("contains", "smart"):
+            with self.subTest(mode=mode, root="linked"):
+                result = self.search(self.root / "drives", "beach", mode)
+                self.assertEqual([row["path"] for row in result["entries"]],
+                                 [str(self.root / "drives" / "drive" / "Photos" / "beach.jpg")])
+                self.assertEqual(result["catalog"]["availableMatches"], 0)
+
+    def test_a_folder_of_a_drive_bound_elsewhere_is_the_drive(self) -> None:
+        drive = self.drive()
+        (drive / "Music").mkdir()
+        (drive / "Music" / "beachsong.mp3").write_bytes(b"m")
+        self.index_drive(drive)
+        device = self.plug(mount=drive)
+        # Its Music bound at ~/Music: the same files under another path, which
+        # resolving links cannot bring together.
+        bound = self.root / "home" / "Music"
+        bound.mkdir(parents=True)
+        (bound / "beachsong.mp3").write_bytes(b"m")
+        self.mount_line(device, bound, root="/Music")
+        for mode in ("contains", "smart"):
+            with self.subTest(mode=mode, root="inside"):
+                inside = self.search(bound, "beachsong", mode)
+                self.assertEqual([row.get("origin") for row in inside["entries"]], [None])
+                self.assertEqual(inside["catalog"]["searched"], 0)
+            with self.subTest(mode=mode, root="above"):
+                above = self.search(self.root / "home", "beachsong", mode)
+                self.assertEqual([row["path"] for row in above["entries"]],
+                                 [str(bound / "beachsong.mp3")])
+                self.assertEqual(above["catalog"]["searched"], 1)
+                self.assertEqual(above["catalog"]["availableMatches"], 0)
+
+    def test_a_mounted_drive_that_does_not_answer_holds_no_search(self) -> None:
+        drive = self.drive()
+        for number in range(3):
+            (drive / "Photos" / f"beach-{number}.jpg").write_bytes(b"j")
+        self.index_drive(drive)
+        self.plug(mount=drive)
+        released = threading.Event()
+        self.addCleanup(released.set)
+        real_row = quickfile.catalog_live_row
+        answered: list[bytes] = []
+
+        def hung(source, record):
+            # The first file answers; then the drive stops, as a disk spinning
+            # up or failing does, inside an lstat no deadline reaches.
+            if answered:
+                released.wait(30)
+                return None
+            answered.append(record[1])
+            return real_row(source, record)
+
+        for mode in ("contains", "smart"):
+            with self.subTest(mode=mode):
+                answered.clear()
+                started = time.monotonic()
+                with mock.patch.object(quickfile, "catalog_live_row", side_effect=hung):
+                    result = self.search(self.elsewhere(), "beach", mode, timeout=2.0)
+                self.assertLess(time.monotonic() - started, 1.5)
+                rows = result["entries"]
+                self.assertEqual(len(rows), 4)
+                live = [row for row in rows if row["available"]]
+                self.assertEqual([os.fsencode(row["relativePath"]) for row in live], answered)
+                # The rest are listed from the catalog, offline although the
+                # drive is mounted: opening one searches again.
+                waiting = [row for row in rows if not row["available"]]
+                self.assertEqual(len(waiting), 3)
+                for row in waiting:
+                    self.assertEqual(row["volumeState"], "mounted")
+                    self.assertTrue(row["token"].startswith("catalog:"))
+                    self.assertEqual(row["token"], row["catalogToken"])
+                self.assertEqual(result["catalog"]["availableMatches"], 1)
+                self.assertEqual(result["catalog"]["offlineMatches"], 3)
+                self.assertTrue(result["catalog"]["truncated"])
+
+    def test_offline_rows_keep_the_exact_bytes_of_a_name(self) -> None:
+        drive = self.drive()
+        self.index_drive(drive)
+        [offline] = self.search(self.elsewhere(), "caf", "smart")["entries"]
+        self.assertEqual(offline["relativePath"], "caf?.txt")
+        mount = self.root / "mnt" / os.fsdecode(b"st\xffck")
+        mount.parent.mkdir()
+        drive.rename(mount)
+        self.plug(mount=mount)
+        for mode in ("contains", "smart"):
+            with self.subTest(mode=mode):
+                [row] = self.search(self.elsewhere(), "caf", mode)["entries"]
+                self.assertEqual(os.fsencode(quickfile.decode_path(row["token"])),
+                                 os.fsencode(mount) + b"/caf\xe9.txt")
+                self.assertEqual(row["catalogToken"], offline["catalogToken"])
+
+    def test_hidden_catalog_rows_are_listed_only_when_hidden_files_are(self) -> None:
+        drive = self.drive()
+        self.index_drive(drive)
+        for mode in ("contains", "smart"):
+            with self.subTest(mode=mode):
+                self.assertEqual(self.search(self.elsewhere(), "settings", mode)["entries"], [])
+                shown = self.search(self.elsewhere(), "settings", mode, show_hidden=True)
+                self.assertEqual([row["relativePath"] for row in shown["entries"]],
+                                 [".config/settings.json"])
+                self.assertTrue(shown["entries"][0]["isHidden"] is False)
+
+    def test_a_catalog_cut_short_by_its_deadline_still_answers_the_search(self) -> None:
+        drive = self.drive()
+        self.index_drive(drive)
+        local = self.elsewhere()
+        (local / "beach-local.txt").write_text("", encoding="utf-8")
+        real_open = quickfile.open_catalog_ro
+
+        class Slow:
+            # The entries query starts just past the catalog deadline; only
+            # SQLite's progress handler is there to stop it.
+            def __init__(self, connection) -> None:
+                self.connection = connection
+
+            def execute(self, sql, *args):
+                if "FROM entries" in sql:
+                    time.sleep(0.15)
+                return self.connection.execute(sql, *args)
+
+            def close(self) -> None:
+                self.connection.close()
+
+        for mode in ("contains", "smart"):
+            with self.subTest(mode=mode), \
+                    mock.patch.object(quickfile, "CATALOG_BUDGET_LIMIT", 0.1), \
+                    mock.patch.object(quickfile, "CATALOG_PROGRESS_STEPS", 1), \
+                    mock.patch.object(quickfile, "open_catalog_ro",
+                                      side_effect=lambda *args: Slow(real_open(*args))):
+                result = self.search(local, "beach", mode)
+            self.assertTrue(result["ok"])
+            self.assertEqual([row["relativePath"] for row in result["entries"]],
+                             ["beach-local.txt"])
+            self.assertEqual(result["catalog"], dict(result["catalog"], searched=1, scanned=0,
+                                                     truncated=True, offlineMatches=0))
+            self.assertTrue(result["truncated"])
+
+    def test_a_scan_that_runs_out_of_time_leaves_time_to_read_a_mounted_drive(self) -> None:
+        drive = self.drive()
+        for number in range(4):
+            (drive / f"beach-{number}.txt").write_text("", encoding="utf-8")
+        self.index_drive(drive)
+        self.plug(mount=drive)
+        real_records = quickfile.catalog_records
+
+        def slow_records(*args):
+            # Every row takes a quarter of a second to score: the scan runs
+            # into its deadline after three.
+            for found in real_records(*args):
+                time.sleep(0.25)
+                yield found
+
+        for mode in ("contains", "smart"):
+            # A second for the catalogs: a quarter of the four the search has.
+            with self.subTest(mode=mode), \
+                    mock.patch.object(quickfile, "catalog_records", side_effect=slow_records):
+                result = self.search(self.elsewhere(), "beach", mode, timeout=4.0)
+                self.assertTrue(result["catalog"]["truncated"])
+                self.assertGreaterEqual(result["catalog"]["availableMatches"], 2)
+                self.assertTrue(all(row["available"] for row in result["entries"]))
+
+    def test_a_damaged_catalog_is_skipped_by_search(self) -> None:
+        drive = self.drive()
+        self.index_drive(drive)
+        directory = quickfile.catalog_dir()
+        (directory / (quickfile.catalog_stem("uuid:BROKEN") + ".sqlite")).write_bytes(b"x" * 4096)
+        # Readable meta over a table that is not there.
+        foreign = directory / (quickfile.catalog_stem("uuid:HALF") + ".sqlite")
+        connection = sqlite3.connect(foreign)
+        connection.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        connection.executemany("INSERT INTO meta VALUES (?, ?)",
+                               [("volumeId", "uuid:HALF"), ("state", "complete")])
+        connection.execute("PRAGMA user_version = 1")
+        connection.commit()
+        connection.close()
+        # Readable throughout, but with rows no indexer writes: a path out of
+        # the drive, text where bytes and numbers go, an empty folder name.
+        odd = directory / (quickfile.catalog_stem("uuid:ODD") + ".sqlite")
+        connection = sqlite3.connect(odd)
+        for statement in quickfile.CATALOG_SCHEMA:
+            connection.execute(statement)
+        rows = [
+            (b"beach.jpg", b"../beach.jpg", 0, 1.0), ("beach-text.jpg", "beach-text.jpg", 0, 1.0),
+            (b"beach-size.jpg", b"beach-size.jpg", "big", 1.0),
+            (b"beach-gap.jpg", b"a//beach-gap.jpg", 0, 1.0),
+            (b"beach-ok.jpg", b"Photos/beach-ok.jpg", 5, 1.0),
+        ]
+        connection.executemany(
+            "INSERT INTO entries (name, rel, name_fold, rel_fold, is_dir, is_link, hidden,"
+            " depth, size, mtime, smart_kind) VALUES (?, ?, ?, ?, 0, 0, 0, 0, ?, ?, 'image')",
+            [(name, rel, os.fsdecode(name), os.fsdecode(rel).casefold(), size, mtime)
+             for name, rel, size, mtime in rows])
+        connection.executemany("INSERT INTO meta VALUES (?, ?)",
+                               [("volumeId", "uuid:ODD"), ("state", "complete")])
+        connection.execute("PRAGMA user_version = 1")
+        connection.commit()
+        connection.close()
+        for mode in ("contains", "smart"):
+            with self.subTest(mode=mode):
+                result = self.search(self.elsewhere(), "beach", mode)
+                self.assertTrue(result["ok"])
+                self.assertEqual(sorted(row["relativePath"] for row in result["entries"]),
+                                 ["Photos/beach-ok.jpg", "Photos/beach.jpg"])
+                self.assertTrue(result["catalog"]["truncated"])
+                self.assertEqual(result["catalog"]["searched"], 3)
+
+    def test_search_without_catalogs_costs_one_listdir(self) -> None:
+        real_listdir = os.listdir
+        listed: list[str] = []
+
+        def listdir(path="."):
+            listed.append(os.fspath(path))
+            return real_listdir(path)
+
+        catalogs = str(quickfile.catalog_dir())
+        with mock.patch.object(quickfile.os, "listdir", side_effect=listdir), \
+                mock.patch.object(quickfile.sqlite3, "connect", side_effect=AssertionError), \
+                mock.patch.object(quickfile, "mounts_by_source", side_effect=AssertionError):
+            for mode in ("contains", "fuzzy", "regex", "smart"):
+                with self.subTest(mode=mode):
+                    for prepared in (False, True):
+                        if prepared:
+                            quickfile.ensure_catalog_dir()
+                        listed.clear()
+                        result = self.search(self.root, "notes", mode)
+                        self.assertEqual(listed.count(catalogs), 1)
+                        self.assertEqual(result["catalog"], quickfile.catalog_stats())
+                        self.assertIn("notes.txt", [row["name"] for row in result["entries"]])
+                    listed.clear()
+                    self.search(self.root, "notes", mode, no_catalog=True)
+                    self.assertEqual(listed.count(catalogs), 0)
+
+    def test_no_catalog_leaves_offline_drives_out(self) -> None:
+        drive = self.drive()
+        self.index_drive(drive)
+        for mode in ("contains", "smart"):
+            with self.subTest(mode=mode):
+                self.assertTrue(self.search(self.elsewhere(), "beach", mode)["entries"])
+                result = self.search(self.elsewhere(), "beach", mode, no_catalog=True)
+                self.assertEqual(result["entries"], [])
+                self.assertEqual(result["catalog"], {
+                    "searched": 0, "offlineMatches": 0, "availableMatches": 0,
+                    "truncated": False, "scanned": 0,
+                })
+        code, lines = self.run_main([
+            "search", "--path", str(self.elsewhere()), "--query", "beach", "--mode", "contains",
+            "--no-git", "--no-catalog",
+        ])
+        self.assertEqual(code, 0)
+        self.assertEqual(lines[-1]["entries"], [])
+        code, lines = self.run_main([
+            "search", "--path", str(self.elsewhere()), "--query", "beach", "--mode", "smart",
+            "--no-git",
+        ])
+        self.assertEqual([row["volumeState"] for row in lines[-1]["entries"]], ["disconnected"])
+
+    def test_each_catalog_has_its_share_of_the_search(self) -> None:
+        crowded = self.corpus({f"crowded-beach-{number}.txt": b"" for number in range(60)},
+                              name="crowded")
+        with mock.patch.object(quickfile.time, "time", return_value=2000):
+            self.index_drive(crowded, disks=(self.disk(self.partition(mount=crowded,
+                                                                      uuid="CROWDED")),))
+        quiet = self.corpus({"quiet-beach.txt": b""}, name="quiet")
+        with mock.patch.object(quickfile.time, "time", return_value=1000):
+            self.index_drive(quiet, disks=(self.disk(self.partition(mount=quiet, uuid="QUIET")),))
+        real_record = quickfile.catalog_record
+
+        def slow(record):
+            # The newest catalog matches everywhere, slowly: alone it would
+            # spend the whole budget before the older one was opened.
+            if record[0].startswith(b"crowded"):
+                time.sleep(0.02)
+            return real_record(record)
+
+        with mock.patch.object(quickfile, "CATALOG_BUDGET_LIMIT", 0.4), \
+                mock.patch.object(quickfile, "catalog_record", side_effect=slow):
+            for mode in ("contains", "fuzzy", "smart"):
+                with self.subTest(mode=mode):
+                    result = self.search(self.elsewhere(), "beach", mode)
+                    volumes = {row["volumeId"] for row in result["entries"]}
+                    self.assertEqual(volumes, {"uuid:CROWDED", "uuid:QUIET"})
+                    self.assertEqual(result["catalog"]["searched"], 2)
+                    self.assertTrue(result["catalog"]["truncated"])
+
+    def test_names_that_match_are_read_before_paths_that_do(self) -> None:
+        drive = self.drive()
+        self.index_drive(drive)
+        # Past a scan bound of path-only matches, a folder named exactly what
+        # is typed, written last.
+        connection = sqlite3.connect(self.catalog_file())
+        rows = [(f"img_{number}.jpg".encode(), f"Photos/many/img_{number}.jpg".encode(), 0, "image")
+                for number in range(30)] + [(b"photo", b"Zed/photo", 1, "folder")]
+        connection.executemany(
+            "INSERT INTO entries (name, rel, name_fold, rel_fold, is_dir, is_link, hidden,"
+            " depth, size, mtime, smart_kind) VALUES (?, ?, ?, ?, ?, 0, 0, 1, 0, 1.0, ?)",
+            [(name, rel, os.fsdecode(name), os.fsdecode(rel).casefold(), is_dir, kind)
+             for name, rel, is_dir, kind in rows])
+        connection.commit()
+        connection.close()
+        with mock.patch.object(quickfile, "CATALOG_SCAN_LIMIT", 10):
+            for mode in ("contains", "fuzzy", "regex", "smart"):
+                with self.subTest(mode=mode):
+                    result = self.search(self.elsewhere(), "photo", mode)
+                    self.assertIn("Zed/photo",
+                                  [row["relativePath"] for row in result["entries"]])
+        # A regex reads the text either side of an i as it is; a dotless ı
+        # in a name still matches it, as re does.
+        passes, _order = quickfile.catalog_keyword_filter("weddings", "regex")
+        self.assertNotIn("replace(", " ".join(where for where, _params in passes))
+        passes, _order = quickfile.catalog_keyword_filter("kit", "regex")
+        self.assertIn("replace(", " ".join(where for where, _params in passes))
+
+    def test_newest_first_reads_stop_at_what_a_list_can_use(self) -> None:
+        drive = self.corpus({f"report-{number}.pdf": b"%PDF" for number in range(8)},
+                            name="papers")
+        self.index_drive(drive)
+        with mock.patch.object(quickfile, "CATALOG_NEWEST_LIMIT", 3):
+            result = self.search(self.elsewhere(), "pdf", "smart")
+        self.assertEqual(result["catalog"]["scanned"], 3)
+        self.assertEqual(len(result["entries"]), 3)
+        self.assertTrue(result["catalog"]["truncated"])
+        # A query without a filter reads every row anyway: no lookups to spare.
+        with mock.patch.object(quickfile, "CATALOG_NEWEST_LIMIT", 3):
+            regex = self.search(self.elsewhere(), "^r.p", "regex")
+        self.assertEqual(len(regex["entries"]), 8)
+
+    def test_search_reads_the_mounted_and_newest_catalogs_first(self) -> None:
+        drives = {}
+        for epoch, uuid in ((1000, "OLDEST"), (2000, "NEWEST"), (1500, "PLUGGED")):
+            drive = self.corpus({f"{uuid.lower()}-beach.txt": b""}, name=uuid.lower())
+            with mock.patch.object(quickfile.time, "time", return_value=epoch):
+                self.index_drive(drive, disks=(self.disk(self.partition(mount=drive, uuid=uuid)),))
+            drives[uuid] = drive
+        self.plug("PLUGGED", mount=drives["PLUGGED"])
+        with mock.patch.object(quickfile, "CATALOG_VOLUME_LIMIT", 2):
+            result = self.search(self.elsewhere(), "beach", "contains")
+        self.assertEqual(sorted((row["volumeId"], row["available"]) for row in result["entries"]),
+                         [("uuid:NEWEST", False), ("uuid:PLUGGED", True)])
+        self.assertEqual(result["catalog"]["searched"], 2)
+        self.assertTrue(result["catalog"]["truncated"])
+
+    def test_catalog_presence_is_read_from_dev_disk_and_the_mount_table(self) -> None:
+        presence = quickfile.catalog_volume_presence
+        disk = Path(os.environ["QUICKFILE_DEV_DISK_DIR"])
+        # An unlocked LUKS drive: its filesystem's link resolves to dm-0, and
+        # the mount table names it by its mapper path.
+        dm = self.plug("FS-1", node="dm-0")
+        mapper = self.root / "dev nodes" / "mapper"
+        mapper.mkdir()
+        (mapper / "luks-4f2a").symlink_to(dm)
+        mount = os.fsencode(self.root) + b"/media/My Drive\\2024\tx"
+        self.mount_line(mapper / "luks-4f2a", mount)
+        self.assertEqual(presence({"volumeId": "uuid:FS-1"}),
+                         (str(dm), os.fsdecode(mount), "mounted"))
+        # Locked: only the header's UUID has a link.
+        header = self.plug("LUKS-2", node="sdc1")
+        self.assertEqual(presence({"volumeId": "uuid:FS-2", "containerUuid": "LUKS-2"}),
+                         (str(header), "", "locked"))
+        # A folder of a drive bound somewhere else is not where the drive is,
+        # whichever the table lists first; a subvolume alone is.
+        plain = self.plug("PLAIN-1", node="sdd1")
+        self.assertEqual(presence({"volumeId": "uuid:PLAIN-1"}), (str(plain), "", "unmounted"))
+        self.mount_line(plain, self.root / "bound", root="/Photos")
+        self.mount_line(plain, self.root / "media" / "PLAIN")
+        self.assertEqual(presence({"volumeId": "uuid:PLAIN-1"}),
+                         (str(plain), str(self.root / "media" / "PLAIN"), "mounted"))
+        volume = self.plug("BTRFS-1", node="sde9")
+        self.mount_line(volume, self.root / "media" / "DATA", root="/@data")
+        self.assertEqual(presence({"volumeId": "uuid:BTRFS-1"}),
+                         (str(volume), str(self.root / "media" / "DATA"), "mounted"))
+        self.assertEqual(presence({"volumeId": "uuid:GONE"}), ("", "", "disconnected"))
+        (disk / "by-uuid" / "STALE").symlink_to(self.root / "dev nodes" / "sdz9")
+        self.assertEqual(presence({"volumeId": "uuid:STALE"}), ("", "", "disconnected"))
+        # The tier the catalog is filed under, and no other: a reformatted
+        # stick keeps its partition UUID but is no longer the drive.
+        (disk / "by-partuuid").mkdir()
+        (disk / "by-partuuid" / "0ab1-02").symlink_to(plain)
+        self.assertEqual(presence({"volumeId": "uuid:OLD", "partUuid": "0ab1-02"}),
+                         ("", "", "disconnected"))
+        self.assertEqual(presence({"volumeId": "part:0ab1-02"}),
+                         (str(plain), str(self.root / "media" / "PLAIN"), "mounted"))
+        (disk / "by-id").mkdir()
+        for name, node in (("usb-Pocket_Drive_S4EVNF0M123456X-0:0", "sde"),
+                           ("usb-Pocket_Drive_S4EVNF0M123456X-0:0-part2", "sde2"),
+                           ("usb-Pocket_Drive_S4EVNF0M123456X-0:0-part1", "sde1"),
+                           ("usb-Pocket_Drive_XS4EVNF0M123456X-0:0-part1", "sdf1")):
+            target = self.root / "dev nodes" / node
+            target.touch()
+            (disk / "by-id" / name).symlink_to(target)
+        self.assertEqual(presence({"volumeId": "serial:S4EVNF0M123456X:1:1000"}),
+                         (str(self.root / "dev nodes" / "sde1"), "", "unmounted"))
+        self.assertEqual(presence({"volumeId": "serial:S4EVNF0M123456X::1000"}),
+                         (str(self.root / "dev nodes" / "sde"), "", "unmounted"))
+        self.assertEqual(presence({"volumeId": "serial:S4EVNF0M123456X:p3:1000"}),
+                         ("", "", "disconnected"))
+
+    def test_settings_keep_the_offline_search_preference(self) -> None:
+        fresh = quickfile.settings_command(argparse.Namespace())
+        self.assertTrue(fresh["settings"]["offlineSearchEnabled"])
+        saved = quickfile.settings_command(argparse.Namespace(offline_search="false"))
+        self.assertTrue(saved["changed"])
+        self.assertFalse(saved["settings"]["offlineSearchEnabled"])
+        self.assertFalse(quickfile.load_settings_store()["offlineSearchEnabled"])
+        again = quickfile.settings_command(argparse.Namespace(offline_search="false"))
+        self.assertFalse(again["changed"])
+        settings = Path(os.environ["QUICKFILE_SETTINGS_FILE"])
+        # A settings file from before the preference existed has it on.
+        settings.write_text(json.dumps({"version": 2, "sortOrder": "size"}), encoding="utf-8")
+        self.assertTrue(quickfile.load_settings_store()["offlineSearchEnabled"])
+        settings.write_text(json.dumps({"version": 2, "offlineSearchEnabled": "no"}),
+                            encoding="utf-8")
+        with self.assertRaises(quickfile.QuickfileError) as raised:
+            quickfile.load_settings_store()
+        self.assertEqual(raised.exception.code, "settings-invalid")
+        settings.unlink()
+        code, lines = self.run_main(["settings", "--offline-search", "false"])
+        self.assertEqual(code, 0)
+        self.assertFalse(lines[-1]["settings"]["offlineSearchEnabled"])
+        self.assertEqual(settings.stat().st_mode & 0o777, 0o600)
+        code, lines = self.run_main(["settings", "--offline-search", "true"])
+        self.assertTrue(lines[-1]["settings"]["offlineSearchEnabled"])
 
     def run_main(self, argv: list[str]) -> tuple[int, list[dict]]:
         output = io.StringIO()

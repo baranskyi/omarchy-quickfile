@@ -33,7 +33,9 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import unicodedata
 import urllib.parse
 import uuid
 from pathlib import Path
@@ -127,6 +129,23 @@ CATALOG_SKIPPED_DIRECTORIES = frozenset({
     ".fseventsd", ".TemporaryItems", "lost+found",
 })
 CATALOG_SKIPPED_PREFIXES = (".Trash-",)
+# What one search may spend on catalogs, read before the walk: so many of
+# them, mounted drives first and then the newest, so many rows scored in each
+# and listed from all, within a share of the search's time. Past any bound the
+# answer is marked truncated, never failed, and the rows listed come after
+# the walk's without taking any of its places.
+CATALOG_VOLUME_LIMIT = 32
+CATALOG_SCAN_LIMIT = 150_000
+CATALOG_RESULT_LIMIT = 300
+CATALOG_NEWEST_LIMIT = 4 * CATALOG_RESULT_LIMIT
+CATALOG_BUDGET_SHARE = 0.25
+CATALOG_BUDGET_LIMIT = 1.25
+# The share of what is left that scanning hands over to reading the rows of a
+# mounted drive from the drive itself.
+CATALOG_LIVE_SHARE = 0.3
+# SQLite steps between two looks at the clock while a catalog is queried.
+CATALOG_PROGRESS_STEPS = 20000
+MOUNTINFO_SIZE_LIMIT = 4 * 1024 * 1024
 OPERATION_HISTORY_LIMIT = 50
 OPERATION_HISTORY_SIZE_LIMIT = 2 * 1024 * 1024
 OPERATION_JOURNAL_BUDGET = 1024 * 1024
@@ -620,6 +639,8 @@ def default_settings_store() -> dict[str, Any]:
         # SMART is the default search; the one-time tip to fetch its model
         # stays dismissed once the user installs it or says not now.
         "smartOnboardingDone": False,
+        # Every search also lists what the catalogued drives hold.
+        "offlineSearchEnabled": True,
         "modules": default_module_layout(),
     }
 
@@ -653,6 +674,9 @@ def load_settings_store() -> dict[str, Any]:
     onboarding_done = parsed.get("smartOnboardingDone", False)
     if not isinstance(onboarding_done, bool):
         raise QuickfileError("Smart Search onboarding flag must be true or false", "settings-invalid")
+    offline_search = parsed.get("offlineSearchEnabled", True)
+    if not isinstance(offline_search, bool):
+        raise QuickfileError("Offline search preference must be true or false", "settings-invalid")
     return {
         "version": 2,
         "activeSessionsEnabled": active_sessions,
@@ -660,6 +684,7 @@ def load_settings_store() -> dict[str, Any]:
         "sortOrder": sort_order,
         "dateFormat": date_format,
         "smartOnboardingDone": onboarding_done,
+        "offlineSearchEnabled": offline_search,
         "modules": normalize_module_layout(parsed.get("modules", default_module_layout())),
     }
 
@@ -721,6 +746,11 @@ def settings_command(args: argparse.Namespace) -> dict[str, Any]:
         done = onboarding_done == "true"
         changed = changed or store["smartOnboardingDone"] != done
         store["smartOnboardingDone"] = done
+    offline_search = getattr(args, "offline_search", None)
+    if offline_search is not None:
+        enabled = offline_search == "true"
+        changed = changed or store["offlineSearchEnabled"] != enabled
+        store["offlineSearchEnabled"] = enabled
     module_layout_json = getattr(args, "module_layout_json", None)
     if module_layout_json is not None:
         try:
@@ -1138,7 +1168,7 @@ def catalog_busy(directory: Path, stem: str) -> bool:
     )
 
 
-def open_catalog_ro(path: Path) -> sqlite3.Connection:
+def open_catalog_ro(path: Path, progress: Any = None) -> sqlite3.Connection:
     # Immutable: a published catalog only ever changes by os.replace, so the
     # reader takes no lock and leaves no journal on a file it merely reads.
     # Always an empty authority: a path starting with exactly two slashes,
@@ -1147,6 +1177,10 @@ def open_catalog_ro(path: Path) -> sqlite3.Connection:
            + "?mode=ro&immutable=1")
     connection = sqlite3.connect(uri, uri=True)
     try:
+        # A search's catalogs are read under its deadline from the first
+        # statement on; `progress` interrupts whatever runs past it.
+        if progress is not None:
+            connection.set_progress_handler(progress, CATALOG_PROGRESS_STEPS)
         version = connection.execute("PRAGMA user_version").fetchone()[0]
         if version != CATALOG_SCHEMA_VERSION:
             raise sqlite3.DatabaseError(f"Unsupported catalog schema {version}")
@@ -1156,8 +1190,8 @@ def open_catalog_ro(path: Path) -> sqlite3.Connection:
     return connection
 
 
-def read_catalog_meta(path: Path) -> dict[str, str]:
-    connection = open_catalog_ro(path)
+def read_catalog_meta(path: Path, progress: Any = None) -> dict[str, str]:
+    connection = open_catalog_ro(path, progress)
     try:
         rows = connection.execute("SELECT key, value FROM meta LIMIT 256").fetchall()
     finally:
@@ -1219,6 +1253,126 @@ def catalog_volumes() -> list[dict[str, Any]]:
             "entries": meta_number(meta, "entries"),
         })
     return catalogs
+
+
+def dev_disk_dir() -> Path:
+    override = os.environ.get("QUICKFILE_DEV_DISK_DIR", "").strip()
+    return Path(override).expanduser() if override else Path("/dev/disk")
+
+
+def mountinfo_file() -> Path:
+    override = os.environ.get("QUICKFILE_MOUNTINFO", "").strip()
+    return Path(override).expanduser() if override else Path("/proc/self/mountinfo")
+
+
+# The mount table writes a space, tab, newline or backslash in a field as a
+# three-digit octal escape.
+MOUNTINFO_ESCAPE = re.compile(rb"\\([0-3][0-7]{2})")
+
+
+def mountinfo_field(value: bytes) -> bytes:
+    return MOUNTINFO_ESCAPE.sub(lambda match: bytes([int(match.group(1), 8)]), value)
+
+
+def mounts_by_source() -> dict[bytes, list[tuple[bytes, bytes]]]:
+    """Every place each mounted device is mounted, as (root, mount point)
+    with the folder of the filesystem it mounts, keyed by its resolved node:
+    first the mount of the filesystem's own root, which is where it was
+    indexed from, then any folder of it bound somewhere else.
+
+    Matched on the table's source field rather than by path as mount_for()
+    does, and resolved on both sides: the table names an unlocked LUKS drive
+    /dev/mapper/luks-…, while its /dev/disk link resolves to /dev/dm-0.
+    """
+    try:
+        with open(mountinfo_file(), "rb") as stream:
+            raw = stream.read(MOUNTINFO_SIZE_LIMIT + 1)
+    except OSError:
+        return {}
+    lines = raw.split(b"\n")
+    if len(raw) > MOUNTINFO_SIZE_LIMIT:
+        # A line cut short would name some other folder.
+        lines.pop()
+    mounts: dict[bytes, list[tuple[bytes, bytes]]] = {}
+    for line in lines:
+        fields = line.split(b" ")
+        try:
+            separator = fields.index(b"-", 6)
+        except ValueError:
+            continue
+        if len(fields) < separator + 3:
+            continue
+        source = mountinfo_field(fields[separator + 2])
+        if not source.startswith(b"/"):
+            continue
+        node = os.path.realpath(source)
+        mounts.setdefault(node, []).append((mountinfo_field(fields[3]), mountinfo_field(fields[4])))
+    # The shortest root is the filesystem's own, not a folder of it bound
+    # somewhere else; a drive mounted only at a subvolume keeps that one. A
+    # tie keeps the table's order.
+    for places in mounts.values():
+        places.sort(key=lambda place: len(place[0]))
+    return mounts
+
+
+def disk_link(directory: Path, name: str) -> str:
+    """The device node a /dev/disk link names, or "" when there is none."""
+    if not name or "/" in name or name in {".", ".."}:
+        return ""
+    link = directory / name
+    return os.path.realpath(link) if os.path.exists(link) else ""
+
+
+def serial_link(directory: Path, serial: str, partition: str) -> str:
+    """The node of a partition named by its disk's serial and its place."""
+    spelled = re.sub(r"\s+", "_", serial.strip())
+    try:
+        names = sorted(os.listdir(directory)) if spelled else []
+    except OSError:
+        return ""
+    number = re.search(r"\d+$", partition)
+    ending = f"-part{number.group(0)}" if number else ""
+    # udev writes the serial after the model, before the partition:
+    # usb-Vendor_Model_<serial>-0:0-part1, ata-Model_<serial>-part1.
+    pattern = re.compile(r"(?:^|[_-])" + re.escape(spelled) + r"(?:-|$)")
+    for name in names:
+        if pattern.search(name) and (name.endswith(ending) if ending else "-part" not in name):
+            node = disk_link(directory, name)
+            if node:
+                return node
+    return ""
+
+
+def catalog_volume_presence(
+    meta: dict[str, str], mounts: dict[bytes, list[tuple[bytes, bytes]]] | None = None,
+) -> tuple[str, str, str]:
+    """Where a catalogued drive is now: its device node, its mount point, and
+    "mounted", "unmounted", "locked" or "disconnected".
+
+    Asked of /dev/disk and the mount table alone, never of lsblk, whose own
+    bound does not fit in a search. Only the identity the catalog is filed
+    under counts: a reformatted stick keeps its partition UUID, but it is no
+    longer the drive the catalog describes.
+    """
+    disk = dev_disk_dir()
+    tier, _separator, value = str(meta.get("volumeId") or "").partition(":")
+    node = ""
+    if tier == "uuid":
+        node = disk_link(disk / "by-uuid", value)
+    elif tier == "part":
+        node = disk_link(disk / "by-partuuid", value)
+    elif tier == "serial":
+        parts = value.rsplit(":", 2)
+        if len(parts) == 3:
+            node = serial_link(disk / "by-id", parts[0], parts[1])
+    if not node:
+        # A locked LUKS container shows only the UUID of its header.
+        container = disk_link(disk / "by-uuid", str(meta.get("containerUuid") or ""))
+        return (container, "", "locked") if container else ("", "", "disconnected")
+    places = (mounts_by_source() if mounts is None else mounts).get(os.fsencode(node))
+    if not places:
+        return node, "", "unmounted"
+    return node, os.fsdecode(places[0][1]), "mounted"
 
 
 def offline_volume(catalog: dict[str, Any]) -> dict[str, Any]:
@@ -2281,6 +2435,25 @@ def matches(candidate: str, query: str, mode: str, case_sensitive: bool) -> tupl
     return right in left, 600 - max(0, len(left) - len(right))
 
 
+def keyword_match(
+    name: str, relative: str, is_directory: bool, query: str, mode: str, case_sensitive: bool,
+) -> tuple[dict[str, Any], int] | None:
+    """How an entry's displayed name, else its path, answers a pattern search,
+    and its score: the walk and the offline catalog rank alike by it."""
+    found, score = matches(name, query, mode, case_sensitive)
+    if found:
+        return {
+            "matchKind": "folder" if is_directory else "name",
+            "matchLine": 0,
+            "matchSnippet": "",
+        }, score + (2500 if is_directory else 2400)
+    if relative != name:
+        found, score = matches(relative, query, mode, case_sensitive)
+        if found:
+            return {"matchKind": "path", "matchLine": 0, "matchSnippet": ""}, score + 1800
+    return None
+
+
 def content_match(
     path: str,
     query: str,
@@ -2727,10 +2900,26 @@ def smart_kind_grade(requested: str, kind: str, name: str, in_config_home: bool)
 
 
 def smart_time_matches(timestamp: float, value: str, now: dt.datetime | None = None) -> bool:
-    if value == "any":
-        return False
     current = now or dt.datetime.now().astimezone()
-    zone = current.tzinfo
+    bounds = smart_time_bounds(value, current)
+    if bounds is None:
+        return False
+    try:
+        modified = dt.datetime.fromtimestamp(float(timestamp), current.tzinfo)
+    except (OSError, OverflowError, ValueError):
+        return False
+    start, end = bounds
+    return (start is None or start <= modified) and modified < end
+
+
+def smart_time_bounds(
+    value: str, now: dt.datetime | None = None,
+) -> tuple[dt.datetime | None, dt.datetime] | None:
+    """The local-calendar window a time hint names, from (None for "older")
+    until; None for no window."""
+    if value == "any":
+        return None
+    current = now or dt.datetime.now().astimezone()
     today = current.replace(hour=0, minute=0, second=0, microsecond=0)
     this_week = today - dt.timedelta(days=today.weekday())
     this_month = today.replace(day=1)
@@ -2752,14 +2941,9 @@ def smart_time_matches(timestamp: float, value: str, now: dt.datetime | None = N
         "this-year": (this_year, this_year.replace(year=this_year.year + 1)),
         "last-year": (this_year.replace(year=this_year.year - 1), this_year),
     }
-    try:
-        modified = dt.datetime.fromtimestamp(float(timestamp), zone)
-    except (OSError, OverflowError, ValueError):
-        return False
     if value == "older":
-        return modified < last_month
-    bounds = windows.get(value)
-    return bool(bounds and bounds[0] <= modified < bounds[1])
+        return None, last_month
+    return windows.get(value)
 
 
 def smart_content_grade(size: int, factor: float) -> float:
@@ -3080,6 +3264,791 @@ class SmartMatcher:
         ]
 
 
+class SmartHeap:
+    """The best rows a SMART search has been offered, at most `limit`."""
+
+    def __init__(self, limit: int) -> None:
+        self.entries: list[tuple[float, int, dict[str, Any]]] = []
+        self.limit = limit
+        self.truncated = False
+
+    def offer(self, entry: tuple[float, int, dict[str, Any]]) -> None:
+        # A full heap gives up the rows the typed words and hints rank
+        # lowest — never because of a model hint — and between equals keeps
+        # the one found first, which is the shallower one.
+        if self.limit <= 0:
+            self.truncated = True
+        elif len(self.entries) < self.limit:
+            heapq.heappush(self.entries, entry)
+        else:
+            heapq.heappushpop(self.entries, entry)
+            self.truncated = True
+
+
+# Offline drives in search. Catalogs are read before the walk, each under the
+# catalog deadline, and their rows are listed after the walk's: scored as the
+# walk scores its own, from names, paths, sizes and dates. What a catalog
+# cannot say is left out rather than guessed: there is no content, a symlink
+# is never a folder, and a folder asked for is ranked by its own name and
+# path, not by what its files say. A dependency or cache tree is listed but
+# was never entered, even for a query that names it, while a virtualenv's
+# tool folders, which a SMART walk skips, were.
+
+
+class CatalogStat(NamedTuple):
+    st_mode: int
+    st_size: int
+    st_mtime: float
+
+
+class CatalogEntry:
+    """A catalogued entry as a SMART walk reads an os.DirEntry: the name
+    os.scandir would give and what an lstat would say."""
+
+    __slots__ = ("name", "details")
+
+    def __init__(self, name: str, mode: int, size: int, mtime: float) -> None:
+        self.name = name
+        self.details = CatalogStat(mode, size, mtime)
+
+    def stat(self, *, follow_symlinks: bool = True) -> CatalogStat:
+        return self.details
+
+
+def catalog_mode(is_dir: Any, is_link: Any) -> int:
+    # The type an lstat would have given, for file_kind() and mime_for() to
+    # say of an offline row what they say of a live one.
+    return stat.S_IFLNK if is_link else stat.S_IFDIR if is_dir else stat.S_IFREG
+
+
+def catalog_stats() -> dict[str, Any]:
+    return {
+        "searched": 0, "offlineMatches": 0, "availableMatches": 0, "truncated": False,
+        "scanned": 0,
+    }
+
+
+def catalog_deadline(start: float, timeout: float) -> float:
+    return start + min(timeout * CATALOG_BUDGET_SHARE, CATALOG_BUDGET_LIMIT)
+
+
+def catalog_scan_deadline(sources: list[dict[str, Any]], deadline: float) -> float:
+    """When scanning the catalogs stops. A mounted drive's rows are read from
+    the drive once they are found, under the same deadline, so a scan that
+    ran to the end would leave none of them."""
+    if not any(source["state"] == "mounted" for source in sources):
+        return deadline
+    now = time.monotonic()
+    return now + max(0.0, deadline - now) * (1 - CATALOG_LIVE_SHARE)
+
+
+def catalog_interrupt(deadline: float) -> Any:
+    """A SQLite progress handler that stops a catalog query at `deadline`."""
+    return lambda: 1 if time.monotonic() >= deadline else 0
+
+
+def catalog_sources(root: str, deadline: float) -> tuple[list[dict[str, Any]], bool]:
+    """The catalogs a search from `root` reads, mounted drives first and then
+    the newest, and whether any was left out.
+
+    With nothing catalogued this is one listdir. A drive mounted around the
+    root, at any of its mounts, is left out: the walk lists it live.
+    """
+    directory = catalog_dir()
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return [], False
+    found = []
+    for name in sorted(names):
+        if name.startswith(".") or not name.endswith(CATALOG_SUFFIX):
+            continue
+        stem = name[:-len(CATALOG_SUFFIX)]
+        volume_id = catalog_volume_id(stem)
+        if volume_id is not None:
+            found.append((directory / name, stem, volume_id))
+    if not found:
+        return [], False
+    mounts = mounts_by_source()
+    here = os.path.realpath(root)
+    sources: list[dict[str, Any]] = []
+    truncated = False
+    for path, stem, volume_id in found:
+        if time.monotonic() >= deadline:
+            truncated = True
+            break
+        try:
+            meta = read_catalog_meta(path, catalog_interrupt(deadline))
+            if (meta.get("volumeId") != volume_id
+                    or meta.get("state") not in {"complete", "partial"}):
+                raise sqlite3.DatabaseError("Catalog is unreadable")
+        except (sqlite3.Error, OSError):
+            # Damaged, foreign or newer: DEVICES lists it to be forgotten, and
+            # a search only says it left something out.
+            truncated = True
+            continue
+        device, mount, state = catalog_volume_presence(meta, mounts)
+        places = [
+            (os.fsdecode(folder), os.path.realpath(os.fsdecode(point)))
+            for folder, point in (mounts.get(os.fsencode(device), []) if state == "mounted" else [])
+        ]
+        if any(path_within(here, point) for _folder, point in places):
+            continue
+        sources.append({
+            "path": path,
+            "stem": stem,
+            "volumeId": volume_id,
+            "state": state,
+            "mount": mount,
+            # Each (folder of the filesystem, mount point), the one indexed
+            # first: where else the walk may list the same files.
+            "places": places,
+            # The drive's own name, without what tells two of them apart in
+            # DEVICES: the row says the model and size beside it.
+            "name": meta.get("label") or meta.get("name") or volume_id,
+            "model": meta.get("model", ""),
+            "sizeText": human_size(meta_number(meta, "size")),
+            "indexedAt": meta.get("indexedAt", ""),
+            "indexedEpoch": meta_number(meta, "indexedEpoch"),
+            "catalogState": meta["state"],
+        })
+    sources.sort(key=lambda source: (
+        source["state"] != "mounted", -source["indexedEpoch"], source["volumeId"],
+    ))
+    if len(sources) > CATALOG_VOLUME_LIMIT:
+        truncated = True
+        del sources[CATALOG_VOLUME_LIMIT:]
+    return sources, truncated
+
+
+def catalog_record(record: tuple[Any, ...]) -> bool:
+    """Whether a catalog row is one the indexer could have written: a path
+    of the drive's own names ending in this one, and numbers where numbers
+    go. Nothing a damaged catalog holds may lead off the drive or into the
+    JSON the panel parses."""
+    name, rel, is_dir, is_link, depth, size, mtime = record
+    if not (isinstance(name, bytes) and isinstance(rel, bytes)
+            and all(isinstance(value, int) for value in (is_dir, is_link, depth, size))
+            and isinstance(mtime, (int, float)) and math.isfinite(mtime)):
+        return False
+    parts = rel.split(b"/")
+    return parts[-1] == name and not any(
+        part in {b"", b".", b".."} or b"\0" in part for part in parts
+    )
+
+
+def catalog_records(
+    sources: list[dict[str, Any]], passes: list[tuple[str, list[Any]]], order: str,
+    show_hidden: bool, deadline: float, stats: dict[str, Any],
+) -> Iterable[tuple[dict[str, Any], tuple[Any, ...]]]:
+    """Each catalog row a pass keeps, as (name, rel, is_dir, is_link, depth,
+    size, mtime), catalog by catalog until the deadline.
+
+    Each catalog has an even share of the time left, so one with many
+    matches cannot keep the others unread, and within it the passes run in
+    turn, the likely best rows first, under one scan bound for all of them.
+    A catalog that fails, or that its share or its bound cuts short, marks
+    the answer truncated and never fails the search.
+    """
+    hidden = [] if show_hidden else ["hidden = 0"]
+    queries = []
+    for where, params in passes:
+        clauses = hidden + ([f"({where})"] if where else [])
+        queries.append((
+            "SELECT name, rel, is_dir, is_link, depth, size, mtime FROM entries"
+            + (" WHERE " + " AND ".join(clauses) if clauses else "")
+            + (" " + order if order else "") + " LIMIT ?",
+            params,
+        ))
+    # Newest first through the mtime index costs a row lookup per entry the
+    # filter turns down, so a filtered read in that order stops at what a
+    # list could use; one with no filter turns nothing down.
+    bound = (CATALOG_NEWEST_LIMIT if order and any(where for where, _params in passes)
+             else CATALOG_SCAN_LIMIT)
+    for index, source in enumerate(sources):
+        now = time.monotonic()
+        if now >= deadline:
+            stats["truncated"] = True
+            return
+        share = now + (deadline - now) / (len(sources) - index)
+        try:
+            connection = open_catalog_ro(source["path"], catalog_interrupt(share))
+        except (sqlite3.Error, OSError):
+            stats["truncated"] = True
+            continue
+        stats["searched"] += 1
+        fetched = 0
+        try:
+            for sql, params in queries:
+                if fetched >= bound or time.monotonic() >= share:
+                    stats["truncated"] = True
+                    break
+                for record in connection.execute(sql, [*params, bound - fetched]):
+                    fetched += 1
+                    if not catalog_record(record):
+                        continue
+                    stats["scanned"] += 1
+                    yield source, record
+                    if time.monotonic() >= share:
+                        stats["truncated"] = True
+                        break
+                if time.monotonic() >= share:
+                    break
+        except sqlite3.Error:
+            # Interrupted at the end of its share, or damaged past its meta table.
+            stats["truncated"] = True
+        finally:
+            connection.close()
+        if fetched >= bound:
+            stats["truncated"] = True
+
+
+def catalog_token(source: dict[str, Any], rel: bytes) -> str:
+    # No path token: decode_path refuses its colons, so nothing that takes a
+    # path can be handed a file that is not there.
+    return f"catalog:{source['stem']}:{encode_path(rel)}"
+
+
+def catalog_row(source: dict[str, Any], record: tuple[Any, ...]) -> dict[str, Any]:
+    """An offline row, with every key entry_row gives, from the catalog alone."""
+    raw_name, rel, is_dir, is_link, depth, size, mtime = record
+    name = display_text(os.fsdecode(raw_name))
+    mode = catalog_mode(is_dir, is_link)
+    return {
+        "name": name,
+        "path": f"{source['name']}:/{display_text(os.fsdecode(rel))}",
+        "token": catalog_token(source, rel),
+        "uri": "",
+        "shellQuotedPath": "",
+        "depth": depth,
+        "kind": file_kind(mode),
+        "isDir": bool(is_dir),
+        "isSymlink": bool(is_link),
+        "isHidden": name.startswith("."),
+        "isExecutable": False,
+        "hasChildren": False,
+        "expanded": False,
+        "size": size,
+        "sizeText": human_size(size),
+        "modified": iso_time(mtime),
+        "modifiedEpoch": mtime,
+        "permissions": "",
+        "mode": "",
+        "mime": mime_for(name, mode),
+        "git": "",
+    }
+
+
+# Where else a mounted drive's row may be listed, kept on the row until
+# unlisted_catalog_rows() has compared it with the walk's.
+CATALOG_PLACES = "_places"
+
+
+def catalog_places(source: dict[str, Any], rel: bytes) -> set[str]:
+    """Every path a walk could list a mounted drive's entry at: under each
+    mount of the drive whose folder holds it. The mount points are resolved
+    once per search and the indexer followed no link, so nothing here reads
+    the drive."""
+    folder = source["places"][0][0] if source["places"] else "/"
+    inside = os.path.join(folder, os.fsdecode(rel))
+    return {
+        os.path.normpath(os.path.join(point, os.path.relpath(inside, root)))
+        for root, point in source["places"] if path_within(inside, root)
+    }
+
+
+def catalog_live_row(source: dict[str, Any], record: tuple[Any, ...]) -> dict[str, Any] | None:
+    """A mounted drive's catalogued entry read from the drive, or None for a
+    file gone since the drive was indexed, as for any row that went stale."""
+    try:
+        return entry_row(
+            os.path.join(source["mount"], os.fsdecode(record[1])), record[4], {"statuses": {}},
+            set(),
+        )
+    except QuickfileError:
+        return None
+
+
+def catalog_entry_rows(
+    candidates: list[tuple[dict[str, Any], tuple[Any, ...]]], deadline: float,
+    stats: dict[str, Any],
+) -> list[tuple[int, dict[str, Any]]]:
+    """The rows of the first CATALOG_RESULT_LIMIT candidates as the panel
+    lists them, each with its place in `candidates`: live, with its real
+    token, while its drive is mounted, else offline.
+
+    entry_row reads a mounted drive itself — an lstat, and a readdir for a
+    folder — where no SQL deadline reaches, so it reads in a thread of its
+    own: a drive spinning up or failing holds that thread, never the
+    search. A row it has not read by the deadline is listed from the
+    catalog, offline although its drive is mounted, which the panel opens by
+    searching again.
+    """
+    read: dict[int, dict[str, Any] | None] = {}
+    lock = threading.Lock()
+    stop = threading.Event()
+
+    def reader() -> None:
+        listed = 0
+        for index, (source, record) in enumerate(candidates):
+            if listed >= CATALOG_RESULT_LIMIT or stop.is_set():
+                return
+            if source["state"] != "mounted":
+                listed += 1
+                continue
+            row = catalog_live_row(source, record)
+            with lock:
+                read[index] = row
+            listed += row is not None
+
+    if any(source["state"] == "mounted" for source, _record in candidates):
+        thread = threading.Thread(target=reader, name="quickfile-catalog-rows", daemon=True)
+        thread.start()
+        thread.join(max(0.0, deadline - time.monotonic()))
+        stop.set()
+    with lock:
+        read = dict(read)
+    rows: list[tuple[int, dict[str, Any]]] = []
+    for index, (source, record) in enumerate(candidates):
+        if len(rows) >= CATALOG_RESULT_LIMIT:
+            stats["truncated"] = True
+            break
+        available = index in read
+        if available and read[index] is None:
+            continue
+        if source["state"] == "mounted" and not available:
+            stats["truncated"] = True
+        row = read[index] if available else catalog_row(source, record)
+        rel = record[1]
+        row.update({
+            "origin": "catalog",
+            "available": available,
+            # One key while the drive comes and goes, for the panel to follow
+            # the row from offline to live.
+            "catalogToken": catalog_token(source, rel),
+            "volumeId": source["volumeId"],
+            "volumeName": source["name"],
+            "volumeModel": source["model"],
+            "volumeSizeText": source["sizeText"],
+            "volumeState": source["state"],
+            "indexedAt": source["indexedAt"],
+            "indexedEpoch": source["indexedEpoch"],
+            "catalogState": source["catalogState"],
+        })
+        if source["state"] == "mounted":
+            row[CATALOG_PLACES] = catalog_places(source, rel)
+        rows.append((index, row))
+    return rows
+
+
+def listed_place(path: str, folders: dict[str, str]) -> str:
+    """Where a listed path is, with the links to its folder resolved but not
+    a link it is itself, the way a walk that follows no link reached it."""
+    folder, name = os.path.split(path)
+    if folder not in folders:
+        folders[folder] = os.path.realpath(folder)
+    return os.path.join(folders[folder], name)
+
+
+def unlisted_catalog_rows(
+    listed: list[dict[str, Any]], rows: list[dict[str, Any]], stats: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """The catalog rows the walk has not listed itself, as it does for a
+    drive mounted below the root, counted for the panel. The same file is
+    found however the walk reached it: through a link above the mount, or a
+    folder of the drive bound elsewhere."""
+    tokens = {row["token"] for row in listed}
+    places: set[str] = set()
+    if any(CATALOG_PLACES in row for row in rows):
+        folders: dict[str, str] = {}
+        for row in listed:
+            try:
+                places.add(listed_place(decode_path(row["token"]), folders))
+            except QuickfileError:
+                continue
+    kept = []
+    for row in rows:
+        where = row.pop(CATALOG_PLACES, set())
+        if row["token"] not in tokens and not (where & places):
+            kept.append(row)
+    stats["availableMatches"] = sum(1 for row in kept if row["available"])
+    stats["offlineMatches"] = len(kept) - stats["availableMatches"]
+    return kept
+
+
+# What a folded name may not keep where its displayed name has it: an
+# apostrophe between letters folds away, and a byte that is not UTF-8 is
+# displayed as "?" but folded as U+FFFD.
+CATALOG_UNSURE = re.compile("['\u2019\u02bc?]")
+
+
+def catalog_needles(text: str) -> list[str]:
+    """Folded pieces of `text`, all of which a catalog's folded path holds
+    wherever its displayed path holds `text`, in any case."""
+    needles = []
+    for piece in CATALOG_UNSURE.split(text.casefold()):
+        folded = fold_text(piece)
+        # A combining mark at either end may sit elsewhere once the whole
+        # name is decomposed.
+        start, end = 0, len(folded)
+        while start < end and unicodedata.combining(folded[start]):
+            start += 1
+        while end > start and unicodedata.combining(folded[end - 1]):
+            end -= 1
+        if end > start:
+            needles.append(folded[start:end])
+    return needles
+
+
+def catalog_subsequence(text: str) -> str:
+    """A LIKE pattern a catalog's folded path matches wherever its displayed
+    path holds the letters of `text` in order, as fuzzy_score() asks."""
+    letters: list[str] = []
+    for char in CATALOG_UNSURE.sub("", text.casefold()):
+        for folded in fold_text(char):
+            # Folding merges a doubled Cyrillic letter, so one letter of the
+            # pattern stands for a run of them.
+            if unicodedata.combining(folded) or (letters and letters[-1] == folded):
+                continue
+            letters.append(folded)
+    if not letters:
+        return ""
+    return "%" + "%".join("\\" + char if char in "%_\\" else char for char in letters) + "%"
+
+
+def regex_required_text(query: str) -> list[str]:
+    """Runs of literal text every match of a regular expression holds; none
+    where that cannot be told, as across an alternation."""
+    try:
+        # The parser re compiles with: private, but kept since Python 3.11.
+        from re import _parser as regex
+
+        repeats = {regex.MAX_REPEAT, regex.MIN_REPEAT, getattr(regex, "POSSESSIVE_REPEAT", None)}
+        runs: list[str] = []
+
+        def visit(items: Any) -> None:
+            run: list[str] = []
+            for op, value in items:
+                if op is regex.LITERAL:
+                    run.append(chr(value))
+                    continue
+                if run:
+                    runs.append("".join(run))
+                    run = []
+                # What a group, a repeat of at least once or an atomic group
+                # holds is in every match too, if not beside its neighbours.
+                if op is regex.SUBPATTERN:
+                    visit(value[-1])
+                elif op in repeats and value[0] >= 1:
+                    visit(value[2])
+                elif op is getattr(regex, "ATOMIC_GROUP", None):
+                    visit(value)
+            if run:
+                runs.append("".join(run))
+
+        visit(regex.parse(query))
+        return runs
+    except (ImportError, AttributeError, TypeError, ValueError, RecursionError, re.error):
+        return []
+
+
+def catalog_name_passes(tests: list[tuple[str, Any]]) -> list[tuple[str, list[Any]]]:
+    """Two reads of what `tests` keep — each a clause with {} for the column,
+    and its value — rows whose name passes them first, then rows only their
+    path does. A match in a name outranks any in its folders (keyword_match),
+    so a catalog's scan bound is not spent on the weaker ones first."""
+    values = [value for _clause, value in tests]
+
+    def holds(column: str) -> str:
+        return " AND ".join(clause.format(column) for clause, _value in tests)
+
+    return [
+        (holds("name_fold"), values),
+        (f"({holds('rel_fold')}) AND NOT ({holds('name_fold')})", values + values),
+    ]
+
+
+def catalog_keyword_filter(query: str, mode: str) -> tuple[list[tuple[str, list[Any]]], str]:
+    """SQL passes keeping at least every catalog row matches() can accept in
+    `mode`, and the order to read them in."""
+    if mode == "fuzzy":
+        pattern = catalog_subsequence(query)
+        if pattern:
+            return catalog_name_passes([("{} LIKE ? ESCAPE '\\'", pattern)]), ""
+    elif mode == "regex":
+        # Case-blind, re takes i and a dotless ı for one letter, which
+        # folding keeps apart; short runs would keep most of a drive.
+        tests = []
+        for run in regex_required_text(query):
+            for needle in catalog_needles(run):
+                needle = needle.replace("\u0131", "i")
+                if len(needle) < 3:
+                    continue
+                # Rewriting every row to compare an i costs a scan most of
+                # its speed: the text either side of each i is asked as it
+                # is, unless that leaves too little to ask.
+                pieces = [piece for piece in needle.split("i") if len(piece) >= 3]
+                if pieces:
+                    tests.extend(("instr({}, ?) > 0", piece) for piece in pieces)
+                else:
+                    tests.append(("instr(replace({}, '\u0131', 'i'), ?) > 0", needle))
+        if tests:
+            return catalog_name_passes(tests), ""
+    else:
+        needles = catalog_needles(query)
+        if needles:
+            return catalog_name_passes([("instr({}, ?) > 0", needle) for needle in needles]), ""
+    # Nothing every match must hold: the newest rows one catalog may give.
+    return [("", [])], "ORDER BY mtime DESC"
+
+
+def catalog_keyword_rows(
+    args: argparse.Namespace, root: str, query: str, deadline: float,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """The catalogued rows a pattern search finds, best first, scored as the
+    walk scores its own: by name, else by path, never by content."""
+    stats = catalog_stats()
+    if getattr(args, "no_catalog", False):
+        return [], stats
+    sources, stats["truncated"] = catalog_sources(root, deadline)
+    if not sources:
+        return [], stats
+    passes, order = catalog_keyword_filter(query, args.mode)
+    found: list[tuple[int, str, dict[str, Any], tuple[Any, ...], dict[str, Any]]] = []
+    # A few more are held than are listed: a mounted drive may have lost some
+    # since it was indexed, and the walk may list others itself.
+    held = 2 * CATALOG_RESULT_LIMIT
+
+    def rank(candidate: tuple[Any, ...]) -> tuple[Any, ...]:
+        score, relative, source = candidate[:3]
+        return -score, relative.casefold(), source["name"].casefold(), source["volumeId"]
+
+    records = catalog_records(
+        sources, passes, order, args.show_hidden, catalog_scan_deadline(sources, deadline), stats,
+    )
+    for source, record in records:
+        relative = display_text(os.fsdecode(record[1]))
+        scored = keyword_match(
+            display_text(os.fsdecode(record[0])), relative, bool(record[2]), query, args.mode,
+            args.case_sensitive,
+        )
+        if scored is None:
+            continue
+        found.append((scored[1], relative, source, record, scored[0]))
+        if len(found) >= 2 * held:
+            found.sort(key=rank)
+            del found[held:]
+            stats["truncated"] = True
+    found.sort(key=rank)
+    rows: list[dict[str, Any]] = []
+    for index, row in catalog_entry_rows(
+            [(source, record) for _score, _relative, source, record, _match in found],
+            deadline, stats):
+        row["relativePath"] = found[index][1]
+        row.update(found[index][4])
+        rows.append(row)
+    return rows, stats
+
+
+def smart_catalog_literals(matcher: SmartMatcher) -> list[str] | None:
+    """Text, one piece of which a catalog row's folded path holds wherever a
+    keyword is in its name or folders; None when a keyword has none.
+
+    It is what SmartMatcher.name() probes a name for before it looks closer.
+    A Latin spelling meets a name of the other script by its transliteration,
+    which no catalog column holds, so offline it finds names written with it.
+    """
+    literals: set[str] = set()
+    for index in range(len(matcher.terms)):
+        found = {form[1] for form in matcher.forms if form[0] == index}
+        found.update(form[1] for form in matcher.latin if form[0] == index)
+        found.update(stem for at, stem in matcher.stems if at == index)
+        found.update(probe for at, probe, _typo in matcher.typos if at == index)
+        found.update(number for at, number, _dated in matcher.months if at == index)
+        for at, text in matcher.symbols:
+            if at == index:
+                found.update(catalog_needles(text))
+        found.discard("")
+        if not found:
+            return None
+        literals |= found
+    # A literal inside another finds every row the longer one would.
+    return sorted(
+        literal for literal in literals
+        if not any(other != literal and other in literal for other in literals)
+    )
+
+
+def smart_catalog_filter(
+    matcher: SmartMatcher, filters: set[str], filter_kinds: set[str], target: str,
+    suffixes: tuple[str, ...], period: str, now: dt.datetime,
+) -> tuple[list[tuple[str, list[Any]]], str] | None:
+    """SQL passes keeping the catalog rows a SMART walk could list, and the
+    order to read them in; None when the query keeps nothing.
+
+    A query with keywords needs one of them in a row's name or folders, or a
+    type that says one, and the rows its name or type answers are read
+    before those only a folder does. A query of hints alone lists what
+    satisfies a hint it typed, newest first, the rows with every hint first:
+    keep() ranks them so.
+    """
+
+    def dated() -> tuple[str, list[Any]]:
+        bounds = smart_time_bounds(period, now)
+        if bounds is None:
+            return "0", []
+        start, end = bounds
+        # A second wider either way: keep() decides on the exact date.
+        clause, values = "mtime < ?", [end.timestamp() + 1]
+        if start is not None:
+            clause, values = "mtime >= ? AND " + clause, [start.timestamp() - 1, *values]
+        # A folder's date counts only when folders are asked for.
+        return (clause if target == "folder" else clause + " AND is_dir = 0"), values
+
+    def formatted() -> tuple[str, list[Any]]:
+        endings = " OR ".join(["substr(name_fold, ?) = ?"] * len(suffixes))
+        return f"is_dir = 0 AND ({endings})", [
+            value for suffix in suffixes for value in (-len(suffix), suffix)
+        ]
+
+    clauses: list[str] = []
+    params: list[Any] = []
+
+    def add(clause: str, values: list[Any]) -> None:
+        clauses.append(f"({clause})")
+        params.extend(values)
+
+    if matcher.terms:
+        literals = smart_catalog_literals(matcher)
+        if literals is None:
+            return [("", [])], ""
+        add(" OR ".join(["instr(name_fold, ?) > 0"] * len(literals)), literals)
+        types = frozenset().union(*(term.types for term in matcher.terms))
+        if types:
+            # Listed for what its type says alone, a row must also have the
+            # date and format typed, as keep() asks.
+            kinds = sorted(types - {"folder"})
+            of_type = ([f"is_dir = 0 AND smart_kind IN ({', '.join('?' * len(kinds))})"]
+                       if kinds else []) + (["is_dir = 1"] if "folder" in types else [])
+            branch, values = [" OR ".join(f"({part})" for part in of_type)], list(kinds)
+            for wanted, condition in (("time", dated), ("format", formatted)):
+                if wanted in filters:
+                    clause, more = condition()
+                    branch.append(clause)
+                    values.extend(more)
+            add(" AND ".join(f"({part})" for part in branch), values)
+        named = " OR ".join(clauses)
+        in_folders = " OR ".join(["instr(rel_fold, ?) > 0"] * len(literals))
+        return [
+            (named, params), (f"({in_folders}) AND NOT ({named})", [*literals, *params]),
+        ], ""
+    if "kind" in filters:
+        kinds = sorted(filter_kinds)
+        # A folder named for a kind ("Photos") is where it is kept, which
+        # only its name tells.
+        add(f"is_dir = 1 OR smart_kind IN ({', '.join('?' * len(kinds))})", kinds)
+    if "time" in filters:
+        add(*dated())
+    if "format" in filters:
+        add(*formatted())
+    if "target" in filters:
+        add("is_dir = 1" if target == "folder" else "is_dir = 0", [])
+    if not clauses:
+        return None
+    if len(clauses) == 1:
+        return [(clauses[0], params)], "ORDER BY mtime DESC"
+    every = " AND ".join(clauses)
+    return [
+        (every, params), (f"({' OR '.join(clauses)}) AND NOT ({every})", [*params, *params]),
+    ], "ORDER BY mtime DESC"
+
+
+def catalog_smart_items(
+    records: Iterable[tuple[dict[str, Any], tuple[Any, ...]]], matcher: SmartMatcher,
+    spent_matcher: SmartMatcher, types_asked: bool, spelled: list[bool],
+) -> Iterable[tuple[dict[str, Any], bool]]:
+    """Catalog rows as the items a SMART walk would offer to keep(), each
+    with whether a slip in its name waits until every name has been seen.
+
+    A row's folders are graded as the walk grades the directories it enters,
+    once per folder, and `spelled` is kept as the walk keeps its own. Nothing
+    is read from a drive: there is no content, and no configuration home.
+    """
+    terms = matcher.terms
+    no_grades = [0.0] * len(terms)
+    no_spent = [0.0] * len(spent_matcher.terms)
+    spends = bool(spent_matcher.terms)
+    folders: dict[tuple[str, bytes], tuple[list[float], list[float], bool]] = {}
+
+    def folder(volume_id: str, rel: bytes) -> tuple[list[float], list[float], bool]:
+        """What the path down to `rel` says of each keyword and spent word,
+        and whether `rel` is named for a year."""
+        known = folders.get((volume_id, rel))
+        if known is not None:
+            return known
+        if not rel:
+            known = (no_grades, no_spent, False)
+        else:
+            parent, _separator, raw = rel.rpartition(b"/")
+            inherited, spent_inherited, in_year = folder(volume_id, parent)
+            name = os.fsdecode(raw)
+            evidence = matcher.name(name, True, in_year) if terms else None
+            grades = evidence.grades if evidence else no_grades
+            if evidence and any(evidence.typed):
+                grades = matcher.own(evidence, "folder")
+            named_for = spent_matcher.name(name, True) if spends else None
+            spent_own = named_for.grades if named_for else no_spent
+            known = (
+                [
+                    max(above * SMART_PATH_DECAY, grade * SMART_PATH_FACTOR)
+                    for above, grade in zip(inherited, grades)
+                ] if evidence or any(inherited) else inherited,
+                [
+                    max(above * SMART_PATH_DECAY, grade * SMART_PATH_FACTOR)
+                    for above, grade in zip(spent_inherited, spent_own)
+                ],
+                SMART_YEAR_FOLDER.fullmatch(name) is not None,
+            )
+        folders[(volume_id, rel)] = known
+        return known
+
+    for source, record in records:
+        raw_name, rel, is_dir, is_link, depth, size, mtime = record
+        name = os.fsdecode(raw_name)
+        path_grades, spent_path, in_year = folder(source["volumeId"], rel.rpartition(b"/")[0])
+        evidence = matcher.name(name, bool(is_dir), in_year) if terms else None
+        grades = evidence.grades if evidence else no_grades
+        if evidence and any(evidence.typed):
+            grades = matcher.own(evidence, "folder" if is_dir else smart_file_kind(name, False))
+        if evidence:
+            spelled[:] = [seen or grade > 0 for seen, grade in zip(spelled, grades)]
+        named_for = spent_matcher.name(name, bool(is_dir)) if spends else None
+        spent_own = named_for.grades if named_for else no_spent
+        typo = evidence is not None and any(
+            slip and not seen for slip, seen in zip(evidence.typos, spelled)
+        )
+        # The walk's own gate, with no text to read and no folder to gather.
+        if terms and evidence is None and not any(path_grades):
+            if not types_asked:
+                continue
+            entry_type = "folder" if is_dir else smart_file_kind(name, False)
+            if not any(entry_type in term.types for term in terms):
+                continue
+        relative = os.fsdecode(rel)
+        yield {
+            "path": f"{source['name']}:/{relative}",
+            "relative": relative,
+            "entry": CatalogEntry(name, catalog_mode(is_dir, is_link), size, mtime),
+            "isDir": bool(is_dir),
+            "depth": depth,
+            "name": evidence,
+            "paths": path_grades,
+            "inConfigHome": False,
+            "spent": [max(pair) for pair in zip(spent_own, spent_path)],
+            "catalog": (source, record),
+        }, typo
+
+
 def smart_search_command(args: argparse.Namespace, root: str, query: str) -> dict[str, Any]:
     plan, smart_state, fallback_reason = smart_plan_from_args(args, query)
     hints = plan["hints"]
@@ -3140,7 +4109,9 @@ def smart_search_command(args: argparse.Namespace, root: str, query: str) -> dic
     no_spent = [0.0] * len(spent_matcher.terms)
 
     git = git_context(root) if not args.no_git else {"root": "", "branch": "", "statuses": {}}
-    deadline = time.monotonic() + max(0.25, float(args.timeout))
+    start = time.monotonic()
+    timeout = max(0.25, float(args.timeout))
+    deadline = start + timeout
     content_file_limit = max(
         0, int(getattr(args, "content_file_limit", DEFAULT_CONTENT_FILE_LIMIT))
     )
@@ -3150,30 +4121,16 @@ def smart_search_command(args: argparse.Namespace, root: str, query: str) -> dic
     # A request in words is matched without regard to case; --case-sensitive
     # belongs to the pattern modes.
     patterns = [smart_content_pattern(term.content_forms) for term in terms]
-    term_files: list[set[str] | None] = [None] * len(terms)
-    content_search_backend = "none"
-    if content_byte_limit > 0 and any(patterns):
-        term_files = rg_smart_term_files(
-            root, [term.content_forms for term in terms], skipped, args.show_hidden,
-            content_file_limit, deadline,
-        )
-        answered_any = any(files is not None for files in term_files)
-        content_search_backend = "rg" if answered_any else "python"
-    answered = [index for index, files in enumerate(term_files) if files is not None]
-    unread = [
-        index for index, pattern in enumerate(patterns)
-        if pattern is not None and term_files[index] is None
-    ]
 
     watch = WatchPaths()
     watch.add_git(git)
-    heap: list[tuple[float, int, dict[str, Any]]] = []
     serial = 0
     scanned = 0
     pruned = 0
     content_bytes_scanned = 0
     truncated = False
     limit = max(0, int(args.limit))
+    heap = SmartHeap(limit)
     scan_limit = max(0, int(args.scan_limit))
     now = dt.datetime.now().astimezone()
     no_grades = [0.0] * len(terms)
@@ -3199,9 +4156,13 @@ def smart_search_command(args: argparse.Namespace, root: str, query: str) -> dic
             vector = [grade * SMART_GATHER_DECAY for grade in vector]
             ancestor = os.path.dirname(ancestor)
 
-    def keep(item: dict[str, Any], content: dict[int, float], hit: dict[str, Any] | None) -> None:
-        """Score one entry with all of its evidence and offer it to the heap."""
-        nonlocal serial, truncated
+    def keep(
+        item: dict[str, Any], content: dict[int, float], hit: dict[str, Any] | None,
+        pool: SmartHeap | None = None, seen: list[bool] | None = None,
+    ) -> None:
+        """Score one entry with all of its evidence and offer it to the heap:
+        the walk's own, or `pool` with the keywords `seen` in its names."""
+        nonlocal serial
         name = item["entry"].name
         is_dir = item["isDir"]
         evidence: SmartName | None = item["name"]
@@ -3210,7 +4171,7 @@ def smart_search_command(args: argparse.Namespace, root: str, query: str) -> dic
         own = matcher.own(evidence, entry_type)
         if evidence:
             for index, slip in enumerate(evidence.typos):
-                if slip and not spelled[index]:
+                if slip and not (spelled if seen is None else seen)[index]:
                     own[index] = max(own[index], slip)
         paths = item["paths"]
         child = item.get("child") or no_grades
@@ -3245,7 +4206,9 @@ def smart_search_command(args: argparse.Namespace, root: str, query: str) -> dic
         # "screenshots", any .lua file for "lua" — is one only on the date and
         # in the format the query typed.
         by_type = required and not any(literal)
-        if gathers and not is_dir and (any(own) or content):
+        # Only the walk gathers into its folders: what a catalog says stays
+        # with the catalog's rows.
+        if gathers and pool is None and not is_dir and (any(own) or content):
             lift(item["path"], [
                 max(own[index] * SMART_PATH_FACTOR,
                     content.get(index, 0.0) * SMART_FOLDER_TEXT_FACTOR)
@@ -3348,18 +4311,7 @@ def smart_search_command(args: argparse.Namespace, root: str, query: str) -> dic
             match = {"matchKind": "smart", "matchLine": 0, "matchSnippet": ""}
         item.update({"score": firm + model, "firm": firm, "reasons": reasons, "match": match})
         serial += 1
-        if limit <= 0:
-            truncated = True
-            return
-        # A full heap gives up the rows the typed words and hints rank lowest —
-        # never because of a model hint — and between equals keeps the one
-        # found first, which is the shallower one.
-        entry = (firm, -serial, item)
-        if len(heap) < limit:
-            heapq.heappush(heap, entry)
-        else:
-            heapq.heappushpop(heap, entry)
-            truncated = True
+        (heap if pool is None else pool).offer((firm, -serial, item))
 
     def defer(item: dict[str, Any]) -> bool:
         nonlocal truncated
@@ -3368,6 +4320,65 @@ def smart_search_command(args: argparse.Namespace, root: str, query: str) -> dic
             return False
         deferred.append(item)
         return True
+
+    # Catalogued drives first, within their own share of the time, into a heap
+    # of their own: they never take a place from what the walk finds, nor it
+    # one of theirs. A slip counts while its word is in no catalogued name as
+    # typed, whatever the walk finds.
+    catalog = catalog_stats()
+    catalog_rows: list[dict[str, Any]] = []
+    offline_deadline = catalog_deadline(start, timeout)
+    query_filter = None if getattr(args, "no_catalog", False) else smart_catalog_filter(
+        matcher, filters, filter_kinds, target, suffixes, hints["time"]["value"], now,
+    )
+    sources: list[dict[str, Any]] = []
+    if query_filter is not None:
+        sources, catalog["truncated"] = catalog_sources(root, offline_deadline)
+    if sources and query_filter is not None:
+        offline = SmartHeap(CATALOG_RESULT_LIMIT)
+        offline_spelled = [False] * len(terms)
+        waiting: list[dict[str, Any]] = []
+        records = catalog_records(
+            sources, *query_filter, args.show_hidden,
+            catalog_scan_deadline(sources, offline_deadline), catalog,
+        )
+        for item, typo in catalog_smart_items(
+                records, matcher, spent_matcher, types_asked, offline_spelled):
+            if typo:
+                if len(waiting) < SMART_DEFERRED_LIMIT:
+                    waiting.append(item)
+                    continue
+                catalog["truncated"] = True
+            keep(item, {}, None, offline, offline_spelled)
+        for item in waiting:
+            keep(item, {}, None, offline, offline_spelled)
+        catalog["truncated"] = catalog["truncated"] or offline.truncated
+        ranked = sorted((entry[2] for entry in offline.entries), key=lambda item: (
+            -item["score"], item["depth"], item["relative"].casefold(),
+            item["catalog"][0]["volumeId"]))
+        for index, row in catalog_entry_rows(
+                [item["catalog"] for item in ranked], offline_deadline, catalog):
+            item = ranked[index]
+            row["relativePath"] = display_text(item["relative"])
+            row.update(item["match"])
+            row["smartScore"] = round(item["score"] * SMART_SCORE_SCALE)
+            row["smartReasons"] = item["reasons"][:4]
+            catalog_rows.append(row)
+
+    term_files: list[set[str] | None] = [None] * len(terms)
+    content_search_backend = "none"
+    if content_byte_limit > 0 and any(patterns):
+        term_files = rg_smart_term_files(
+            root, [term.content_forms for term in terms], skipped, args.show_hidden,
+            content_file_limit, deadline,
+        )
+        answered_any = any(files is not None for files in term_files)
+        content_search_backend = "rg" if answered_any else "python"
+    answered = [index for index, files in enumerate(term_files) if files is not None]
+    unread = [
+        index for index, pattern in enumerate(patterns)
+        if pattern is not None and term_files[index] is None
+    ]
 
     # Each directory to list, what its path says of each keyword and of each
     # spent word, and whether it is a dot-directory or inside one, which wait
@@ -3560,7 +4571,7 @@ def smart_search_command(args: argparse.Namespace, root: str, query: str) -> dic
     # Between rows the evidence ranks alike, the shallower copy is usually the
     # one in use; the order is then the name's, which does not shift as new
     # files arrive.
-    listed = [entry[2] for entry in heap]
+    listed = [entry[2] for entry in heap.entries]
     # rg says which files hold the words, not where: the line shown is read
     # for the rows returned while the budget lasts, best first by the typed
     # words and hints, so that a model hint never decides which files are read.
@@ -3589,6 +4600,7 @@ def smart_search_command(args: argparse.Namespace, root: str, query: str) -> dic
         row["smartScore"] = round(item["score"] * SMART_SCORE_SCALE)
         row["smartReasons"] = item["reasons"][:4]
         rows.append(row)
+    rows.extend(unlisted_catalog_rows(rows, catalog_rows, catalog))
     metadata = load_metadata_store()
     enrich_rows(rows, metadata)
     smart_payload = {
@@ -3611,7 +4623,8 @@ def smart_search_command(args: argparse.Namespace, root: str, query: str) -> dic
         "query": query,
         "mode": "smart",
         "smart": smart_payload,
-        "truncated": truncated,
+        "truncated": truncated or heap.truncated or catalog["truncated"],
+        "catalog": catalog,
         "scanned": scanned,
         "pruned": pruned,
         "contentBytesScanned": content_bytes_scanned,
@@ -3649,7 +4662,14 @@ def search_command(args: argparse.Namespace) -> dict[str, Any]:
     content_byte_limit = max(
         0, int(getattr(args, "content_byte_limit", DEFAULT_CONTENT_BYTE_LIMIT))
     )
-    deadline = time.monotonic() + max(0.25, float(args.timeout))
+    start = time.monotonic()
+    timeout = max(0.25, float(args.timeout))
+    deadline = start + timeout
+    # Catalogued drives first, within their own share of the time; their rows
+    # are listed after the walk's and never take one of its places.
+    catalog_rows, catalog = catalog_keyword_rows(
+        args, root, query, catalog_deadline(start, timeout),
+    )
     rg_candidates = rg_content_candidates(
         root, query, args.mode, args.case_sensitive, args.show_hidden,
         content_file_limit, deadline,
@@ -3675,26 +4695,12 @@ def search_command(args: argparse.Namespace) -> dict[str, Any]:
             rendered_name = display_text(name)
             rendered_relative = display_text(relative)
             is_directory = name in dirnames
-            found, score = matches(rendered_name, query, args.mode, args.case_sensitive)
-            match: dict[str, Any] | None = None
-            if found:
-                match = {
-                    "matchKind": "folder" if is_directory else "name",
-                    "matchLine": 0,
-                    "matchSnippet": "",
-                }
-                score += 2500 if is_directory else 2400
-            elif rendered_relative != rendered_name:
-                found, score = matches(
-                    rendered_relative, query, args.mode, args.case_sensitive
-                )
-                if found:
-                    match = {
-                        "matchKind": "path",
-                        "matchLine": 0,
-                        "matchSnippet": "",
-                    }
-                    score += 1800
+            found = keyword_match(
+                rendered_name, rendered_relative, is_directory, query, args.mode,
+                args.case_sensitive,
+            )
+            match: dict[str, Any] | None = found[0] if found else None
+            score = found[1] if found else 0
 
             if (match is None and not is_directory
                     and content_bytes_scanned < content_byte_limit
@@ -3729,6 +4735,7 @@ def search_command(args: argparse.Namespace) -> dict[str, Any]:
     rows.sort(key=lambda pair: (-pair[0], pair[1]["relativePath"].casefold()))
     metadata = load_metadata_store()
     result_rows = [row for _, row in rows]
+    result_rows.extend(unlisted_catalog_rows(result_rows, catalog_rows, catalog))
     enrich_rows(result_rows, metadata)
     return {
         "ok": True,
@@ -3738,7 +4745,8 @@ def search_command(args: argparse.Namespace) -> dict[str, Any]:
         "git": {key: value for key, value in git.items() if key != "statuses"},
         "query": query,
         "mode": args.mode,
-        "truncated": truncated,
+        "truncated": truncated or catalog["truncated"],
+        "catalog": catalog,
         "scanned": scanned,
         "contentBytesScanned": content_bytes_scanned,
         "contentSearchBackend": content_search_backend,
@@ -6206,6 +7214,7 @@ def parser() -> argparse.ArgumentParser:
     search.add_argument("--timeout", type=float, default=5.0)
     search.add_argument("--content-file-limit", type=int, default=DEFAULT_CONTENT_FILE_LIMIT)
     search.add_argument("--content-byte-limit", type=int, default=DEFAULT_CONTENT_BYTE_LIMIT)
+    search.add_argument("--no-catalog", action="store_true")
 
     quick_nav = subcommands.add_parser("quick-nav", help="Return bounded navigation locations")
     add_path_arguments(quick_nav)
@@ -6250,6 +7259,7 @@ def parser() -> argparse.ArgumentParser:
     settings.add_argument("--sort-order", choices=SORT_ORDER)
     settings.add_argument("--date-format", choices=DATE_FORMAT)
     settings.add_argument("--smart-onboarding-done", choices=("true", "false"))
+    settings.add_argument("--offline-search", choices=("true", "false"))
     settings.add_argument("--module-layout-json")
 
     knowledge_links = subcommands.add_parser(

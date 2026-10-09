@@ -423,6 +423,8 @@ Item {
 
   function showInlinePreview(entry) {
     if (!service || !entry) return false
+    // Nothing to show of a file on a drive that is away; the footer says where.
+    if (service.isOfflineEntry(entry)) return service.requestOfflineEntry(entry)
     inlinePreviewOpen = true
     return service.loadPreview(entry)
   }
@@ -461,7 +463,10 @@ Item {
   onMetadataTokenChanged: {
     syncMetadataEditor()
     if (inlinePreviewOpen) {
-      if (service && service.selectedEntry) service.loadPreview(service.selectedEntry)
+      // Walking the cursor onto an offline row closes the preview quietly;
+      // only an explicit Space asks for its drive.
+      if (service && service.selectedEntry && !service.selectedOffline)
+        service.loadPreview(service.selectedEntry)
       else closeInlinePreview()
     }
   }
@@ -501,7 +506,7 @@ Item {
   }
 
   function dragMimeData(entry) {
-    if (!service || !entry) return ({})
+    if (!service || !entry || service.isOfflineEntry(entry)) return ({})
     return ({
       "application/x-quickfile-tokens": JSON.stringify(
         service.effectiveSelectionTokens(String(entry.token || ""))),
@@ -640,7 +645,8 @@ Item {
   function syncFolderMeasurement() {
     if (!service) return
     var p = service.selectedProperties
-    var wanted = inspectorOpen && p && String(p.kind || "") === "directory"
+    var wanted = inspectorOpen && p && p.offline !== true
+      && String(p.kind || "") === "directory"
       && service.inspectorTab === "properties" ? String(p.token || "") : ""
     if (wanted === "") {
       if (service.folderSizeToken !== "") service.clearFolderSize()
@@ -968,6 +974,42 @@ Item {
     return transport === "USB" ? "󰕓" : "󰋊"
   }
 
+  // A search row from a drive catalog says which drive it is on and whether
+  // that drive is here, in the line a content match uses for its snippet.
+  function catalogRowDetail(entry) {
+    if (!entry || entry.origin !== "catalog") return ""
+    var parts = [volumeGlyph(entry) + "  " + String(entry.volumeName || "")]
+    if (entry.volumeSizeText) parts.push(String(entry.volumeSizeText))
+    // Mounted but not read in time (the backend lists it from its catalog).
+    parts.push(entry.available === true || entry.volumeState === "mounted" ? "connected"
+      : entry.volumeState === "locked" ? "locked"
+      : entry.volumeState === "unmounted" ? "not mounted" : "not connected")
+    if (entry.catalogState === "partial") parts.push("may be incomplete")
+    return parts.join(" · ")
+  }
+
+  function offlineStatusText(state) {
+    if (state === "locked") return "Locked"
+    if (state === "unmounted") return "Not mounted"
+    if (state === "mounted") return "Connected"
+    return "Not connected · plug in to open"
+  }
+
+  // What the offline-search switch has to search, from the drive list.
+  function offlineCatalogSummary() {
+    var drives = 0
+    var files = 0
+    var volumes = service && Array.isArray(service.volumes) ? service.volumes : []
+    for (var i = 0; i < volumes.length; i++) {
+      if (volumes[i].catalogued !== true) continue
+      drives++
+      files += Math.max(0, Number(volumes[i].catalogEntries) || 0)
+    }
+    if (drives === 0) return "Names, paths, sizes and dates only · stored privately"
+    return drives + (drives === 1 ? " drive" : " drives") + " indexed · "
+      + compactTokens(files) + " files"
+  }
+
   function volumeDetail(volume) {
     if (!volume) return ""
     var parts = []
@@ -1082,6 +1124,28 @@ Item {
   function propertyRows() {
     if (!service || !service.selectedProperties) return []
     var p = service.selectedProperties
+    if (p.offline === true) {
+      // What the catalog knows: no owner, inode or permissions on file. The
+      // row's path reads "ARCHIVE:/Photos/x.jpg"; the part after the drive is
+      // where the file sits on it.
+      var age = catalogAge(p.indexedEpoch)
+      var drivePrefix = String(p.volumeName || "") + ":"
+      var onDrive = String(p.path || "").indexOf(drivePrefix + "/") === 0
+        ? String(p.path).slice(drivePrefix.length) : "/" + String(p.relativePath || p.name || "")
+      return [
+        { label: "Type", value: p.kind || "" },
+        { label: "MIME", value: p.mime || "" },
+        { label: "Size", value: p.isDir === true ? "—" : (p.sizeText || "") },
+        { label: "Modified", value: p.modified || "" },
+        { label: "Drive", value: [p.volumeName, p.volumeModel, p.volumeSizeText]
+            .filter(function(value) { return String(value || "") !== "" }).join(" · ") },
+        { label: "Path on drive", value: onDrive },
+        { label: "Indexed", value: age !== "" ? age : String(p.indexedAt || "") },
+        { label: "Catalog", value: p.catalogState === "partial"
+            ? "Partial · may be incomplete" : "Complete" },
+        { label: "Status", value: offlineStatusText(p.volumeState) }
+      ]
+    }
     var rows = [
       { label: "Type", value: p.kind || "" },
       { label: "MIME", value: p.mime || "" },
@@ -1109,7 +1173,8 @@ Item {
   }
 
   function gitRows() {
-    if (!service) return []
+    // The folder's repository says nothing about a file on a drive that is away.
+    if (!service || service.selectedOffline) return []
     var selected = service.selectedProperties && service.selectedProperties.git
       ? service.selectedProperties.git : ({})
     var listing = service.git || ({})
@@ -1231,7 +1296,8 @@ Item {
       return true
     }
     if (key === Qt.Key_R) {
-      if (selected && idle && service.selectedTokens.length <= 1)
+      if (selected && service.selectedOffline) service.offlineHint(service.selectedEntry)
+      else if (selected && idle && service.selectedTokens.length <= 1)
         beginEditor("rename")
       return true
     }
@@ -1256,7 +1322,12 @@ Item {
 
   function handleTrashShortcut(key) {
     if (key !== Qt.Key_Delete && key !== Qt.Key_Backspace) return false
-    if (service && service.selectedToken !== "" && !service.actionBusy)
+    // A selection of offline rows only has nothing to trash; say where it is
+    // instead of asking to confirm an empty deletion.
+    if (service && service.selectedToken !== ""
+        && service.effectiveSelectionTokens().length === 0)
+      service.offlineHint(service.selectedEntry)
+    else if (service && service.selectedToken !== "" && !service.actionBusy)
       beginEditor("trash")
     // Consume both deletion keys even without a selection. Backspace used to
     // navigate to the parent, which made an empty delete attempt surprising.
@@ -1520,11 +1591,24 @@ Item {
     Qt.callLater(function() { root.pulseRow(token) })
   }
 
+  // A row as the cursor follows it: by its catalog token when it has one, so
+  // a row whose drive comes or goes keeps the cursor (Service.rowKey).
+  function entryKey(entry) {
+    return entry ? String(entry.catalogToken || entry.token || "") : ""
+  }
+
+  function selectionKey() {
+    if (!service) return ""
+    var entry = service.selectedEntry
+    return entry && String(entry.token || "") === String(service.selectedToken || "")
+      ? entryKey(entry) : String(service.selectedToken || "")
+  }
+
   function rememberKeyboardCursor() {
     keyboardSnapshot = service && keyboardIndex >= 0
       && keyboardIndex < service.entries.length
-        ? ({ token: String(service.entries[keyboardIndex].token || ""),
-          index: keyboardIndex, selection: service.selectedToken,
+        ? ({ token: entryKey(service.entries[keyboardIndex]),
+          index: keyboardIndex, selection: selectionKey(),
           path: service.rootPath, query: service.query }) : null
   }
 
@@ -1535,10 +1619,17 @@ Item {
       keyboardIndex = -1
       return
     }
+    // A row the listing gave a new token and a new key, as when a drive the
+    // walk listed is unplugged and its catalog row takes the place.
+    var moves = service.listingTokenMoves || ({})
+    var moved = function(key) { return moves[key] !== undefined ? String(moves[key]) : "" }
     if (saved && saved.index === keyboardIndex && saved.path === service.rootPath
-        && saved.query === service.query && saved.selection === service.selectedToken) {
+        && saved.query === service.query && (saved.selection === selectionKey()
+          || (saved.selection !== "" && moved(saved.selection) === service.selectedToken))) {
       for (var i = 0; i < service.entries.length; i++) {
-        if (String(service.entries[i].token || "") === saved.token) {
+        var token = String(service.entries[i].token || "")
+        if (entryKey(service.entries[i]) === saved.token
+            || (saved.token !== "" && token === moved(saved.token))) {
           keyboardIndex = i
           return
         }
@@ -1561,6 +1652,20 @@ Item {
     editorError = ""
     editorMode = "trash-browser"
     service.reloadTrash()
+  }
+
+  // Offline rows in the selection stay where they are: not counted, but said.
+  function trashSummary() {
+    if (!service || !service.selectedEntry) return ""
+    var tokens = service.effectiveSelectionTokens()
+    var left = service.offlineSelectionCount()
+    var note = left === 0 ? "" : left === 1 ? " 1 offline item stays where it is."
+      : " " + left + " offline items stay where they are."
+    if (tokens.length > 1)
+      return tokens.length + " selected items can be restored from Trash." + note
+    var entry = tokens.length === 1 ? service.visibleEntryForToken(tokens[0]) : null
+    return "“" + String((entry || service.selectedEntry).name || "")
+      + "” can be restored from Trash." + note
   }
 
   function confirmTrashDelete(entry) {
@@ -1662,6 +1767,15 @@ Item {
     if (started && editorMode !== "rename") editorMode = ""
   }
 
+  // An open sheet acts on the selection, and a draft belongs to it: neither
+  // may have a background reveal move it (Service.selectionHeld).
+  Binding {
+    target: root.service
+    when: !!root.service
+    property: "selectionHeld"
+    value: root.editorMode !== "" || root.noteDirty || root.colorDirty || root.knowledgeDirty
+  }
+
   Connections {
     target: root.service
     function onConflictRequested(conflicts) {
@@ -1671,6 +1785,13 @@ Item {
     }
     function onListingAboutToChange() {
       root.rememberKeyboardCursor()
+    }
+    // The offline row the user asked for has come alive: the cursor lands on
+    // it and it marks itself, as when leaving search hands a row back.
+    function onRevealRequested(token) {
+      root.pendingCursorToken = String(token || "")
+      root.pendingCursorRequested = true
+      root.applyPendingCursor()
     }
     function onModelChanged() {
       root.restoreKeyboardCursor()
@@ -1767,10 +1888,12 @@ Item {
       ? ScrollBar.vertical.pressed : false
     highlightFollowsCurrentItem: false
 
+    // Service.rowKey: a catalog row keeps its key when its drive comes or goes.
     function rowKey(index) {
       if (!model || index < 0 || index >= count) return ""
       var row = model.get(index).rowData
-      return row ? String(row.token || row.id || row.device || row.sessionKey || "") : ""
+      return row ? String(row.catalogToken || row.token || row.id || row.device
+        || row.sessionKey || "") : ""
     }
 
     function locationKey(path, token) {
@@ -2681,6 +2804,103 @@ Item {
               elide: Text.ElideRight
               font.family: Style.font.family
               font.pixelSize: Style.font.caption
+            }
+            Rectangle {
+              width: parent.width
+              height: Math.max(1, Style.normalBorderWidth)
+              color: root.borderColor
+            }
+            // Offline rows come with every search mode, not SMART alone.
+            Text {
+              textFormat: Text.PlainText
+              width: parent.width
+              height: Style.space(23)
+              text: "SEARCH"
+              color: root.foreground
+              font.family: Style.font.family
+              font.pixelSize: Style.font.bodySmall
+              font.bold: true
+              font.letterSpacing: 1
+              verticalAlignment: Text.AlignVCenter
+            }
+            // Every search also lists files on indexed drives that are away.
+            // Drawn like the AI Sessions opt-in in MODULES, so the two read as
+            // one kind of setting.
+            Rectangle {
+              id: offlineSearchRow
+              objectName: "quickfileOfflineSearchSettings"
+              width: parent.width
+              height: Style.space(46)
+              radius: Style.cornerRadius > 0 ? Style.space(4) : 0
+              color: offlineSearchMouse.containsMouse ? Style.hoverFill : "transparent"
+              readonly property bool enabledSetting: root.service
+                && root.service.offlineSearchEnabled
+              MouseArea {
+                id: offlineSearchMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                acceptedButtons: Qt.NoButton
+              }
+              Column {
+                anchors.left: parent.left
+                anchors.leftMargin: Style.space(7)
+                anchors.right: offlineSearchToggle.left
+                anchors.rightMargin: Style.space(8)
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.space(2)
+                Text {
+                  textFormat: Text.PlainText
+                  width: parent.width
+                  text: "Offline drives in search"
+                  color: root.foreground
+                  elide: Text.ElideRight
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.bodySmall
+                }
+                Text {
+                  objectName: "quickfileOfflineSearchCaption"
+                  textFormat: Text.PlainText
+                  width: parent.width
+                  text: root.offlineCatalogSummary()
+                  color: root.muted
+                  maximumLineCount: 1
+                  elide: Text.ElideRight
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                }
+              }
+              Rectangle {
+                id: offlineSearchToggle
+                objectName: "quickfileOfflineSearchToggle"
+                anchors.right: parent.right
+                anchors.rightMargin: Style.space(8)
+                anchors.verticalCenter: parent.verticalCenter
+                width: Style.space(40)
+                height: Style.space(20)
+                radius: height / 2
+                color: offlineSearchRow.enabledSetting
+                  ? Qt.alpha(root.accent, 0.32) : Qt.alpha(root.muted, 0.15)
+                border.width: 1
+                border.color: offlineSearchRow.enabledSetting ? root.accent : root.muted
+                Rectangle {
+                  width: Style.space(14)
+                  height: width
+                  radius: width / 2
+                  anchors.verticalCenter: parent.verticalCenter
+                  x: offlineSearchRow.enabledSetting
+                    ? parent.width - width - Style.space(3) : Style.space(3)
+                  color: offlineSearchRow.enabledSetting ? root.accent : root.muted
+                  Behavior on x { NumberAnimation { duration: 120 } }
+                }
+                MouseArea {
+                  objectName: "quickfileOfflineSearchToggleMouse"
+                  anchors.fill: parent
+                  enabled: root.service && root.service.settingsLoaded
+                  cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+                  onClicked: root.service.setOfflineSearchEnabled(
+                    !root.service.offlineSearchEnabled)
+                }
+              }
             }
             Text {
               textFormat: Text.PlainText
@@ -4005,6 +4225,9 @@ Item {
             readonly property string activity: !root.service ? ""
               : root.service.operationBusy ? root.operationStatus()
               : root.service.actionBusy ? "Working…"
+              // What the user just asked for, over the standing clipboard line.
+              : root.service.actionNoticeFresh && String(root.service.actionMessage || "") !== ""
+                ? String(root.service.actionMessage)
               : root.service.clipboardToken !== ""
                 ? ((root.service.clipboardMode === "cut" ? "Cut: " : "Copy: ")
                   + root.service.clipboardName)
@@ -4015,6 +4238,8 @@ Item {
               : root.service.selectedTokens.length > 1
                 ? root.service.selectedTokens.length + " selected"
                 : (root.service.entries.length + (root.service.truncated ? "+" : "") + " items")
+                  + (root.service.query !== "" && root.service.offlineMatchCount > 0
+                    ? " · " + root.service.offlineMatchCount + " offline" : "")
                   + (root.service.query !== "" && root.service.searchEngine === "rg" ? " · rg" : "")
             // Centred on the panel, not on the gap: the icon row grows and
             // shrinks with the Undo button, and a label centred in the
@@ -4118,14 +4343,18 @@ Item {
                 framed: true
                 buttonSize: Style.space(27)
                 available: root.service && root.service.selectedToken !== ""
+                  && !root.service.selectedOffline
                 onClicked: root.service.openSelected()
               }
               Components.IconButton {
+                objectName: "quickfileFooterCopy"
                 glyph: "󰆏"
                 tooltip: "Copy  ·  Ctrl+C"
                 framed: true
                 buttonSize: Style.space(27)
+                // As the keys do: on the live rows of a mixed selection.
                 available: root.service && root.service.selectedToken !== ""
+                  && root.service.effectiveSelectionTokens().length > 0
                 onClicked: root.service.copySelected()
               }
               Components.IconButton {
@@ -4133,7 +4362,9 @@ Item {
                 tooltip: "Cut  ·  Ctrl+X"
                 framed: true
                 buttonSize: Style.space(27)
+                // As the keys do: on the live rows of a mixed selection.
                 available: root.service && root.service.selectedToken !== ""
+                  && root.service.effectiveSelectionTokens().length > 0
                 onClicked: root.service.cutSelected()
               }
               Components.IconButton {
@@ -4151,6 +4382,7 @@ Item {
                 framed: true
                 buttonSize: Style.space(27)
                 available: root.service && root.service.selectedToken !== ""
+                  && root.service.effectiveSelectionTokens().length > 0
                   && !root.service.actionBusy
                 onClicked: root.service.duplicateSelected()
               }
@@ -4160,16 +4392,19 @@ Item {
                 framed: true
                 buttonSize: Style.space(27)
                 available: root.service && root.service.selectedToken !== ""
+                  && !root.service.selectedOffline
                   && root.service.selectedTokens.length <= 1
                   && !root.service.actionBusy
                 onClicked: root.beginEditor("rename")
               }
               Components.IconButton {
+                objectName: "quickfileFooterTrash"
                 glyph: "󰩺"
                 tooltip: "Move to Trash  ·  Delete / Backspace"
                 framed: true
                 buttonSize: Style.space(27)
                 available: root.service && root.service.selectedToken !== ""
+                  && root.service.effectiveSelectionTokens().length > 0
                 onClicked: root.beginEditor("trash")
               }
             }
@@ -4318,6 +4553,7 @@ Item {
               tooltip: "Copy full path"
               buttonSize: Style.space(29)
               available: root.service && root.service.selectedToken !== ""
+                && !root.service.selectedOffline
                 && !root.service.actionBusy
               onClicked: root.service.copySelectedPath()
             }
@@ -4333,6 +4569,7 @@ Item {
             anchors.rightMargin: Style.space(8)
             height: Style.space(38)
             visible: root.service && root.service.inspectorTab === "notes"
+              && !root.service.selectedOffline
             color: "transparent"
 
             Text {
@@ -4434,6 +4671,7 @@ Item {
             anchors.rightMargin: Style.space(8)
             height: Style.space(76)
             visible: root.service && root.service.inspectorTab === "notes"
+              && !root.service.selectedOffline
             color: "transparent"
 
             Text {
@@ -4511,6 +4749,7 @@ Item {
             anchors.rightMargin: Style.space(8)
             height: Style.space(40)
             visible: root.service && root.service.inspectorTab === "notes"
+              && !root.service.selectedOffline
             color: "transparent"
 
             Text {
@@ -4569,6 +4808,26 @@ Item {
 
           }
 
+          // Notes, colours and Knowledge are kept per path on this machine; a
+          // file on a drive that is away has none to edit.
+          Text {
+            objectName: "quickfileOfflineNotes"
+            textFormat: Text.PlainText
+            anchors.top: inspectorTabs.bottom
+            anchors.topMargin: Style.space(16)
+            anchors.horizontalCenter: parent.horizontalCenter
+            width: parent.width - Style.space(40)
+            visible: root.service && root.service.inspectorTab === "notes"
+              && root.service.selectedOffline
+            text: "Notes are kept for files on connected drives"
+            color: root.muted
+            horizontalAlignment: Text.AlignHCenter
+            wrapMode: Text.Wrap
+            font.family: Style.font.family
+            font.pixelSize: Style.font.bodySmall
+            renderType: Text.NativeRendering
+          }
+
           ListView {
             id: inspectorDetailsList
             visible: root.service && root.service.inspectorTab === "properties"
@@ -4625,7 +4884,8 @@ Item {
               anchors.centerIn: parent
               width: parent.width - Style.space(40)
               visible: root.gitRows().length === 0
-              text: "Not inside a Git worktree"
+              text: root.service && root.service.selectedOffline
+                ? "Git status needs the drive connected" : "Not inside a Git worktree"
               color: root.muted
               horizontalAlignment: Text.AlignHCenter
               wrapMode: Text.Wrap
@@ -4847,14 +5107,18 @@ Item {
             required property int index
             required property var rowData
             readonly property var modelData: rowData
+            // From a drive catalog; offline while that drive is away, when the
+            // row is dimmed like a hidden file and takes no drop, drag or star.
+            readonly property bool catalogRow: modelData.origin === "catalog"
+            readonly property bool offline: modelData.available === false
             width: fileList.width
-            height: modelData.matchKind === "content"
+            height: modelData.matchKind === "content" || catalogRow
               ? Style.space(44) : Style.space(29)
             readonly property bool persistentSelected: root.service
               && root.service.isSelected(String(modelData.token || ""))
             color: persistentSelected ? Style.selectedFill
               : (rowMouse.containsMouse ? Style.hoverFill : "transparent")
-            DirectoryDropTarget { destinationEntry: fileRow.modelData }
+            DirectoryDropTarget { destinationEntry: fileRow.offline ? null : fileRow.modelData }
 
             Components.FocusPulse {
               id: rowPulse
@@ -4897,13 +5161,14 @@ Item {
             Text {
               textFormat: Text.PlainText
               id: fileIcon
+              objectName: "quickfileFileIcon"
               anchors.left: chevron.right
               anchors.leftMargin: Style.space(3)
               anchors.verticalCenter: parent.verticalCenter
               width: Style.space(17)
               text: root.fileGlyph(fileRow.modelData)
               color: root.entryColor(fileRow.modelData)
-              opacity: fileRow.modelData.isHidden ? 0.55 : 0.9
+              opacity: fileRow.modelData.isHidden || fileRow.offline ? 0.55 : 0.9
               font.family: Style.font.family
               font.pixelSize: root.primaryFontSize
               renderType: Text.NativeRendering
@@ -4937,7 +5202,7 @@ Item {
                   text: fileRow.modelData.relativePath || fileRow.modelData.name
                   textFormat: Text.PlainText
                   color: root.entryColor(fileRow.modelData)
-                  opacity: fileRow.modelData.isHidden ? 0.58 : 1
+                  opacity: fileRow.modelData.isHidden || fileRow.offline ? 0.58 : 1
                   elide: Text.ElideMiddle
                   font.family: Style.font.family
                   font.pixelSize: root.primaryFontSize
@@ -4957,7 +5222,7 @@ Item {
                     fileNameLabel.width) + Style.space(3)
                   anchors.top: fileNameLabel.top
                   color: root.muted
-                  opacity: fileRow.modelData.isHidden ? 0.58 : 0.85
+                  opacity: fileRow.modelData.isHidden || fileRow.offline ? 0.58 : 0.85
                   font.family: Style.font.family
                   font.pixelSize: Math.max(7, Math.round(root.primaryFontSize * 0.6))
                   renderType: Text.NativeRendering
@@ -4965,9 +5230,11 @@ Item {
               }
 
               Text {
+                objectName: "quickfileRowDetail"
                 width: parent.width
-                visible: fileRow.modelData.matchKind === "content"
-                text: (fileRow.modelData.matchLine
+                visible: fileRow.modelData.matchKind === "content" || fileRow.catalogRow
+                text: fileRow.catalogRow ? root.catalogRowDetail(fileRow.modelData)
+                  : (fileRow.modelData.matchLine
                     ? "L" + fileRow.modelData.matchLine + "  " : "")
                   + String(fileRow.modelData.matchSnippet || "")
                 textFormat: Text.PlainText
@@ -4999,8 +5266,10 @@ Item {
               Text {
                 textFormat: Text.PlainText
                 id: rowStar
+                objectName: "quickfileRowStar"
                 anchors.verticalCenter: parent.verticalCenter
-                visible: fileRow.modelData.starred === true || rowMouse.containsMouse
+                visible: !fileRow.offline
+                  && (fileRow.modelData.starred === true || rowMouse.containsMouse)
                 text: fileRow.modelData.starred === true ? "󰓎" : "󰓒"
                 color: fileRow.modelData.starred === true
                   ? root.entryColor(fileRow.modelData) : root.muted
@@ -5015,21 +5284,25 @@ Item {
                   onClicked: root.service.toggleFavoriteEntry(fileRow.modelData)
                 }
               }
+              // An offline row's pill names its state, not how it matched, so
+              // it shows whatever its match kind and wears the muted colour.
               Rectangle {
                 id: matchBadge
+                objectName: "quickfileMatchBadge"
                 anchors.verticalCenter: parent.verticalCenter
                 visible: root.service && root.service.query !== ""
-                  && root.matchLabel(fileRow.modelData.matchKind) !== ""
+                  && matchBadgeText.text !== ""
                 width: matchBadgeText.implicitWidth + Style.space(8)
                 height: Style.space(18)
                 radius: Style.cornerRadius > 0 ? Style.space(3) : 0
-                color: Qt.alpha(root.accent, 0.11)
+                color: fileRow.offline ? Qt.alpha(root.muted, 0.14) : Qt.alpha(root.accent, 0.11)
                 Text {
                   textFormat: Text.PlainText
                   id: matchBadgeText
+                  objectName: "quickfileMatchBadgeText"
                   anchors.centerIn: parent
-                  text: root.matchLabel(fileRow.modelData.matchKind)
-                  color: root.accent
+                  text: fileRow.offline ? "OFFLINE" : root.matchLabel(fileRow.modelData.matchKind)
+                  color: fileRow.offline ? root.muted : root.accent
                   font.family: Style.font.family
                   font.pixelSize: Style.font.caption
                   font.bold: true
@@ -5113,6 +5386,7 @@ Item {
             DragHandler {
               id: rowDrag
               target: null
+              enabled: !fileRow.offline
               acceptedButtons: Qt.LeftButton
               cursorShape: Qt.ClosedHandCursor
               onActiveChanged: if (active && !fileRow.persistentSelected) {
@@ -5781,12 +6055,7 @@ Item {
                   ? (!root.pendingTrashEntry ? ""
                     : ("“" + root.pendingTrashEntry.name
                       + "” will be deleted permanently. This cannot be undone."))
-                  : (!root.service || !root.service.selectedEntry ? ""
-                  : root.service.selectedTokens.length > 1
-                    ? (root.service.selectedTokens.length
-                      + " selected items can be restored from Trash.")
-                    : ("“" + root.service.selectedEntry.name
-                      + "” can be restored from Trash."))
+                  : root.trashSummary()
                 color: root.muted
                 font.family: Style.font.family
                 font.pixelSize: Style.font.bodySmall

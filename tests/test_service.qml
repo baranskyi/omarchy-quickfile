@@ -17,6 +17,8 @@ ShellRoot {
   property int destroyedSessionDelegates: 0
   property int createdDriveDelegates: 0
   property int destroyedDriveDelegates: 0
+  property int createdOfflineDelegates: 0
+  property int destroyedOfflineDelegates: 0
   property bool finished: false
   property bool expectSilent: false
   property string phase: "startup"
@@ -67,6 +69,68 @@ ShellRoot {
     function reloadVolumes() {
       volumeReloads++
       return true
+    }
+  }
+
+  // Search rows from drive catalogs. Everything a guard could hand a catalog
+  // token to is either recorded here or a real process whose busy flag shows.
+  Quickfile.Service {
+    id: offline
+    rootPath: suite.fixture
+    rootToken: "offline-root"
+    knowledgeRootToken: "offline-root"
+    initialized: true
+    property var volumeActions: []
+    property int volumeReloads: 0
+    property int searchRefreshes: 0
+    property var reloads: []
+    property int settingsSaves: 0
+    property var inspections: []
+    property var revealed: []
+    function runVolumeAction(kind, volume, navigateAfter) {
+      volumeActions.push(kind + ":" + String(volume.device || "")
+        + (navigateAfter === false ? ":stay" : ""))
+      return true
+    }
+    function reloadVolumes() {
+      volumeReloads++
+      return true
+    }
+    function scheduleSearchRefresh() {
+      searchRefreshes++
+      return true
+    }
+    function reload(background) {
+      reloads.push(background === true)
+      return true
+    }
+    function persistSettings() {
+      settingsSaves++
+      return true
+    }
+    function startPendingInspection() {
+      inspections.push(propertyPendingToken)
+      propertyPendingToken = ""
+    }
+    function startCatalogIndexProcess(command) { return true }
+    property var operations: []
+    function runOperation(kind, tokens) {
+      operations.push(kind + ":" + tokens.join(","))
+      pendingOperation = { kind: kind, tokens: tokens.slice() }
+      return true
+    }
+    onRevealRequested: function(token) { revealed.push(token) }
+  }
+
+  Item {
+    Repeater {
+      id: offlineRows
+      model: offline.entriesModel
+      delegate: Item {
+        required property var rowData
+        Component.onCompleted: suite.createdOfflineDelegates++
+        Component.onDestruction: suite.destroyedOfflineDelegates++
+      }
     }
   }
 
@@ -447,6 +511,7 @@ ShellRoot {
     check(synthetic.pendingOperation === null && synthetic.operationConflicts.length === 0,
       "Completed operation retained obsolete conflict state")
     catalogUnitTests()
+    offlineSearchUnitTests()
     console.log("QuickFile service model assertions passed:", assertions)
   }
 
@@ -746,6 +811,458 @@ ShellRoot {
       "The held drive did not start once its action had finished")
     drives.finishCatalogIndex(130)
     drives.actionFinished.disconnect(finishHandler)
+  }
+
+  // A search row from the catalog of ARCHIVE, as `search` reports it while
+  // the drive is away; `extra` overrides fields.
+  function catalogRow(name, extra) {
+    var relative = "Photos/" + name
+    // Shaped like the backend's token; only its prefix and uniqueness matter here.
+    var token = "catalog:dXVpZDpBMQ:" + relative.replace(/[^A-Za-z0-9]/g, "_")
+    return Object.assign({ name: name, path: "ARCHIVE:/" + relative, token: token, uri: "",
+      shellQuotedPath: "", depth: 0, kind: "file", isDir: false, isSymlink: false,
+      isHidden: false, isExecutable: false, hasChildren: false, expanded: false,
+      size: 2048, sizeText: "2.0 KiB", modified: "2026-09-01T10:00:00",
+      modifiedEpoch: 1788256800, permissions: "", mode: "", mime: "image/jpeg", git: "",
+      relativePath: relative, matchKind: "name", matchLine: 0, matchSnippet: "",
+      origin: "catalog", available: false, catalogToken: token, volumeId: "uuid:A1",
+      volumeName: "ARCHIVE", volumeModel: "Stick", volumeSizeText: "64 GB",
+      volumeState: "disconnected", indexedAt: "2026-10-01T10:00:00",
+      indexedEpoch: 1790848800, catalogState: "complete" }, extra || ({}))
+  }
+
+  // The same row once ARCHIVE is mounted elsewhere: a real token and path,
+  // the catalog token kept.
+  function liveCatalogRow(row) {
+    var path = "/run/media/test/ARCHIVE/" + row.relativePath
+    return Object.assign({}, row, { available: true, volumeState: "mounted",
+      token: "real-" + row.name, path: path, uri: "file://" + path,
+      shellQuotedPath: "'" + path + "'" })
+  }
+
+  function catalogListing(rows) {
+    var away = rows.filter(function(row) { return row.available === false }).length
+    var here = rows.filter(function(row) { return row.available === true }).length
+    return JSON.stringify({ ok: true, root: { token: offline.rootToken, path: offline.rootPath },
+      entries: rows, favorites: [], git: { root: "", branch: "" }, truncated: false,
+      catalog: { searched: 1, offlineMatches: away, availableMatches: here,
+        truncated: false, scanned: 40 } })
+  }
+
+  function applyCatalog(rows) {
+    offline.listInFlightRootToken = offline.rootToken
+    offline.listInFlightRootPath = offline.rootPath
+    offline.listInFlightCommand = JSON.stringify(offline.buildListCommand())
+    offline.listInFlightRevision = offline.metadataRevision
+    offline.listInFlightBackground = true
+    offline.reloadPending = false
+    check(offline.applyListing(catalogListing(rows)), "A listing with catalog rows was rejected")
+  }
+
+  function noProcessFor(what) {
+    check(!offline.actionBusy && !offline.operationBusy && !offline.previewBusy
+        && !offline.folderSizeBusy && offline.previewInFlightToken === ""
+        && offline.inspections.filter(function(token) {
+          return offline.isCatalogToken(token) }).length === 0,
+      what + " started a process for an offline row")
+  }
+
+  function offlineSearchUnitTests() {
+    // --no-catalog only when switched off, and only for a search.
+    offline.searchMode = "fuzzy"
+    offline.query = ""
+    offline.offlineSearchEnabled = false
+    check(offline.buildListCommand().indexOf("--no-catalog") < 0,
+      "A folder listing carried --no-catalog")
+    offline.query = "beach"
+    check(offline.buildListCommand().indexOf("--no-catalog") >= 0,
+      "A search with offline drives switched off did not pass --no-catalog")
+    offline.searchMode = "smart"
+    check(offline.buildListCommand().indexOf("--no-catalog") >= 0,
+      "A SMART search with offline drives switched off did not pass --no-catalog")
+    offline.searchMode = "fuzzy"
+    offline.offlineSearchEnabled = true
+    check(offline.buildListCommand().indexOf("--no-catalog") < 0,
+      "A search with offline drives on passed --no-catalog")
+
+    // Every save carries the switch; a store from before it reads as on.
+    var settingsCommand = offline.buildSettingsCommand()
+    check(settingsCommand[settingsCommand.indexOf("--offline-search") + 1] === "true",
+      "Saved settings did not carry the offline-search switch: " + settingsCommand)
+    offline.offlineSearchEnabled = false
+    settingsCommand = offline.buildSettingsCommand()
+    check(settingsCommand[settingsCommand.indexOf("--offline-search") + 1] === "false",
+      "Saved settings did not carry the offline-search switch turned off")
+    check(offline.applySettings(JSON.stringify({ ok: true, settings: { modules: [] } }))
+        && offline.offlineSearchEnabled === true,
+      "A settings store without the switch did not read as on")
+    check(offline.applySettings(JSON.stringify({ ok: true,
+      settings: { modules: [], offlineSearchEnabled: false } }))
+        && offline.offlineSearchEnabled === false, "A stored switch-off was not applied")
+    var reloadsBefore = offline.reloads.length
+    check(offline.setOfflineSearchEnabled(true) && offline.offlineSearchEnabled
+        && offline.settingsSaves === 1, "Turning offline search on was not saved")
+    check(offline.reloads.length === reloadsBefore + 1
+        && offline.reloads[offline.reloads.length - 1] === false,
+      "Turning offline search on did not search again")
+    check(!offline.setOfflineSearchEnabled(true) && offline.settingsSaves === 1,
+      "Setting the switch to its own value saved again")
+
+    // The catalog tally is kept; an unchanged answer changes nothing.
+    var report = { token: "live-report", name: "beach-report.txt", isDir: false,
+      path: offline.rootPath + "/beach-report.txt", relativePath: "beach-report.txt",
+      matchKind: "name" }
+    var photo = catalogRow("beach.jpg")
+    var folder = catalogRow("Beach trip", { isDir: true, kind: "directory",
+      mime: "inode/directory", size: 0, sizeText: "", matchKind: "folder" })
+    applyCatalog([report, photo, folder])
+    check(offline.catalogResult && offline.catalogResult.searched === 1
+        && offline.catalogResult.scanned === 40 && offline.offlineMatchCount === 2,
+      "The catalog tally of a search was not kept")
+    check(offlineRows.count === 3, "Catalog rows did not get delegates")
+    var changesBefore = offline.listingChanges
+    var createdBefore = createdOfflineDelegates
+    applyCatalog([report, photo, folder])
+    check(offline.listingChanges === changesBefore && createdOfflineDelegates === createdBefore,
+      "An unchanged search with catalog rows emitted a model change")
+    check(!offline.listingIsNewResults, "A background search was marked as new results")
+
+    // A refresh for a file event asks the walk alone and keeps the catalog
+    // rows on screen with their tally; a drive change asks for both again.
+    check(offline.buildListCommand(true).indexOf("--no-catalog") >= 0,
+      "A refresh that keeps the catalog rows still read the catalogs")
+    check(offline.catalogReusable(), "A full search's catalog rows were not kept for a refresh")
+    var report2 = Object.assign({}, report, { token: "live-report-2",
+      name: "beach-report-2.txt", path: offline.rootPath + "/beach-report-2.txt",
+      relativePath: "beach-report-2.txt" })
+    function walkOnly(rows) {
+      offline.listInFlightReusesCatalog = true
+      offline.listInFlightCommand = JSON.stringify(offline.buildListCommand(true))
+      offline.listInFlightRevision = offline.metadataRevision
+      offline.listInFlightBackground = true
+      offline.reloadPending = false
+      offline.reloadPendingCatalog = false
+      var applied = offline.applyListing(JSON.stringify({ ok: true,
+        root: { token: offline.rootToken, path: offline.rootPath }, entries: rows,
+        favorites: [], git: { root: "", branch: "" }, truncated: false,
+        catalog: { searched: 0, offlineMatches: 0, availableMatches: 0, truncated: false,
+          scanned: 0 } }))
+      offline.listInFlightReusesCatalog = false
+      return applied
+    }
+    check(walkOnly([report, report2]), "A refresh of the walk alone was rejected")
+    check(offline.entries.map(function(row) { return row.token }).join(",")
+        === ["live-report", "live-report-2", photo.token, folder.token].join(","),
+      "A refresh of the walk alone dropped the catalog rows: "
+        + offline.entries.map(function(row) { return row.token }))
+    check(offline.catalogResult.searched === 1 && offline.catalogResult.scanned === 40
+        && offline.offlineMatchCount === 2, "A refresh of the walk alone lost the catalog tally")
+    offline.catalogPresenceKey = "uuid:A1=unmounted"
+    check(!offline.catalogReusable(), "Catalog rows were kept across a drive change")
+    var entriesBefore = offline.entries
+    check(walkOnly([report]) && offline.reloadPending && offline.reloadPendingCatalog
+        && offline.entries === entriesBefore,
+      "A walk that ran while a drive changed was applied with the old catalog rows")
+    offline.reloadPending = false
+    offline.reloadPendingCatalog = false
+    offline.catalogPresenceKey = ""
+    applyCatalog([report, photo, folder])
+    check(offline.entries.length === 3 && offline.catalogReusable(),
+      "The full search after a walk-only refresh was not taken as the new catalog answer")
+
+    // Enter names the drive to plug in and opens nothing.
+    check(offline.applyVolumes(snapshot([offlineDrive("uuid:A1", "ARCHIVE", 1790848800)])),
+      "The drive snapshot was rejected")
+    var reloadsOfVolumes = offline.volumeReloads
+    offline.activateIndex(1)
+    check(offline.actionMessage === "Connect “ARCHIVE” to open beach.jpg",
+      "Enter on an offline file did not say which drive to connect: " + offline.actionMessage)
+    noProcessFor("Enter")
+    check(offline.volumeReloads === reloadsOfVolumes + 1,
+      "Enter on an offline row did not refresh the drive list first")
+    check(offline.lastOfflineRequest && offline.lastOfflineRequest.catalogToken === photo.catalogToken
+        && offline.lastOfflineRequest.volumeId === "uuid:A1"
+        && offline.lastOfflineRequest.name === "beach.jpg",
+      "Enter on an offline row did not remember the row asked for")
+    check(offline.selectedToken === photo.token && offline.selectedOffline
+        && offline.selectedProperties && offline.selectedProperties.offline === true
+        && offline.selectedProperties.volumeName === "ARCHIVE"
+        && offline.selectedProperties.volumeState === "disconnected"
+        && offline.selectedProperties.catalogState === "complete",
+      "Selecting an offline row did not synthesise its properties")
+    // Its drive arrives but stays unmounted: the inspector says so at once.
+    var refreshesBeforeArrival = offline.searchRefreshes
+    offline.applyVolumes(snapshot([drive("uuid:A1", "/dev/sdb1", { name: "ARCHIVE",
+      label: "ARCHIVE", catalogued: true, canMount: false, indexedEpoch: 1790848800,
+      catalogState: "complete" })]))
+    check(offline.selectedProperties.volumeState === "unmounted",
+      "The inspector of an offline row did not follow its drive arriving: "
+        + offline.selectedProperties.volumeState)
+    offline.applyVolumes(snapshot([offlineDrive("uuid:A1", "ARCHIVE", 1790848800)]))
+    check(offline.selectedProperties.volumeState === "disconnected",
+      "The inspector of an offline row did not follow its drive leaving")
+    offline.searchRefreshes = refreshesBeforeArrival
+    offline.inspect(photo.token)
+    noProcessFor("Re-inspecting an offline row")
+    offline.enterIndex(2)
+    check(offline.actionMessage === "Connect “ARCHIVE” to browse Beach trip",
+      "Entering an offline folder did not say which drive to connect: " + offline.actionMessage)
+    check(offline.rootToken === "offline-root", "Entering an offline folder navigated")
+    offline.actionMessage = ""
+    check(!offline.enterEntry(photo)
+        && offline.actionMessage === "Connect “ARCHIVE” to open beach.jpg",
+      "Opening an offline row from a list did not hint: " + offline.actionMessage)
+    noProcessFor("enterEntry")
+
+    // Locked, mountable and unmountable drives each get their own word.
+    var archive = drive("uuid:A1", "/dev/sdb1", { name: "ARCHIVE", label: "ARCHIVE",
+      catalogued: true, indexedEpoch: 1790848800, catalogState: "complete" })
+    offline.applyVolumes(snapshot([Object.assign({}, archive, { locked: true,
+      canMount: false })]))
+    check(offline.searchRefreshes === refreshesBeforeArrival + 1,
+      "A drive arriving under a search did not refresh its offline rows")
+    offline.activateIndex(1)
+    check(offline.actionMessage === "Unlock “ARCHIVE” to open beach.jpg"
+        && offline.volumeActions.length === 0,
+      "A locked drive was not asked to be unlocked: " + offline.actionMessage)
+    offline.applyVolumes(snapshot([archive]))
+    offline.activateIndex(1)
+    check(offline.volumeActions.join(",") === "mount:/dev/sdb1:stay"
+        && offline.actionMessage === "Mounting “ARCHIVE”…",
+      "A connected drive was not mounted in place: " + offline.volumeActions
+        + " / " + offline.actionMessage)
+    offline.applyVolumes(snapshot([Object.assign({}, archive, { canMount: false })]))
+    offline.activateIndex(1)
+    check(offline.actionMessage === "Mount “ARCHIVE” to open beach.jpg"
+        && offline.volumeActions.length === 1,
+      "A drive that cannot be mounted was not named: " + offline.actionMessage)
+    noProcessFor("Opening a connected but unmounted drive's row")
+
+    // A drive that turns up later is never mounted by the hint.
+    offline.applyVolumes(snapshot([offlineDrive("uuid:A1", "ARCHIVE", 1790848800)]))
+    offline.activateIndex(1)
+    offline.applyVolumes(snapshot([archive]))
+    check(offline.volumeActions.length === 1,
+      "A drive plugged in after the hint was mounted by QuickFile")
+    offline.applyVolumes(snapshot([offlineDrive("uuid:A1", "ARCHIVE", 1790848800)]))
+
+    // Every other action leaves an offline row alone and says where it is.
+    offline.selectIndex(1)
+    offline.actionMessage = ""
+    check(!offline.copySelected() && offline.clipboardToken === ""
+        && offline.actionMessage === "Connect “ARCHIVE” to open beach.jpg",
+      "Copying an offline row put it on the clipboard: " + offline.actionMessage)
+    check(!offline.cutSelected() && offline.clipboardToken === "", "Cutting an offline row worked")
+    check(offline.effectiveSelectionTokens().length === 0,
+      "An offline row reached the selection actions")
+    check(!offline.trashSelected(), "Trashing an offline row started")
+    check(!offline.duplicateSelected(), "Duplicating an offline row started")
+    check(!offline.renameSelected("renamed.jpg"), "Renaming an offline row started")
+    check(!offline.loadPreview(photo) && offline.previewToken === "",
+      "Previewing an offline row started")
+    check(!offline.openPreviewExternally(photo), "Opening an offline row in Sushi started")
+    check(!offline.toggleFavoriteEntry(photo), "Starring an offline row started")
+    check(!offline.saveEntryMetadata(photo, "blue", "note", false),
+      "Saving a note on an offline row started")
+    check(!offline.saveEntryKnowledge(photo, true, ["codex"]),
+      "Registering an offline row as knowledge started")
+    check(!offline.previewSelectedKnowledgeLinks(), "Linking an offline row started")
+    check(!offline.measureFolder(folder.token), "Measuring an offline folder started")
+    check(!offline.runAction("copy-path", photo.token), "Copying an offline path started")
+    check(!offline.runAction("open", photo.token), "Opening an offline row by token started")
+    check(!offline.startOperationRequest({ kind: "copy", tokens: [photo.token],
+      destinationToken: offline.rootToken }), "Copying an offline row by token started")
+    check(!offline.dropOnDirectory(folder.token, ["live-report"], false),
+      "A drop into an offline folder started")
+    check(!offline.navigate(folder.path, folder.token, true) && offline.entries.length === 3,
+      "Navigating into an offline folder cleared the search")
+    noProcessFor("The offline action guards")
+    check(offline.volumeActions.length === 1, "An offline action mounted a drive")
+
+    // A mixed selection acts on what is here and says what it left out.
+    offline.selectedTokens = ["live-report", photo.token]
+    check(offline.copySelected() && offline.clipboardTokens.join(",") === "live-report"
+        && offline.actionMessage === "Copied “beach-report.txt” · 1 offline item left out",
+      "A mixed selection was not copied without its offline row: " + offline.actionMessage)
+    check(offline.trashSelected() && offline.operations.join("|") === "trash:live-report"
+        && offline.pendingOperation.offlineNote === " · 1 offline item left out",
+      "A mixed trash did not say what it left out: " + offline.operations)
+    check(offline.duplicateSelected()
+        && offline.operations.join("|") === "trash:live-report|duplicate:live-report"
+        && offline.pendingOperation.offlineNote === " · 1 offline item left out",
+      "A mixed duplicate did not say what it left out: " + offline.operations)
+    offline.pendingOperation = null
+    offline.clearClipboard()
+    offline.selectedTokens = [photo.token]
+
+    // Unplugging a mounted drive: its live row goes back to its catalog form,
+    // the selection and the delegate follow it.
+    offline.lastOfflineRequest = null
+    var livePhoto = liveCatalogRow(photo)
+    applyCatalog([report, livePhoto, folder])
+    var photoDelegate = offlineRows.itemAt(1)
+    offline.selectIndex(1)
+    offline.selectedTokens = ["live-report", livePhoto.token]
+    offline.inspections = []
+    createdBefore = createdOfflineDelegates
+    var destroyedBefore = destroyedOfflineDelegates
+    applyCatalog([report, photo, folder])
+    check(offline.selectedToken === photo.token && offline.selectedEntry.available === false
+        && offline.selectedTokens.join(",") === "live-report," + photo.token,
+      "Unplugging the drive dropped the selection of its row: " + offline.selectedToken)
+    check(offline.selectionAnchorIndex === 1, "Unplugging the drive lost the range anchor")
+    check(offlineRows.count === 3 && offlineRows.itemAt(1) === photoDelegate
+        && createdOfflineDelegates === createdBefore
+        && destroyedOfflineDelegates === destroyedBefore,
+      "Unplugging the drive rebuilt the row's delegate")
+    check(offline.selectedProperties.offline === true && offline.inspections.length === 0,
+      "The unplugged row kept its live properties or asked the backend")
+    check(offline.revealed.length === 0, "A row nobody asked for was revealed")
+
+    // Plugging it back in after Enter: the row comes alive in place, is
+    // selected and announced, and nothing opens.
+    offline.activateIndex(1)
+    check(offline.lastOfflineRequest !== null, "Enter did not remember the row")
+    applyCatalog([report, livePhoto, folder])
+    check(offline.selectedToken === livePhoto.token && offline.selectedEntry.available === true
+        && offline.selectedTokens.join(",") === livePhoto.token,
+      "The row that came alive was not selected: " + offline.selectedToken)
+    check(offline.revealed.join(",") === livePhoto.token,
+      "The row that came alive was not revealed: " + offline.revealed)
+    check(offline.actionMessage === "“ARCHIVE” connected · beach.jpg is ready",
+      "The row that came alive was not announced: " + offline.actionMessage)
+    check(offline.lastOfflineRequest === null, "The reveal did not consume the request")
+    check(offlineRows.itemAt(1) === photoDelegate && offlineRows.count === 3,
+      "The row that came alive rebuilt its delegate")
+    check(offline.inspections.join(",") === livePhoto.token,
+      "The live row was not inspected for real: " + offline.inspections)
+    check(!offline.actionBusy && offline.rootToken === "offline-root"
+        && !offline.listingIsNewResults, "The reveal opened, navigated or reset the view")
+    applyCatalog([report, livePhoto, folder])
+    check(offline.revealed.length === 1, "A refresh revealed the row a second time")
+
+    // A drive mounted inside the searched folder: the walk lists the file
+    // itself, without a catalog token, and the reveal finds it by path.
+    offline.applyVolumes(snapshot([offlineDrive("uuid:A1", "ARCHIVE", 1790848800)]))
+    applyCatalog([report, photo, folder])
+    offline.revealed = []
+    offline.activateIndex(1)
+    var walked = { token: "walk-photo", name: "beach.jpg", isDir: false,
+      path: "/run/media/test/ARCHIVE/" + photo.relativePath,
+      relativePath: "ARCHIVE/" + photo.relativePath, matchKind: "name" }
+    offline.applyVolumes(snapshot([Object.assign({}, archive, { mounted: true,
+      mountPath: "/run/media/test/ARCHIVE/", mountToken: "mount-archive", canUnmount: true })]))
+    applyCatalog([report, walked, folder])
+    check(offline.revealed.join(",") === "walk-photo" && offline.selectedToken === "walk-photo"
+        && offline.actionMessage === "“ARCHIVE” connected · beach.jpg is ready",
+      "A row the walk lists itself was not revealed: " + offline.revealed + " / "
+        + offline.actionMessage)
+    check(offline.lastOfflineRequest === null, "The walked reveal did not consume the request")
+
+    // The walk's row and the catalog's are one file: unplugging the drive
+    // hands the selection to the catalog row, mounting it hands it back.
+    var mountedArchive = Object.assign({}, archive, { mounted: true,
+      mountPath: "/run/media/test/ARCHIVE/", mountToken: "mount-archive", canUnmount: true })
+    offline.applyVolumes(snapshot([offlineDrive("uuid:A1", "ARCHIVE", 1790848800)]))
+    applyCatalog([report, photo, folder])
+    check(offline.selectedToken === photo.token && offline.selectedTokens.join(",") === photo.token
+        && offline.selectionAnchorIndex === 1
+        && offline.listingTokenMoves["walk-photo"] === photo.token,
+      "Unplugging a drive the walk listed dropped the selection: " + offline.selectedToken)
+    offline.applyVolumes(snapshot([mountedArchive]))
+    applyCatalog([report, walked, folder])
+    check(offline.selectedToken === "walk-photo"
+        && offline.selectedTokens.join(",") === "walk-photo"
+        && offline.revealed.join(",") === "walk-photo",
+      "Mounting the drive back did not hand the selection to the walk's row: "
+        + offline.selectedToken + " / " + offline.revealed)
+
+    // A key on a row whose drive has just mounted: "Finding…" until the
+    // search brings the row alive, then the reveal says it is ready.
+    var mountedElsewhere = Object.assign({}, archive, { mounted: true,
+      mountPath: "/run/media/test/ARCHIVE", mountToken: "mount-archive", canUnmount: true })
+    offline.applyVolumes(snapshot([offlineDrive("uuid:A1", "ARCHIVE", 1790848800)]))
+    applyCatalog([report, photo, folder])
+    offline.selectIndex(1)
+    offline.applyVolumes(snapshot([mountedElsewhere]))
+    check(offline.offlineHint(offline.selectedEntry)
+        && offline.actionMessage === "Finding beach.jpg on “ARCHIVE”…"
+        && offline.lastOfflineRequest !== null,
+      "A row whose drive mounted did not wait for the search: " + offline.actionMessage)
+    applyCatalog([report, liveCatalogRow(photo), folder])
+    check(offline.actionMessage === "“ARCHIVE” connected · beach.jpg is ready"
+        && offline.lastOfflineRequest === null,
+      "\"Finding…\" outlived the row it was finding: " + offline.actionMessage)
+
+    // A sheet open on another row holds the selection still: the row that
+    // came alive waits for it to close, then takes the cursor.
+    offline.applyVolumes(snapshot([offlineDrive("uuid:A1", "ARCHIVE", 1790848800)]))
+    applyCatalog([report, photo, folder])
+    offline.activateIndex(1)
+    offline.selectIndex(0)
+    offline.revealed = []
+    offline.selectionHeld = true
+    offline.applyVolumes(snapshot([mountedElsewhere]))
+    applyCatalog([report, liveCatalogRow(photo), folder])
+    check(offline.selectedToken === "live-report"
+        && offline.selectedTokens.join(",") === "live-report" && offline.revealed.length === 0 && offline.lastOfflineRequest !== null,
+      "A reveal moved the selection from under an open sheet: " + offline.selectedToken)
+    offline.selectionHeld = false
+    offline.revealRequestedEntry()
+    check(offline.selectedToken === "real-beach.jpg"
+        && offline.revealed.join(",") === "real-beach.jpg",
+      "The held reveal did not happen once the sheet closed: " + offline.selectedToken)
+
+    // A new question forgets the row asked for.
+    offline.applyVolumes(snapshot([offlineDrive("uuid:A1", "ARCHIVE", 1790848800)]))
+    applyCatalog([report, photo, folder])
+    offline.activateIndex(1)
+    offline.setSearch("beach trip", "fuzzy")
+    check(offline.lastOfflineRequest === null, "Changing the query kept the old request")
+    offline.setSearch("beach", "fuzzy")
+
+    // Drive changes refresh a search on screen, and only a search.
+    var refreshes = offline.searchRefreshes
+    offline.applyVolumes(snapshot([archive]))
+    check(offline.searchRefreshes === refreshes + 1,
+      "A drive arriving under a search did not refresh it")
+    offline.applyVolumes(snapshot([archive]))
+    check(offline.searchRefreshes === refreshes + 1, "An unchanged drive list refreshed the search")
+    offline.query = ""
+    offline.applyVolumes(snapshot([Object.assign({}, archive, { mounted: true,
+      mountPath: "/run/media/test/ARCHIVE", canUnmount: true })]))
+    check(offline.searchRefreshes === refreshes + 1,
+      "Mounting a drive refreshed a folder listing as if it were a search")
+    offline.query = "beach"
+    offline.catalogIndexVolumeId = "uuid:A1"
+    offline.catalogIndexName = "ARCHIVE"
+    offline.catalogIndexResult = { ok: true, event: "result",
+      volume: { name: "ARCHIVE", files: 12, state: "complete" } }
+    offline.finishCatalogIndex(0)
+    check(offline.searchRefreshes === refreshes + 2,
+      "A fresh catalog did not refresh the search on screen")
+
+    // Forgetting a drive's catalog takes its rows off the search on screen.
+    offline.applyVolumes(snapshot([offlineDrive("uuid:A1", "ARCHIVE", 1790848800)]))
+    applyCatalog([report, photo, folder])
+    offline.activateIndex(1)
+    var refreshesBeforeForget = offline.searchRefreshes
+    offline.catalogForgetVolumeId = "uuid:A1"
+    offline.catalogForgetStdout = JSON.stringify({ ok: true, message: "Forgot ARCHIVE" })
+    offline.finishCatalogForget(0)
+    check(offline.searchRefreshes === refreshesBeforeForget + 1
+        && offline.lastOfflineRequest === null,
+      "Forgetting a drive left its rows and its request on screen")
+
+    // A folder listing has no catalog to report.
+    offline.query = ""
+    offline.listInFlightCommand = JSON.stringify(offline.buildListCommand())
+    offline.listInFlightBackground = true
+    check(offline.applyListing(JSON.stringify({ ok: true, root: { token: offline.rootToken,
+      path: offline.rootPath }, entries: [report], favorites: [],
+      git: { root: "", branch: "" } })), "A folder listing was rejected")
+    check(offline.catalogResult === null && offline.offlineMatchCount === 0,
+      "A folder listing kept the last search's catalog tally")
   }
 
   function entryNamed(name) {

@@ -359,8 +359,27 @@ catalogs. The walk skips `.git`, does not enter dependency and cache trees
 such as `node_modules` or folders tagged with `CACHEDIR.TAG`, ignores drive
 litter such as `$RECYCLE.BIN`, `.Trashes` and `.Trash-*`, and stops at one
 million entries, marking the catalog partial.
-A `dd` clone shares its original's catalog. Searching an offline drive's
-catalog from the search field is not wired in yet.
+A `dd` clone shares its original's catalog.
+
+Every search, from any folder and in every mode, also lists matches from the
+catalogs of indexed drives that are away. They come after the live rows,
+dimmed, with an `OFFLINE` badge and a second line naming the drive and whether
+it is not connected, locked or not mounted. Enter on one says what to do —
+`Connect “ARCHIVE” to open beach.jpg`, or Unlock or Mount — and a drive that is
+plugged in but not mounted is mounted in place without leaving the search. A
+drive that turns up later is never mounted by QuickFile; once the desktop mounts
+it, the row comes alive in place with its real path, the cursor lands on it and
+the footer says `“ARCHIVE” connected · beach.jpg is ready`. Copy, trash, rename,
+stars and notes leave an offline row alone and only say where it is. A drive
+that is mounted somewhere outside the searched folder is listed live from its
+catalog, without a file deleted since it was indexed. The `Offline drives in
+search` switch in the settings turns these rows off. Limits: an offline drive
+has no content matches, only names and paths; typo and transliteration
+tolerance reach only names the catalog prefilter keeps; at most 300 offline rows
+are listed; and the catalogs get a share of the search time budget, split evenly
+between them and spent on name matches before path matches, so a very large
+catalog can come back truncated. A mounted drive too slow to answer in that time
+lists its rows from its catalog, and opening one searches again.
 
 The short labels in `PROJECT KNOWLEDGE` (`CX`, `CL`, `GM`, `CU`, `CP`, `WS`) describe
 which agent configuration references a file. They are bindings, not currently

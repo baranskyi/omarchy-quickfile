@@ -80,7 +80,7 @@ identity, navigation/search, metadata, and a small set of recoverable actions.
 - Semantic embeddings, synonym retrieval, and domain fine-tuning remain future
   experiments; SMART currently reranks the bounded lexical candidate set.
 
-## 0.8 — offline drive catalog (in progress)
+## 0.8 — offline drive catalog (complete)
 
 A drive that is not plugged in can still be found: QuickFile walks an external
 drive once into a private catalog and lists it, dimmed, while it is away. The

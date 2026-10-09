@@ -71,7 +71,7 @@ from quickfile_smart import (  # noqa: E402 - bundled sibling of this executable
 )
 
 
-VERSION = "0.16.0"
+VERSION = "0.17.0"
 DEFAULT_LIMIT = 2000
 COMMAND_TIMEOUT = 3
 # `git status` is the only command on the navigation path that can scale with

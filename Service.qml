@@ -154,6 +154,44 @@ Item {
   property var folderSizeResult: null
   property string folderSizeError: ""
   property double folderSizeStarted: 0
+
+  // Offline catalog of an external drive: names, paths, sizes and dates,
+  // walked once so a search can say which drive to plug in. One walk at a
+  // time, reported and cancellable like the folder walk, and kept out of
+  // actionBusy so a slow USB disk never blocks browsing or file operations.
+  // catalogIndexVolumeId is set from the request until the exit handler has
+  // run; the process's own running flag drops just before that handler.
+  property string catalogIndexDevice: ""
+  property string catalogIndexVolumeId: ""
+  property string catalogIndexName: ""
+  property bool catalogIndexAutomatic: false
+  readonly property bool catalogIndexBusy: catalogIndexProcess.running
+  property bool catalogIndexCancelling: false
+  readonly property bool catalogIndexKillPending: catalogIndexKillTimer.running
+  property string catalogIndexPhase: ""
+  property double catalogIndexFiles: 0
+  property double catalogIndexDirectories: 0
+  property double catalogIndexBytes: 0
+  property string catalogIndexError: ""
+  property var catalogIndexResult: null
+  property string catalogIndexStderr: ""
+  // An unmount asked for mid-walk waits for the walk to let go of the mount;
+  // udisksctl would otherwise fail with "target is busy".
+  property string unmountAfterIndexDevice: ""
+  // Known drives re-index when they are mounted again, one at a time. A drive
+  // whose automatic run the user stopped is left alone for the session.
+  readonly property int catalogAutoRefreshMinAge: 60
+  property var autoIndexQueue: []
+  property var autoIndexSkipped: ({})
+  // The first drive snapshot is only a baseline: drives already mounted when
+  // QuickFile starts were not just plugged in.
+  property bool volumesSnapshotReady: false
+  property int catalogVolumeCount: 0
+  property int offlineVolumeCount: 0
+  property string catalogForgetVolumeId: ""
+  readonly property bool catalogForgetBusy: catalogForgetProcess.running
+  property string catalogForgetStdout: ""
+  property string catalogForgetStderr: ""
   property string query: ""
   // Plain-language search is the default; without its optional model it
   // still ranks the typed keywords, and a one-time tip offers the model.
@@ -450,8 +488,10 @@ Item {
     return setDateFormat(dateFormats[((index + delta) % count + count) % count])
   }
 
+  // Drive rows carry an id that survives unplug, replug and unlock, so one
+  // delegate follows the drive instead of whichever /dev node it got.
   function rowKey(row) {
-    return String(row.token || row.device || row.sessionKey || "")
+    return String(row.token || row.id || row.device || row.sessionKey || "")
   }
 
   function reconcileRows(model, previous, next) {
@@ -1088,14 +1128,279 @@ Item {
       return false
     }
     var nextVolumes = Array.isArray(parsed.volumes) ? parsed.volumes : []
-    if (!sameData(volumes, nextVolumes)) {
+    var previousVolumes = volumes
+    var changed = !sameData(volumes, nextVolumes)
+    if (changed) {
       listingAboutToChange()
       reconcileRows(volumeRows, volumes, nextVolumes)
       volumes = nextVolumes
       modelChanged()
     }
+    var catalogued = 0
+    var offline = 0
+    for (var i = 0; i < nextVolumes.length; i++) {
+      if (nextVolumes[i].catalogued === true) catalogued++
+      if (nextVolumes[i].offline === true) offline++
+    }
+    var reportedOffline = Number(parsed.offlineCount)
+    catalogVolumeCount = catalogued
+    offlineVolumeCount = isFinite(reportedOffline) && reportedOffline >= 0
+      ? reportedOffline : offline
     volumesError = ""
+    if (volumesSnapshotReady && changed) queueRemountedCatalogs(previousVolumes, nextVolumes)
+    volumesSnapshotReady = true
+    // A queued drive held back by its mount or unmount goes once the
+    // snapshot that follows the action says what became of it.
+    startNextAutoIndex()
     return true
+  }
+
+  function volumeForCatalogId(volumeId) {
+    var id = String(volumeId || "")
+    if (id === "") return null
+    for (var i = 0; i < volumes.length; i++)
+      if (String(volumes[i].catalogVolumeId || "") === id) return volumes[i]
+    return null
+  }
+
+  function volumeForDevice(device) {
+    var value = String(device || "")
+    if (value === "") return null
+    for (var i = 0; i < volumes.length; i++)
+      if (volumes[i].offline !== true && String(volumes[i].device || "") === value)
+        return volumes[i]
+    return null
+  }
+
+  // A transition, never a state: a drive that was already mounted in the last
+  // snapshot is not re-indexed, so finishing an index cannot start another.
+  function queueRemountedCatalogs(previous, next) {
+    var wasMounted = ({})
+    for (var i = 0; i < previous.length; i++) {
+      var before = previous[i]
+      if (before.mounted === true && before.offline !== true && before.catalogVolumeId)
+        wasMounted[String(before.catalogVolumeId)] = true
+    }
+    var now = Date.now() / 1000
+    for (var j = 0; j < next.length; j++) {
+      var row = next[j]
+      var id = String(row.catalogVolumeId || "")
+      if (id === "" || row.catalogued !== true || row.mounted !== true
+          || row.offline === true || wasMounted[id] || autoIndexSkipped[id]) continue
+      if (now - Number(row.indexedEpoch || 0) <= catalogAutoRefreshMinAge) continue
+      if (catalogIndexBusy || catalogIndexVolumeId !== "" || volumeActionPending(row)) {
+        if (id !== catalogIndexVolumeId && autoIndexQueue.indexOf(id) < 0)
+          autoIndexQueue = autoIndexQueue.concat([id])
+      } else {
+        indexVolume(row, true)
+      }
+    }
+  }
+
+  function startNextAutoIndex() {
+    while (autoIndexQueue.length > 0 && catalogIndexVolumeId === "") {
+      var queue = autoIndexQueue.slice()
+      var id = queue.shift()
+      var volume = volumeForCatalogId(id)
+      if (volume && volumeActionPending(volume)) return false
+      autoIndexQueue = queue
+      if (autoIndexSkipped[id]) continue
+      if (volume && volume.mounted === true && volume.offline !== true
+          && indexVolume(volume, true)) return true
+    }
+    return false
+  }
+
+  function buildCatalogIndexCommand(volume) {
+    return ["/usr/bin/env", "python3", cliPath, "catalog-index",
+      "--device", String(volume && volume.device || "")]
+  }
+
+  function buildCatalogForgetCommand(volumeId) {
+    return ["/usr/bin/env", "python3", cliPath, "catalog-forget",
+      "--volume-id", String(volumeId || "")]
+  }
+
+  // A mount or unmount still running on this drive: the walk would hold the
+  // mount busy under udisksctl, or lose it halfway.
+  function volumeActionPending(volume) {
+    var device = String(volume && volume.device || "")
+    return device !== "" && device === volumeActionDevice
+  }
+
+  function volumeIndexable(volume) {
+    return !!volume && volume.offline !== true && volume.locked !== true
+      && volume.mounted === true && String(volume.device || "") !== ""
+      && volume.identityStrength !== "none" && String(volume.catalogVolumeId || "") !== ""
+  }
+
+  function indexVolume(volume, automatic) {
+    if (!volume || catalogIndexBusy || catalogIndexVolumeId !== "") return false
+    if (volumeActionPending(volume)) return false
+    if (!volumeIndexable(volume)) {
+      if (automatic !== true && volume.mounted === true && volume.offline !== true)
+        actionMessage = "This drive has no stable identity"
+      return false
+    }
+    var id = String(volume.catalogVolumeId)
+    autoIndexQueue = autoIndexQueue.filter(function(value) { return value !== id })
+    catalogIndexDevice = String(volume.device)
+    catalogIndexVolumeId = id
+    catalogIndexName = String(volume.label || volume.name || volume.device)
+    catalogIndexAutomatic = automatic === true
+    catalogIndexCancelling = false
+    catalogIndexPhase = ""
+    catalogIndexFiles = 0
+    catalogIndexDirectories = 0
+    catalogIndexBytes = 0
+    catalogIndexError = ""
+    catalogIndexResult = null
+    catalogIndexStderr = ""
+    // The footer shows the walk until something newer has a word to say;
+    // whatever it said before the walk began is not newer.
+    actionMessage = ""
+    return startCatalogIndexProcess(buildCatalogIndexCommand(volume))
+  }
+
+  // The one place an index process starts, so the harness can drive the
+  // whole request/exit cycle without a backend.
+  function startCatalogIndexProcess(command) {
+    catalogIndexProcess.command = command
+    catalogIndexProcess.running = true
+    return true
+  }
+
+  function cancelCatalogIndex() {
+    if (catalogIndexVolumeId === "" || catalogIndexCancelling) return false
+    catalogIndexCancelling = true
+    if (signalCatalogIndex(15)) catalogIndexKillTimer.restart()
+    return true
+  }
+
+  // The one place the walk is signalled, beside the one place it starts.
+  function signalCatalogIndex(signalNumber) {
+    if (!catalogIndexProcess.running) return false
+    catalogIndexProcess.signal(signalNumber)
+    return true
+  }
+
+  function escalateCatalogIndexCancel() {
+    catalogIndexKillTimer.stop()
+    return catalogIndexCancelling && signalCatalogIndex(9)
+  }
+
+  function handleCatalogIndexEvent(line) {
+    var parsed = null
+    try { parsed = JSON.parse(String(line || "")) } catch (error) { return }
+    if (!parsed) return
+    if (parsed.event === "progress") {
+      catalogIndexPhase = String(parsed.phase || "")
+      catalogIndexFiles = Number(parsed.files) || 0
+      catalogIndexDirectories = Number(parsed.directories) || 0
+      catalogIndexBytes = Number(parsed.bytes) || 0
+      return
+    }
+    if (parsed.ok === true) {
+      catalogIndexResult = parsed
+      var volume = parsed.volume || ({})
+      catalogIndexFiles = Number(volume.files) || 0
+      catalogIndexDirectories = Number(volume.directories) || 0
+      catalogIndexBytes = Number(volume.bytes) || 0
+      catalogIndexError = ""
+    } else if (parsed.error) {
+      catalogIndexResult = parsed
+      catalogIndexError = String(parsed.error)
+    }
+  }
+
+  // Panel's compactTokens, so the finished message reads like the progress.
+  function compactCount(value) {
+    var amount = Math.max(0, Number(value || 0))
+    if (amount < 1000) return String(Math.round(amount))
+    var digits = amount >= 10000 ? 1 : 2
+    return (amount / 1000).toFixed(digits).replace(/\.0+$/, "") + "k"
+  }
+
+  function finishCatalogIndex(exitCode) {
+    catalogIndexKillTimer.stop()
+    var parsed = catalogIndexResult
+    var volumeId = catalogIndexVolumeId
+    var automatic = catalogIndexAutomatic
+    var parkedDevice = unmountAfterIndexDevice
+    var cancelled = catalogIndexCancelling || exitCode === 130
+      || (parsed && (parsed.code === "cancelled" || parsed.code === "operation-cancelled"))
+    var ok = exitCode === 0 && parsed && parsed.ok === true
+    var message = ""
+    if (ok) {
+      var result = parsed.volume || ({})
+      message = "Indexed “" + String(result.name || catalogIndexName) + "” · "
+        + compactCount(result.files) + " files"
+        + (String(result.state || "") === "partial" ? " · partial" : "")
+    } else if (!cancelled) {
+      message = parsed && parsed.error ? String(parsed.error)
+        : (catalogIndexError || catalogIndexStderr.trim() || "Could not index the drive")
+    }
+    // A cancelled walk has nothing to report, and a message that arrived
+    // while it ran is still the latest word.
+    if (message !== "") actionMessage = message
+    catalogIndexDevice = ""
+    catalogIndexVolumeId = ""
+    catalogIndexName = ""
+    catalogIndexAutomatic = false
+    catalogIndexCancelling = false
+    catalogIndexPhase = ""
+    unmountAfterIndexDevice = ""
+    // Stopping an automatic run means "not now". Unmounting mid-run does not:
+    // the drive re-indexes the next time it is mounted.
+    if (automatic && cancelled && parkedDevice === "" && volumeId !== "") {
+      var skipped = Object.assign({}, autoIndexSkipped)
+      skipped[volumeId] = true
+      autoIndexSkipped = skipped
+    }
+    actionFinished("catalog-index", ok, message)
+    Qt.callLater(root.reloadVolumes)
+    if (parkedDevice !== "") {
+      var parked = volumeForDevice(parkedDevice)
+      if (parked) unmountVolume(parked)
+    }
+    // The next queued drive starts without clearing what this walk just said.
+    var reported = actionMessage
+    if (startNextAutoIndex()) actionMessage = reported
+  }
+
+  function forgetCatalog(volumeId) {
+    var id = String(volumeId || "")
+    if (id === "" || catalogForgetProcess.running) return false
+    if (id === catalogIndexVolumeId) {
+      // The walk would publish the catalog again seconds after it was removed.
+      actionMessage = "This drive is being indexed"
+      return false
+    }
+    catalogForgetVolumeId = id
+    catalogForgetStdout = ""
+    catalogForgetStderr = ""
+    return startCatalogForgetProcess(buildCatalogForgetCommand(id))
+  }
+
+  function startCatalogForgetProcess(command) {
+    catalogForgetProcess.command = command
+    catalogForgetProcess.running = true
+    return true
+  }
+
+  function finishCatalogForget(exitCode) {
+    var id = catalogForgetVolumeId
+    var parsed = null
+    try { parsed = JSON.parse(catalogForgetStdout) } catch (error) {}
+    var ok = exitCode === 0 && parsed && parsed.ok === true
+    var message = ok ? String(parsed.message || "Forgot the drive's catalog")
+      : (parsed && parsed.error ? String(parsed.error)
+        : (catalogForgetStderr.trim() || "Could not forget the drive's catalog"))
+    catalogForgetVolumeId = ""
+    if (ok) autoIndexQueue = autoIndexQueue.filter(function(value) { return value !== id })
+    actionMessage = message
+    actionFinished("catalog-forget", ok, message)
+    Qt.callLater(root.reloadVolumes)
   }
 
   function pathInsideMount(path, mountPath) {
@@ -1106,7 +1411,20 @@ Item {
   }
 
   function openVolume(volume) {
-    if (!volume || volumeActionProcess.running) return false
+    if (!volume) return false
+    // A catalogued drive that is away, or still locked, has nothing to mount.
+    // Named by its label: the listed name may carry a model and size to tell
+    // two same-named drives apart, which the row already shows.
+    var name = String(volume.label || volume.name || "this drive")
+    if (volume.offline === true) {
+      actionMessage = "Connect “" + name + "” to browse it"
+      return false
+    }
+    if (volume.locked === true) {
+      actionMessage = "Unlock “" + name + "” to browse it"
+      return false
+    }
+    if (volumeActionProcess.running) return false
     if (volume.mounted === true && String(volume.mountPath || "") !== "")
       return navigate(String(volume.mountPath), String(volume.mountToken || ""), true)
     if (volume.canMount !== true) {
@@ -1118,6 +1436,12 @@ Item {
 
   function unmountVolume(volume) {
     if (!volume || volume.mounted !== true || volume.canUnmount !== true) return false
+    var device = String(volume.device || "")
+    if (catalogIndexVolumeId !== "" && device !== "" && device === catalogIndexDevice) {
+      unmountAfterIndexDevice = device
+      cancelCatalogIndex()
+      return true
+    }
     return runVolumeAction("unmount", volume)
   }
 
@@ -2342,6 +2666,10 @@ Item {
         smartFallback: root.semanticFallback,
         smartSession: root.semanticSessionActive,
         smartOnboardingDone: root.smartOnboardingDone,
+        catalogVolumes: root.catalogVolumeCount,
+        offlineVolumes: root.offlineVolumeCount,
+        catalogIndexBusy: root.catalogIndexBusy,
+        catalogIndexDevice: root.catalogIndexDevice,
         moduleLayout: root.moduleLayout
       })
     }
@@ -2748,6 +3076,39 @@ Item {
         root.folderSizeError = root.folderSizeCancelling ? "" : "Could not measure the folder"
       root.folderSizeCancelling = false
     }
+  }
+
+  Process {
+    id: catalogIndexProcess
+    stdout: SplitParser {
+      onRead: function(data) { root.handleCatalogIndexEvent(data) }
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.catalogIndexStderr = text.slice(-400)
+    }
+    onExited: function(exitCode) { root.finishCatalogIndex(exitCode) }
+  }
+
+  // SIGTERM is honoured between entries. A walk stuck in a pulled drive's I/O
+  // never reaches the next check, so it is killed outright after a grace period.
+  Timer {
+    id: catalogIndexKillTimer
+    interval: 5000
+    onTriggered: root.escalateCatalogIndexCancel()
+  }
+
+  Process {
+    id: catalogForgetProcess
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.catalogForgetStdout = text
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.catalogForgetStderr = text.slice(-2000)
+    }
+    onExited: function(exitCode) { root.finishCatalogForget(exitCode) }
   }
 
   Process {

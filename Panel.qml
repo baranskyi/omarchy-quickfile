@@ -26,6 +26,7 @@ Item {
   property string editorValue: ""
   property string editorError: ""
   property var pendingTrashEntry: null
+  property var pendingForgetVolume: null
   property var pendingDrop: null
   property var conflictRows: []
   // Quick Nav is switched off pending a reason to keep it: the location bar,
@@ -245,6 +246,16 @@ Item {
     if (value < 3600) return Math.floor(value / 60) + "m"
     if (value < 86400) return Math.floor(value / 3600) + "h"
     return Math.floor(value / 86400) + "d"
+  }
+
+  // An index stamp is a moment, not an age. sessionAge reads zero and below
+  // as a live session, so a stamp from this very second is clamped to "now".
+  function catalogAge(epoch) {
+    var tick = dateTick
+    var stamp = Number(epoch || 0)
+    if (stamp <= 0) return ""
+    var age = sessionAge(Math.max(1, Date.now() / 1000 - stamp))
+    return age === "now" ? age : age + " ago"
   }
 
   function open(payloadJson) {
@@ -619,6 +630,7 @@ Item {
     // stays on the Size row, marked as stopped rather than passed off as final.
     if (editorMode === "folder-size" && service) service.cancelFolderSize()
     pendingDrop = null
+    pendingForgetVolume = null
     editorMode = ""
     editorError = ""
   }
@@ -693,12 +705,14 @@ Item {
     }
   }
 
+  // A drive's "indexed 3h ago" ages the same way, whatever the date format.
   Timer {
     interval: 30000
     repeat: true
     triggeredOnStart: true
     running: root.opened && root.service
-      && ["relative", "smart"].indexOf(String(root.service.dateFormat)) >= 0
+      && (["relative", "smart"].indexOf(String(root.service.dateFormat)) >= 0
+        || root.service.catalogVolumeCount > 0)
     onTriggered: root.dateTick++
   }
 
@@ -958,11 +972,72 @@ Item {
     if (!volume) return ""
     var parts = []
     if (volume.sizeText) parts.push(String(volume.sizeText))
+    if (volume.offline === true) {
+      // An unreadable catalog has no size on file; "0 B" would read as an empty drive.
+      if (volume.catalogState === "unreadable") return "Catalog unreadable"
+      parts.push("Not connected")
+      var away = catalogAge(volume.indexedEpoch)
+      if (away !== "") parts.push("indexed " + away)
+      return parts.join("  ·  ")
+    }
+    if (volumeIndexing(volume))
+      return "Indexing  ·  " + compactTokens(service.catalogIndexFiles) + " files"
     if (volume.transport) parts.push(String(volume.transport))
     if (volume.mounted === true && volume.mountPath)
       parts.push(String(volume.mountPath))
     else parts.push("Not mounted")
+    if (volume.locked === true) parts.push("locked")
+    else if (volume.catalogued === true) {
+      var age = catalogAge(volume.indexedEpoch)
+      if (volume.catalogState === "unreadable") parts.push("catalog unreadable")
+      else if (age !== "") parts.push("indexed " + age)
+      if (volume.catalogState === "partial") parts.push("partial")
+    }
     return parts.join("  ·  ")
+  }
+
+  function volumeIndexing(volume) {
+    return !!service && !!volume && service.catalogIndexBusy && volume.offline !== true
+      && String(volume.device || "") !== ""
+      && String(volume.device) === String(service.catalogIndexDevice || "")
+  }
+
+  function devicesSummary() {
+    if (!service) return ""
+    var offline = Math.max(0, Number(service.offlineVolumeCount || 0))
+    var connected = Math.max(0, service.volumes.length - offline)
+    return connected + (connected === 1 ? " drive" : " drives")
+      + (offline > 0 ? " · " + offline + " offline" : "")
+  }
+
+  // Indexing needs a mounted drive with an identity that outlives its /dev
+  // node, no mount or unmount of it in flight, and only one walk at a time.
+  function canIndexVolume(volume) {
+    return !!service && !service.catalogIndexBusy && !service.volumeActionPending(volume)
+      && service.volumeIndexable(volume)
+  }
+
+  function catalogIndexTooltip(volume) {
+    if (!volume) return ""
+    if (volumeIndexing(volume)) return "Stop indexing"
+    if (volume.identityStrength === "none" || !volume.catalogVolumeId)
+      return "This drive has no stable identity"
+    var age = volume.catalogued === true ? catalogAge(volume.indexedEpoch) : ""
+    return age !== "" ? "Re-index · indexed " + age : "Index drive for offline search"
+  }
+
+  function catalogIndexStatus() {
+    if (!service || !service.catalogIndexBusy) return ""
+    if (service.catalogIndexCancelling) return "Cancelling…"
+    return "Indexing “" + service.catalogIndexName + "” · "
+      + compactTokens(service.catalogIndexFiles) + " files"
+  }
+
+  function confirmForgetCatalog(volume) {
+    if (!service || !volume) return false
+    pendingForgetVolume = volume
+    beginEditor("catalog-forget")
+    return true
   }
 
   function volumeIsCurrent(volume) {
@@ -1521,6 +1596,8 @@ Item {
     if (editorMode === "semantic-install" || editorMode === "smart-onboarding")
       return !service.semanticInstalled
     if (editorMode === "semantic-remove") return service.semanticInstalled
+    if (editorMode === "catalog-forget")
+      return !!pendingForgetVolume && !service.catalogForgetBusy
     return true
   }
 
@@ -1554,6 +1631,16 @@ Item {
     if (editorMode === "trash") {
       if (!service.selectedToken) return
       if (service.trashSelected()) editorMode = ""
+      return
+    }
+    if (editorMode === "catalog-forget") {
+      if (!pendingForgetVolume) return
+      var volumeId = String(pendingForgetVolume.catalogVolumeId || pendingForgetVolume.id || "")
+      if (service.forgetCatalog(volumeId)) {
+        pendingForgetVolume = null
+        editorMode = ""
+      } else editorError = volumeId !== "" && volumeId === service.catalogIndexVolumeId
+        ? "This drive is being indexed" : "Could not forget this drive's catalog"
       return
     }
     if (editorMode === "trash-delete") {
@@ -1599,6 +1686,9 @@ Item {
     }
     function onActionFinished(kind, ok, message) {
       if (kind === "metadata") root.finishMetadataSave(ok)
+      // A background index ends on its own schedule; its outcome belongs to
+      // the footer, not to whatever sheet happens to be open.
+      if (kind === "catalog-index") return
       if (!ok) root.editorError = message
       else if (kind === "rename" && root.editorMode === "rename") {
         root.editorError = ""
@@ -1680,7 +1770,7 @@ Item {
     function rowKey(index) {
       if (!model || index < 0 || index >= count) return ""
       var row = model.get(index).rowData
-      return row ? String(row.token || row.device || row.sessionKey || "") : ""
+      return row ? String(row.token || row.id || row.device || row.sessionKey || "") : ""
     }
 
     function locationKey(path, token) {
@@ -3112,15 +3202,16 @@ Item {
           }
           Text {
             textFormat: Text.PlainText
+            objectName: "quickfileDevicesSummary"
             anchors.right: parent.right
             anchors.rightMargin: Style.space(12)
             anchors.verticalCenter: parent.verticalCenter
             text: !root.service ? ""
               : root.service.volumeActionKind !== ""
                 ? root.service.volumeActionKind.toUpperCase() + "ING…"
+              : root.service.catalogIndexBusy ? "INDEXING…"
               : root.service.volumesError !== "" ? "DEVICE ERROR"
-              : root.service.volumes.length
-                + (root.service.volumes.length === 1 ? " drive" : " drives")
+              : root.devicesSummary()
             color: root.service && root.service.volumesError !== ""
               ? Color.urgent : root.muted
             font.family: Style.font.family
@@ -3159,7 +3250,9 @@ Item {
             readonly property var modelData: rowData
             width: devicesList.width
             height: Style.space(42)
-            readonly property bool current: root.volumeIsCurrent(modelData)
+            readonly property bool offline: modelData.offline === true
+            readonly property bool indexing: root.volumeIndexing(modelData)
+            readonly property bool current: !offline && root.volumeIsCurrent(modelData)
             color: current ? Style.focusFillColor
               : (deviceMouse.containsMouse ? Style.hoverFill : "transparent")
             DirectoryDropTarget {
@@ -3167,15 +3260,19 @@ Item {
                 token: deviceRow.modelData.mountToken, path: deviceRow.modelData.mountPath }) : null
             }
 
+            // A drive that is away is dimmed like a hidden file: still listed,
+            // still searchable, but not something to open right now.
             Text {
               textFormat: Text.PlainText
               id: deviceIcon
+              objectName: "quickfileDeviceIcon"
               anchors.left: parent.left
               anchors.leftMargin: Style.space(48)
               anchors.verticalCenter: parent.verticalCenter
               width: Style.space(19)
               text: root.volumeGlyph(deviceRow.modelData)
               color: deviceRow.current ? root.accent : root.foreground
+              opacity: deviceRow.offline ? 0.55 : 1
               font.family: Style.font.family
               font.pixelSize: root.primaryFontSize
               renderType: Text.NativeRendering
@@ -3183,15 +3280,17 @@ Item {
             Column {
               anchors.left: deviceIcon.right
               anchors.leftMargin: Style.space(5)
-              anchors.right: volumeActionButton.left
+              anchors.right: deviceActions.left
               anchors.rightMargin: Style.space(6)
               anchors.verticalCenter: parent.verticalCenter
               spacing: 0
               Text {
                 textFormat: Text.PlainText
+                objectName: "quickfileDeviceName"
                 width: parent.width
                 text: String(deviceRow.modelData.name || deviceRow.modelData.device || "Drive")
                 color: deviceRow.current ? root.accent : root.foreground
+                opacity: deviceRow.offline ? 0.58 : 1
                 elide: Text.ElideRight
                 font.family: Style.font.family
                 font.pixelSize: root.primaryFontSize
@@ -3199,9 +3298,11 @@ Item {
               }
               Text {
                 textFormat: Text.PlainText
+                objectName: "quickfileDeviceDetail"
                 width: parent.width
                 text: root.volumeDetail(deviceRow.modelData)
                 color: root.muted
+                opacity: deviceRow.offline ? 0.58 : 1
                 elide: Text.ElideMiddle
                 font.family: Style.font.family
                 font.pixelSize: Style.font.caption
@@ -3220,24 +3321,53 @@ Item {
                 root.focusList()
               }
             }
-            Components.IconButton {
-              id: volumeActionButton
+            Row {
+              id: deviceActions
               z: 3
               anchors.right: parent.right
               anchors.rightMargin: Style.space(8)
               anchors.verticalCenter: parent.verticalCenter
-              glyph: deviceRow.modelData.mounted === true ? "󰍃" : "󰐕"
-              tooltip: deviceRow.modelData.mounted === true
-                ? "Safely unmount drive" : "Mount and open drive"
-              buttonSize: Style.space(27)
-              available: root.service && !root.service.volumesBusy
-                && (deviceRow.modelData.mounted === true
-                  ? deviceRow.modelData.canUnmount === true
-                  : deviceRow.modelData.canMount === true)
-              onClicked: {
-                if (deviceRow.modelData.mounted === true)
-                  root.service.unmountVolume(deviceRow.modelData)
-                else root.service.openVolume(deviceRow.modelData)
+              spacing: Style.space(2)
+              Components.IconButton {
+                id: catalogIndexButton
+                objectName: "quickfileCatalogIndexButton"
+                visible: !deviceRow.offline && deviceRow.modelData.mounted === true
+                glyph: deviceRow.indexing ? "󰜺" : "󰑐"
+                tooltip: root.catalogIndexTooltip(deviceRow.modelData)
+                buttonSize: Style.space(27)
+                available: deviceRow.indexing
+                  ? root.service && !root.service.catalogIndexCancelling
+                  : root.canIndexVolume(deviceRow.modelData)
+                onClicked: {
+                  if (deviceRow.indexing) root.service.cancelCatalogIndex()
+                  else root.service.indexVolume(deviceRow.modelData, false)
+                }
+              }
+              // An offline row has nothing to mount; its one action is to
+              // drop the catalog of a drive that will not be back.
+              Components.IconButton {
+                id: volumeActionButton
+                objectName: "quickfileVolumeActionButton"
+                glyph: deviceRow.offline ? "󰆴"
+                  : deviceRow.modelData.mounted === true ? "󰍃" : "󰐕"
+                // Unmounting the drive being indexed stops the walk first,
+                // then unmounts once it has let go of the mount.
+                tooltip: deviceRow.offline ? "Forget this drive's catalog"
+                  : deviceRow.modelData.mounted !== true ? "Mount and open drive"
+                  : deviceRow.indexing ? "Stop indexing and unmount" : "Safely unmount drive"
+                buttonSize: Style.space(27)
+                available: !root.service ? false
+                  : deviceRow.offline ? !root.service.catalogForgetBusy
+                  : !root.service.volumesBusy
+                    && (deviceRow.modelData.mounted === true
+                      ? deviceRow.modelData.canUnmount === true
+                      : deviceRow.modelData.canMount === true)
+                onClicked: {
+                  if (deviceRow.offline) root.confirmForgetCatalog(deviceRow.modelData)
+                  else if (deviceRow.modelData.mounted === true)
+                    root.service.unmountVolume(deviceRow.modelData)
+                  else root.service.openVolume(deviceRow.modelData)
+                }
               }
             }
           }
@@ -3807,22 +3937,33 @@ Item {
             anchors.leftMargin: Style.space(5)
             anchors.verticalCenter: parent.verticalCenter
             spacing: Style.space(2)
+            // Undo stays where it always is while a drive indexes in the
+            // background; the walk's Cancel sits beside it, not in its place.
             Components.IconButton {
-              visible: root.service && root.service.operationBusy
-              glyph: "󰜺"
-              tooltip: "Cancel operation"
-              buttonSize: Style.space(23)
-              available: root.service && !root.service.operationCancelling
-              onClicked: root.service.cancelOperation()
-            }
-            Components.IconButton {
-              visible: root.service && !root.service.operationBusy
-                && root.service.undoAvailable
+              objectName: "quickfileFooterUndo"
+              visible: root.service && !root.service.operationBusy && root.service.undoAvailable
               glyph: "󰕌"
               tooltip: "Undo " + (root.service ? root.service.undoLabel : "") + "  ·  Ctrl+Z"
               buttonSize: Style.space(23)
               available: root.service && root.service.undoAvailable
               onClicked: root.service.undoLast()
+            }
+            // One Cancel for whatever is running: a file operation first, else
+            // a drive being indexed in the background.
+            Components.IconButton {
+              objectName: "quickfileFooterCancel"
+              visible: root.service
+                && (root.service.operationBusy || root.service.catalogIndexBusy)
+              glyph: "󰜺"
+              tooltip: root.service && !root.service.operationBusy
+                ? "Stop indexing" : "Cancel operation"
+              buttonSize: Style.space(23)
+              available: root.service && (root.service.operationBusy
+                ? !root.service.operationCancelling : !root.service.catalogIndexCancelling)
+              onClicked: {
+                if (root.service.operationBusy) root.service.cancelOperation()
+                else root.service.cancelCatalogIndex()
+              }
             }
           }
 
@@ -3854,7 +3995,10 @@ Item {
 
           // One centred slot. What the folder holds is the resting state; an
           // operation, a pending clipboard or the last action's message takes
-          // the slot while it has something to say, then hands it back.
+          // the slot while it has something to say, then hands it back. A
+          // drive indexing in the background comes last: it can run for an
+          // hour, its progress is in DEVICES too, and starting it cleared any
+          // older message, so only a newer one is shown over it.
           Text {
             textFormat: Text.PlainText
             objectName: "quickfileFooterStatus"
@@ -3864,7 +4008,9 @@ Item {
               : root.service.clipboardToken !== ""
                 ? ((root.service.clipboardMode === "cut" ? "Cut: " : "Copy: ")
                   + root.service.clipboardName)
-                : String(root.service.actionMessage || "")
+              : String(root.service.actionMessage || "") !== ""
+                ? String(root.service.actionMessage)
+              : root.service.catalogIndexBusy ? root.catalogIndexStatus() : ""
             readonly property string tally: !root.service ? ""
               : root.service.selectedTokens.length > 1
                 ? root.service.selectedTokens.length + " selected"
@@ -5084,6 +5230,9 @@ Item {
 
               Text {
                 textFormat: Text.PlainText
+                objectName: "quickfileEditorTitle"
+                width: parent.width
+                elide: Text.ElideMiddle
                 text: root.editorMode === "new-file" ? "Create file"
                   : root.editorMode === "new-folder" ? "Create folder"
                   : root.editorMode === "rename" ? "Rename item"
@@ -5100,6 +5249,10 @@ Item {
                   : root.editorMode === "smart-onboarding" ? "Smart Search is on"
                   : root.editorMode === "semantic-install" ? "Install Smart Search?"
                   : root.editorMode === "semantic-remove" ? "Remove Smart Search?"
+                  : root.editorMode === "catalog-forget"
+                    ? "Forget “" + (root.pendingForgetVolume
+                      ? String(root.pendingForgetVolume.name || root.pendingForgetVolume.label
+                        || "this drive") : "this drive") + "”?"
                   : "Move to Trash?"
                 color: root.foreground
                 font.family: Style.font.family
@@ -5607,6 +5760,20 @@ Item {
 
               Text {
                 textFormat: Text.PlainText
+                objectName: "quickfileCatalogForgetText"
+                visible: root.editorMode === "catalog-forget"
+                width: parent.width
+                wrapMode: Text.Wrap
+                text: "QuickFile forgets the files it indexed on this drive. Nothing on the "
+                  + "drive changes; index it again the next time it is connected."
+                color: root.muted
+                font.family: Style.font.family
+                font.pixelSize: Style.font.bodySmall
+                renderType: Text.NativeRendering
+              }
+
+              Text {
+                textFormat: Text.PlainText
                 visible: root.editorMode === "trash" || root.editorMode === "trash-delete"
                 width: parent.width
                 wrapMode: Text.Wrap
@@ -5915,6 +6082,7 @@ Item {
                     : root.editorMode === "semantic-install"
                       || root.editorMode === "smart-onboarding" ? "󰇚"
                     : root.editorMode === "semantic-remove" ? "󰆴"
+                    : root.editorMode === "catalog-forget" ? "󰆴"
                     : root.editorMode === "knowledge-links" ? "󰌷" : "󰄬"
                   label: root.editorMode === "trash" ? "Move to Trash"
                     : root.editorMode === "trash-delete" ? "Delete permanently"
@@ -5922,6 +6090,7 @@ Item {
                     : root.editorMode === "semantic-install" ? "Download and install"
                     : root.editorMode === "smart-onboarding" ? "Download Laya"
                     : root.editorMode === "semantic-remove" ? "Move to Trash"
+                    : root.editorMode === "catalog-forget" ? "Forget"
                     : root.editorMode === "knowledge-links"
                       ? (!root.service || !root.service.knowledgeLinkPlan
                         ? "Preparing…"
@@ -5930,12 +6099,14 @@ Item {
                   destructive: root.editorMode === "trash-delete"
                     || root.editorMode === "conflict-replace"
                     || root.editorMode === "semantic-remove"
+                    || root.editorMode === "catalog-forget"
                   enabled: root.service && !root.service.actionBusy
                     && !root.service.semanticSetupBusy
                     && (root.editorMode !== "knowledge-links"
                     || (root.service && root.service.knowledgeLinkPlan
                       && root.service.knowledgeLinkPlan.createCount > 0
                       && !root.service.actionBusy))
+                    && (root.editorMode !== "catalog-forget" || !root.service.catalogForgetBusy)
                   onClicked: root.commitEditor()
                 }
               }

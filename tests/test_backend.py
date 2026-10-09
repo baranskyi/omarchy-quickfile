@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import errno
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import shutil
+import signal
+import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -35,6 +41,7 @@ class BackendTests(unittest.TestCase):
                 "QUICKFILE_STATE_FILE": str(self.root / "quickfile-operations.json"),
                 "QUICKFILE_NAV_FILE": str(self.root / "quickfile-recent.json"),
                 "QUICKFILE_SETTINGS_FILE": str(self.root / "quickfile-settings.json"),
+                "QUICKFILE_CATALOG_DIR": str(self.root / "quickfile-catalog"),
                 "QUICKFILE_HOME": str(self.root),
                 "XDG_CONFIG_HOME": str(self.root / "xdg-config"),
                 "XDG_DATA_HOME": str(self.root / "xdg-data"),
@@ -241,6 +248,759 @@ class BackendTests(unittest.TestCase):
                     action="mount", device="/dev/nvme0n1"
                 ))
         self.assertEqual(raised.exception.code, "volume-missing")
+
+    # Offline drive catalog. No drive can be mounted here, so lsblk is faked
+    # with a payload whose mount point is a directory of this test, and that
+    # directory is reported as a mount point while it is in `mounts`.
+
+    def partition(self, name: str = "sdb1", mount: Path | None = None, **values):
+        node = {
+            "name": name, "kname": name, "path": "/dev/" + name, "type": "part",
+            "fstype": "exfat", "label": "ARCHIVE", "uuid": "DRIVE-1", "partuuid": None,
+            "size": 63 * 1024**3, "mountpoints": [str(mount)] if mount else [None],
+            "rm": False, "hotplug": False, "tran": None,
+        }
+        node.update(values)
+        return node
+
+    def disk(self, *children, name: str = "sdb", **values):
+        node = {
+            "name": name, "kname": name, "path": "/dev/" + name, "type": "disk",
+            "fstype": None, "size": 64 * 1024**3, "rm": True, "hotplug": True,
+            "tran": "usb", "model": "Pocket Drive", "serial": "S4EVNF0M123456X",
+            "mountpoints": [None], "children": list(children),
+        }
+        node.update(values)
+        return node
+
+    @contextlib.contextmanager
+    def lsblk(self, *disks, mounts: set[str] | None = None):
+        mounted = mounts if mounts is not None else set()
+        real_ismount = os.path.ismount
+        payload = json.dumps({"blockdevices": list(disks)})
+        with mock.patch.object(quickfile.shutil, "which", return_value="/usr/bin/lsblk"), \
+                mock.patch.object(quickfile, "run_bounded", return_value=(0, payload, "")), \
+                mock.patch.object(quickfile.os.path, "ismount", side_effect=lambda path: (
+                    os.fspath(path) in mounted or real_ismount(path))):
+            yield mounted
+
+    def drive(self) -> Path:
+        drive = self.root / "drive"
+        (drive / "Photos" / "2024").mkdir(parents=True)
+        (drive / "Photos" / "beach.jpg").write_bytes(b"j" * 300)
+        (drive / "Photos" / "2024" / "trip.mov").write_bytes(b"m" * 40)
+        (drive / ".config").mkdir()
+        (drive / ".config" / "settings.json").write_text("{}", encoding="utf-8")
+        (drive / "node_modules" / "left-pad").mkdir(parents=True)
+        (drive / "node_modules" / "left-pad" / "index.js").write_text("x", encoding="utf-8")
+        (drive / "target" / "debug").mkdir(parents=True)
+        (drive / "target" / quickfile.SMART_CACHE_MARKER).write_text("tag", encoding="utf-8")
+        (drive / "target" / "debug" / "app.o").write_bytes(b"o")
+        (drive / ".git").mkdir()
+        (drive / ".git" / "HEAD").write_text("ref", encoding="utf-8")
+        for litter in ("$RECYCLE.BIN", ".Trash-1000", "lost+found", "System Volume Information"):
+            (drive / litter).mkdir()
+            (drive / litter / "deleted.txt").write_text("gone", encoding="utf-8")
+        (drive / "photos-link").symlink_to(drive / "Photos")
+        with open(os.path.join(os.fsencode(drive), b"caf\xe9.txt"), "wb") as stream:
+            stream.write(b"latin-1")
+        return drive
+
+    def index_drive(self, drive: Path, callback=lambda _event: None, *, device: str = "/dev/sdb1",
+                    disks=None, mounts: set[str] | None = None):
+        disks = disks or (self.disk(self.partition(mount=drive)),)
+        with self.lsblk(*disks, mounts=mounts if mounts is not None else {str(drive)}):
+            return quickfile.catalog_index_command(argparse.Namespace(device=device), callback)
+
+    def catalog_file(self, volume_id: str = "uuid:DRIVE-1") -> Path:
+        return quickfile.catalog_dir() / (quickfile.catalog_stem(volume_id) + ".sqlite")
+
+    def catalog_rows(self, volume_id: str = "uuid:DRIVE-1") -> dict[bytes, dict]:
+        connection = sqlite3.connect(self.catalog_file(volume_id))
+        connection.row_factory = sqlite3.Row
+        try:
+            return {bytes(row["rel"]): dict(row) for row in connection.execute("SELECT * FROM entries")}
+        finally:
+            connection.close()
+
+    def catalog_temporaries(self) -> list[str]:
+        directory = quickfile.catalog_dir()
+        return sorted(name for name in os.listdir(directory) if name.startswith(".tmp-"))
+
+    @contextlib.contextmanager
+    def running_indexer(self):
+        # Another QuickFile walking a drive: alive, and started as one.
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)", "catalog-index"])
+        try:
+            yield process.pid
+        finally:
+            process.kill()
+            process.wait()
+
+    def test_volume_identity_prefers_filesystem_then_partition_then_serial(self) -> None:
+        identity = quickfile.volume_identity
+        self.assertEqual(identity({"uuid": "1234-ABCD", "partUuid": "p-1", "serial": "S4EV123"}),
+                         "uuid:1234-ABCD")
+        self.assertEqual(identity({"uuid": "", "partUuid": "p-1", "serial": "S4EV123"}), "part:p-1")
+        self.assertEqual(
+            identity({"uuid": "", "partUuid": "", "serial": "S4EV123", "partition": "1",
+                      "size": 1000}),
+            "serial:S4EV123:1:1000",
+        )
+        for placeholder in ("000000000000", "0123456789ABCDEF", "0123456789abcdef", "AAAAAAAA",
+                            "1234567890", "To Be Filled By O.E.M.", "  ", "", "0"):
+            with self.subTest(serial=placeholder):
+                self.assertIsNone(identity({"uuid": "", "partUuid": "", "serial": placeholder,
+                                            "partition": "1", "size": 1000}))
+        # Nothing about where or what it is named: label and size are no identity.
+        self.assertIsNone(identity({"uuid": "", "partUuid": "", "serial": "", "label": "ARCHIVE",
+                                    "size": 1000}))
+
+    def test_volume_rows_inherit_the_disk_serial_into_their_identity(self) -> None:
+        rows = quickfile.volume_rows_from_lsblk({"blockdevices": [
+            self.disk(
+                self.partition("sdb1", uuid=None),
+                self.partition("sdb2", uuid=None, partuuid="0ab1-02", label="SECOND"),
+            ),
+            self.disk(self.partition("sdc1", uuid=None, label="CHEAP"),
+                      name="sdc", serial="000000000000"),
+            # A superfloppy stick: the filesystem sits on the disk itself.
+            self.disk(name="sdd", fstype="vfat", label="FLOPPY", uuid=None, children=None,
+                      size=2048),
+        ]})
+        by_device = {row["device"]: row for row in rows}
+        first = by_device["/dev/sdb1"]
+        self.assertEqual(first["serial"], "S4EVNF0M123456X")
+        self.assertEqual(first["catalogVolumeId"], f"serial:S4EVNF0M123456X:1:{63 * 1024**3}")
+        self.assertEqual(first["id"], first["catalogVolumeId"])
+        self.assertEqual(first["identityStrength"], "strong")
+        self.assertEqual(by_device["/dev/sdb2"]["catalogVolumeId"], "part:0ab1-02")
+        self.assertEqual(by_device["/dev/sdb2"]["partUuid"], "0ab1-02")
+        cheap = by_device["/dev/sdc1"]
+        self.assertEqual(cheap["catalogVolumeId"], "")
+        self.assertEqual(cheap["identityStrength"], "none")
+        self.assertEqual(cheap["id"], "/dev/sdc1")
+        self.assertEqual(by_device["/dev/sdd"]["catalogVolumeId"],
+                         "serial:S4EVNF0M123456X::2048")
+
+    def test_lsblk_is_asked_for_partition_uuids_and_serials(self) -> None:
+        with self.lsblk():
+            quickfile.external_volumes()
+            argv = quickfile.run_bounded.call_args.args[0]
+        columns = argv[argv.index("--output") + 1].split(",")
+        self.assertIn("PARTUUID", columns)
+        self.assertIn("SERIAL", columns)
+
+    def test_catalog_index_writes_a_private_database_of_the_drive(self) -> None:
+        drive = self.drive()
+        result = self.index_drive(drive)
+        self.assertTrue(result["ok"])
+        volume = result["volume"]
+        self.assertEqual(volume["volumeId"], "uuid:DRIVE-1")
+        self.assertEqual(volume["name"], "ARCHIVE")
+        self.assertEqual(volume["state"], "complete")
+        self.assertEqual(volume["partialReason"], "")
+        self.assertFalse(volume["truncated"])
+        self.assertFalse(volume["replaced"])
+        self.assertGreater(volume["indexedEpoch"], 0)
+        self.assertTrue(volume["indexedAt"])
+
+        path = self.catalog_file()
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(self.catalog_temporaries(), [])
+        rows = self.catalog_rows()
+        self.assertEqual(set(rows), {
+            b"Photos", b"Photos/2024", b"Photos/beach.jpg", b"Photos/2024/trip.mov",
+            b".config", b".config/settings.json",
+            # Listed, as a SMART walk lists them, but never entered.
+            b"node_modules", b"target",
+            b"photos-link", b"caf\xe9.txt",
+        })
+        self.assertEqual(volume["entries"], len(rows))
+        beach = rows[b"Photos/beach.jpg"]
+        self.assertEqual(bytes(beach["name"]), b"beach.jpg")
+        self.assertEqual((beach["is_dir"], beach["is_link"], beach["hidden"]), (0, 0, 0))
+        self.assertEqual((beach["size"], beach["depth"], beach["smart_kind"]), (300, 1, "image"))
+        self.assertEqual(beach["rel_fold"], "photos/beach.jpg")
+        self.assertAlmostEqual(beach["mtime"], (drive / "Photos" / "beach.jpg").stat().st_mtime)
+        self.assertEqual(rows[b"Photos"]["is_dir"], 1)
+        self.assertEqual(rows[b"Photos"]["smart_kind"], "any")
+        self.assertEqual(rows[b".config"]["hidden"], 1)
+        self.assertEqual(rows[b".config/settings.json"]["hidden"], 1)
+        link = rows[b"photos-link"]
+        self.assertEqual((link["is_link"], link["is_dir"]), (1, 0))
+        latin = rows[b"caf\xe9.txt"]
+        self.assertEqual(bytes(latin["name"]), b"caf\xe9.txt")
+        self.assertEqual(latin["name_fold"], "caf�.txt")
+        self.assertEqual(volume["bytes"], 300 + 40 + 2 + len(b"latin-1"))
+
+        connection = sqlite3.connect(path)
+        try:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 1)
+            self.assertEqual(connection.execute("PRAGMA journal_mode").fetchone()[0], "delete")
+            meta = dict(connection.execute("SELECT key, value FROM meta"))
+            indexes = {row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'")}
+        finally:
+            connection.close()
+        self.assertEqual(meta["volumeId"], "uuid:DRIVE-1")
+        self.assertEqual(meta["state"], "complete")
+        self.assertEqual(meta["serial"], "S4EVNF0M123456X")
+        self.assertEqual(meta["entries"], str(len(rows)))
+        self.assertIn("entries_mtime", indexes)
+        self.assertIn("entries_kind", indexes)
+
+        again = self.index_drive(drive)
+        self.assertTrue(again["volume"]["replaced"])
+
+    def test_catalog_index_streams_progress_then_saving(self) -> None:
+        drive = self.drive()
+        events = []
+        # A second per call, so the throttle lets every directory through.
+        with mock.patch.object(quickfile.time, "monotonic", side_effect=range(1, 10**6)):
+            self.index_drive(drive, events.append)
+        phases = [event["phase"] for event in events]
+        self.assertGreater(phases.count("indexing"), 1)
+        self.assertEqual(phases[-1], "saving")
+        self.assertEqual(phases.count("saving"), 1)
+        first = events[0]
+        self.assertEqual(first["event"], "progress")
+        self.assertEqual(set(first), {"event", "phase", "files", "directories", "bytes", "path"})
+        self.assertEqual(set(events[-1]), {"event", "phase", "files", "directories", "bytes"})
+
+    def test_catalog_index_publishes_a_ceiling_as_partial(self) -> None:
+        drive = self.drive()
+        cases = (
+            ("CATALOG_ENTRY_LIMIT", 3, "entry-limit"),
+            ("CATALOG_DEPTH_LIMIT", 0, "depth-limit"),
+            ("MEASURE_PENDING_LIMIT", 0, "pending-limit"),
+        )
+        for constant, value, reason in cases:
+            with self.subTest(constant=constant), mock.patch.object(quickfile, constant, value):
+                result = self.index_drive(drive)
+                self.assertEqual(result["volume"]["state"], "partial")
+                self.assertEqual(result["volume"]["partialReason"], reason)
+                self.assertTrue(result["volume"]["truncated"])
+                rows = self.catalog_rows()
+                self.assertNotIn(b"Photos/beach.jpg", rows)
+                if constant == "CATALOG_ENTRY_LIMIT":
+                    self.assertEqual(len(rows), 3)
+        with self.lsblk():
+            listed = quickfile.volumes_command(argparse.Namespace())["volumes"]
+        self.assertEqual(listed[0]["catalogState"], "partial")
+
+    def test_cancelled_catalog_index_keeps_the_previous_catalog(self) -> None:
+        drive = self.drive()
+        self.index_drive(drive)
+        path = self.catalog_file()
+        before = (path.read_bytes(), path.stat().st_mtime_ns)
+        (drive / "new.txt").write_text("new", encoding="utf-8")
+        for phase in ("indexing", "saving"):
+            def cancel(event, phase=phase):
+                if event["phase"] == phase:
+                    quickfile.request_operation_cancel(15, None)
+            with self.subTest(phase=phase):
+                try:
+                    with self.assertRaises(quickfile.OperationCancelled):
+                        self.index_drive(drive, cancel)
+                finally:
+                    quickfile._operation_cancelled = False
+                self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+                self.assertEqual(self.catalog_temporaries(), [])
+        # The last moment: the build is complete and flushed to disk, and a
+        # cancel landing now must still not swap it in.
+        real_fsync = os.fsync
+
+        def cancel_while_flushing(descriptor):
+            real_fsync(descriptor)
+            quickfile.request_operation_cancel(15, None)
+
+        try:
+            with mock.patch.object(quickfile.os, "fsync", cancel_while_flushing), \
+                    self.assertRaises(quickfile.OperationCancelled):
+                self.index_drive(drive)
+        finally:
+            quickfile._operation_cancelled = False
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+        self.assertEqual(self.catalog_temporaries(), [])
+
+    def test_catalog_index_resets_a_stale_cancel(self) -> None:
+        quickfile.request_operation_cancel(15, None)
+        try:
+            result = self.index_drive(self.drive())
+        finally:
+            quickfile._operation_cancelled = False
+        self.assertTrue(result["ok"])
+
+    def test_catalog_index_publishes_nothing_when_the_drive_goes_away(self) -> None:
+        drive = self.drive()
+        mounts = {str(drive)}
+
+        def unplug(event):
+            if event["phase"] == "indexing":
+                mounts.clear()
+
+        with self.assertRaises(quickfile.QuickfileError) as raised:
+            self.index_drive(drive, unplug, mounts=mounts)
+        self.assertEqual(raised.exception.code, "catalog-volume-lost")
+        self.assertEqual(str(raised.exception), "The drive was disconnected while indexing")
+        self.assertFalse(self.catalog_file().exists())
+        self.assertEqual(self.catalog_temporaries(), [])
+
+        # Another filesystem mounted on the same directory is not the drive.
+        self.index_drive(drive)
+        path = self.catalog_file()
+        before = (path.read_bytes(), path.stat().st_mtime_ns)
+        swapped = {"done": False}
+        real_stat = os.stat
+
+        def stat_after_swap(target, *args, **kwargs):
+            result = real_stat(target, *args, **kwargs)
+            if swapped["done"] and os.fspath(target) == str(drive):
+                values = list(result[:10])
+                values[2] += 1
+                return os.stat_result(values)
+            return result
+
+        def swap(event):
+            if event["phase"] == "indexing":
+                swapped["done"] = True
+
+        with mock.patch.object(quickfile.os, "stat", side_effect=stat_after_swap), \
+                self.assertRaises(quickfile.QuickfileError) as raised:
+            self.index_drive(drive, swap)
+        self.assertEqual(raised.exception.code, "catalog-volume-lost")
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+        self.assertEqual(self.catalog_temporaries(), [])
+
+    def test_catalog_index_checks_the_drive_after_an_unreadable_folder(self) -> None:
+        drive = self.drive()
+        mounts = {str(drive)}
+        real_scandir = os.scandir
+        after_failure = []
+
+        def failing_scandir(path):
+            if not mounts:
+                after_failure.append(path)
+            if os.fspath(path) == str(drive / "Photos"):
+                mounts.clear()
+                raise OSError(5, "Input/output error")
+            return real_scandir(path)
+
+        with mock.patch.object(quickfile.os, "scandir", failing_scandir), \
+                self.assertRaises(quickfile.QuickfileError) as raised:
+            self.index_drive(drive, mounts=mounts)
+        self.assertEqual(raised.exception.code, "catalog-volume-lost")
+        # The failed readdir is what noticed: no folder was read after it.
+        self.assertEqual(after_failure, [])
+
+    def test_catalog_index_treats_a_dead_mount_as_a_lost_drive(self) -> None:
+        drive = self.drive()
+        self.index_drive(drive)
+        path = self.catalog_file()
+        before = (path.read_bytes(), path.stat().st_mtime_ns)
+        real_scandir = os.scandir
+
+        class DeadEntry:
+            def __init__(self, entry):
+                self.name = entry.name
+
+            def stat(self, follow_symlinks=True):
+                raise OSError(errno.EIO, "Input/output error")
+
+        @contextlib.contextmanager
+        def dead_children(target):
+            with real_scandir(target) as iterator:
+                yield (DeadEntry(entry) for entry in iterator)
+
+        # Pulled, but still in the mount table until udisks catches up:
+        # every uncached read fails at once while the mount checks all pass.
+        def dead_folders(target):
+            if os.fspath(target) == str(drive):
+                return real_scandir(target)
+            raise OSError(errno.EIO, "Input/output error")
+
+        def dead_entries(target):
+            return dead_children(target)
+
+        for name, scandir in (("folders", dead_folders), ("entries", dead_entries)):
+            with self.subTest(failing=name), \
+                    mock.patch.object(quickfile.os, "scandir", scandir), \
+                    self.assertRaises(quickfile.QuickfileError) as raised:
+                self.index_drive(drive)
+            self.assertEqual(raised.exception.code, "catalog-volume-lost")
+            self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+            self.assertEqual(self.catalog_temporaries(), [])
+
+        # Cached folders keep answering after the device is gone; its /dev
+        # node is what goes first.
+        node = {"present": True}
+        real_stat = os.stat
+
+        def device_stat(target, *args, **kwargs):
+            if os.fspath(target) == "/dev/sdb1":
+                if not node["present"]:
+                    raise FileNotFoundError(errno.ENOENT, "No such file or directory")
+                return os.stat_result((stat.S_IFBLK | 0o660, 0, 0, 1, 0, 0, 0, 0, 0, 0),
+                                      {"st_rdev": 2065})
+            return real_stat(target, *args, **kwargs)
+
+        def pull(event):
+            if event["phase"] == "indexing":
+                node["present"] = False
+
+        with mock.patch.object(quickfile, "CATALOG_PRESENCE_INTERVAL", 1), \
+                mock.patch.object(quickfile.os, "stat", side_effect=device_stat), \
+                self.assertRaises(quickfile.QuickfileError) as raised:
+            self.index_drive(drive, pull)
+        self.assertEqual(raised.exception.code, "catalog-volume-lost")
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+        self.assertEqual(self.catalog_temporaries(), [])
+
+    def test_catalog_index_keeps_the_catalog_of_a_drive_it_cannot_read(self) -> None:
+        drive = self.drive()
+        self.index_drive(drive)
+        path = self.catalog_file()
+        before = (path.read_bytes(), path.stat().st_mtime_ns)
+        real_scandir = os.scandir
+
+        def denied(folder):
+            def scandir(target):
+                if os.fspath(target) == str(folder):
+                    raise PermissionError(errno.EACCES, "Permission denied")
+                return real_scandir(target)
+            return scandir
+
+        # Still mounted, still this drive, but its top folder will not list.
+        with mock.patch.object(quickfile.os, "scandir", denied(drive)), \
+                self.assertRaises(quickfile.QuickfileError) as raised:
+            self.index_drive(drive)
+        self.assertEqual(raised.exception.code, "catalog-unreadable")
+        self.assertEqual(str(raised.exception), "Could not read this drive")
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+        self.assertEqual(self.catalog_temporaries(), [])
+
+        # One folder further down is just one folder: counted, and the rest saved.
+        with mock.patch.object(quickfile.os, "scandir", denied(drive / "Photos")):
+            result = self.index_drive(drive)
+        self.assertTrue(result["ok"])
+        rows = self.catalog_rows()
+        self.assertIn(b"Photos", rows)
+        self.assertNotIn(b"Photos/beach.jpg", rows)
+        connection = sqlite3.connect(path)
+        try:
+            unreadable = connection.execute(
+                "SELECT value FROM meta WHERE key = 'unreadable'").fetchone()[0]
+        finally:
+            connection.close()
+        self.assertEqual(unreadable, "1")
+
+    def test_catalog_index_keeps_the_previous_catalog_when_saving_fails(self) -> None:
+        drive = self.drive()
+        self.index_drive(drive)
+        path = self.catalog_file()
+        before = (path.read_bytes(), path.stat().st_mtime_ns)
+        with mock.patch.object(quickfile.os, "replace",
+                               side_effect=OSError(errno.ENOSPC, "No space left on device")), \
+                self.assertRaises(quickfile.QuickfileError) as raised:
+            self.index_drive(drive)
+        self.assertEqual(raised.exception.code, "catalog-write-failed")
+        self.assertIn("No space left on device", str(raised.exception))
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+        self.assertEqual(self.catalog_temporaries(), [])
+
+    def test_catalog_index_is_stamped_when_the_walk_ends(self) -> None:
+        drive = self.drive()
+        clock = {"now": 1_800_000_000.0}
+
+        def long_walk(event):
+            # The walk takes half an hour; the catalog is as old as its end.
+            if event["phase"] == "indexing":
+                clock["now"] = 1_800_001_800.0
+
+        with mock.patch.object(quickfile.time, "time", side_effect=lambda: clock["now"]):
+            result = self.index_drive(drive, long_walk)
+        self.assertEqual(result["volume"]["indexedEpoch"], 1_800_001_800)
+        with self.lsblk():
+            listed = quickfile.volumes_command(argparse.Namespace())["volumes"]
+        self.assertEqual(listed[0]["indexedEpoch"], 1_800_001_800)
+
+    def test_catalogs_open_under_a_directory_spelled_with_two_slashes(self) -> None:
+        self.index_drive(self.drive())
+        spelled = "/" + str(quickfile.catalog_dir())
+        self.assertTrue(spelled.startswith("//") and not spelled.startswith("///"))
+        # POSIX lets a path start with exactly two slashes; as a URI that
+        # would name a host, and every catalog would read as unreadable.
+        with mock.patch.dict(os.environ, {"QUICKFILE_CATALOG_DIR": spelled}):
+            catalogs = quickfile.catalog_volumes()
+        self.assertEqual([(row["volumeId"], row["state"]) for row in catalogs],
+                         [("uuid:DRIVE-1", "complete")])
+        self.assertGreater(catalogs[0]["entries"], 0)
+
+    def test_catalog_index_refuses_drives_it_cannot_catalog(self) -> None:
+        drive = self.drive()
+        cases = (
+            ((), "volume-missing"),
+            ((self.disk(self.partition()),), "catalog-not-mounted"),
+            ((self.disk(self.partition(mount=drive, uuid=None), serial="0000000000"),),
+             "catalog-no-identity"),
+        )
+        for disks, code in cases:
+            with self.subTest(code=code), self.lsblk(*disks, mounts={str(drive)}), \
+                    self.assertRaises(quickfile.QuickfileError) as raised:
+                quickfile.catalog_index_command(
+                    argparse.Namespace(device="/dev/sdb1"), lambda _event: None)
+            self.assertEqual(raised.exception.code, code)
+        self.assertFalse(quickfile.catalog_dir().exists())
+
+    def test_catalog_forget_removes_the_file_unless_it_is_being_indexed(self) -> None:
+        drive = self.drive()
+        self.index_drive(drive)
+        path = self.catalog_file()
+        stem = quickfile.catalog_stem("uuid:DRIVE-1")
+        with self.running_indexer() as pid:
+            building = path.parent / f".tmp-{stem}-{pid}.sqlite"
+            building.write_bytes(b"")
+            with self.assertRaises(quickfile.QuickfileError) as raised:
+                quickfile.catalog_forget_command(argparse.Namespace(volume_id="uuid:DRIVE-1"))
+            self.assertEqual(raised.exception.code, "catalog-busy")
+            self.assertEqual(str(raised.exception), "This drive is being indexed")
+            self.assertTrue(path.exists())
+            with self.assertRaises(quickfile.QuickfileError) as raised:
+                self.index_drive(drive)
+            self.assertEqual(raised.exception.code, "catalog-busy")
+            self.assertTrue(building.exists())
+        building.unlink()
+
+        # A build killed outright whose pid now belongs to some other live
+        # process (here the one running the tests) is litter, not a walk.
+        stranger = path.parent / f".tmp-{stem}-{os.getppid()}.sqlite"
+        stranger.write_bytes(b"")
+        self.assertTrue(self.index_drive(drive)["ok"])
+        self.assertFalse(stranger.exists())
+        stranger.write_bytes(b"")
+        result = quickfile.catalog_forget_command(argparse.Namespace(volume_id="uuid:DRIVE-1"))
+        self.assertEqual(result, {
+            "ok": True, "volumeId": "uuid:DRIVE-1", "removed": True, "message": "Forgot “ARCHIVE”",
+        })
+        self.assertFalse(path.exists())
+        with self.assertRaises(quickfile.QuickfileError) as raised:
+            quickfile.catalog_forget_command(argparse.Namespace(volume_id="uuid:DRIVE-1"))
+        self.assertEqual(raised.exception.code, "catalog-missing")
+        self.assertEqual(str(raised.exception), "No catalog for this drive")
+
+    def test_catalog_index_sweeps_only_builds_whose_process_is_gone(self) -> None:
+        directory = quickfile.ensure_catalog_dir()
+        finished = subprocess.Popen([sys.executable, "-c", "pass"])
+        finished.wait()
+        other = quickfile.catalog_stem("uuid:OTHER")
+        dead = directory / f".tmp-{other}-{finished.pid}.sqlite"
+        reused = directory / f".tmp-{other}-{os.getppid()}.sqlite"
+        dead.write_bytes(b"")
+        reused.write_bytes(b"")
+        with self.running_indexer() as pid:
+            live = directory / f".tmp-{other}-{pid}.sqlite"
+            live.write_bytes(b"")
+            os.utime(live, (0, 0))
+            self.index_drive(self.drive())
+            self.assertFalse(dead.exists())
+            # A live pid that is no indexer: the build's own process is gone.
+            self.assertFalse(reused.exists())
+            # However old, a build whose process still runs is kept.
+            self.assertTrue(live.exists())
+
+    def test_volumes_list_unreadable_catalogs_instead_of_failing(self) -> None:
+        directory = quickfile.ensure_catalog_dir()
+        corrupt = directory / (quickfile.catalog_stem("uuid:BROKEN") + ".sqlite")
+        corrupt.write_bytes(b"this is not a database at all" * 64)
+        newer = directory / (quickfile.catalog_stem("uuid:NEWER") + ".sqlite")
+        connection = sqlite3.connect(newer)
+        connection.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        connection.execute("INSERT INTO meta VALUES ('volumeId', 'uuid:NEWER')")
+        connection.execute("PRAGMA user_version = 99")
+        connection.commit()
+        connection.close()
+        (directory / "not ours.sqlite").write_bytes(b"")
+        with self.lsblk():
+            result = quickfile.volumes_command(argparse.Namespace())
+        self.assertTrue(result["ok"])
+        self.assertEqual((result["count"], result["offlineCount"]), (0, 2))
+        rows = {row["id"]: row for row in result["volumes"]}
+        self.assertEqual(set(rows), {"uuid:BROKEN", "uuid:NEWER"})
+        for row in rows.values():
+            self.assertEqual(row["catalogState"], "unreadable")
+            self.assertTrue(row["offline"])
+            self.assertTrue(row["catalogued"])
+            self.assertEqual(row["name"], row["catalogVolumeId"])
+        forgotten = quickfile.catalog_forget_command(argparse.Namespace(volume_id="uuid:BROKEN"))
+        self.assertTrue(forgotten["removed"])
+        self.assertFalse(corrupt.exists())
+
+    def test_volumes_without_catalogs_never_open_sqlite(self) -> None:
+        with self.lsblk(self.disk(self.partition())), \
+                mock.patch.object(quickfile.sqlite3, "connect", side_effect=AssertionError):
+            missing = quickfile.volumes_command(argparse.Namespace())
+            quickfile.ensure_catalog_dir()
+            empty = quickfile.volumes_command(argparse.Namespace())
+        for result in (missing, empty):
+            self.assertEqual((result["count"], result["offlineCount"]), (1, 0))
+            row = result["volumes"][0]
+            self.assertFalse(row["catalogued"])
+            self.assertEqual((row["indexedAt"], row["indexedEpoch"]), ("", 0))
+            self.assertEqual((row["catalogEntries"], row["catalogState"]), (0, ""))
+            self.assertFalse(row["offline"])
+            self.assertFalse(row["locked"])
+
+    def test_volumes_merge_catalogued_and_offline_drives(self) -> None:
+        drive = self.drive()
+        self.index_drive(drive)
+        old = self.root / "old-drive"
+        (old / "letters").mkdir(parents=True)
+        self.index_drive(old, disks=(self.disk(
+            self.partition("sdc1", mount=old, uuid="OLD-1", size=8 * 1024**3),
+            name="sdc", model="Old Stick"),), device="/dev/sdc1")
+        backup = self.root / "backup"
+        backup.mkdir()
+        with self.lsblk(
+            self.disk(self.partition()),
+            self.disk(self.partition("sdd1", mount=backup, uuid="BACK-1", label="BACKUP"),
+                      name="sdd"),
+        ):
+            result = quickfile.volumes_command(argparse.Namespace())
+        self.assertEqual((result["count"], result["offlineCount"]), (2, 1))
+        rows = result["volumes"]
+        # Mounted, then plugged in, then only catalogued.
+        self.assertEqual([row["id"] for row in rows], ["uuid:BACK-1", "uuid:DRIVE-1", "uuid:OLD-1"])
+        backup_row, archive, orphan = rows
+        self.assertFalse(backup_row["catalogued"])
+        self.assertEqual(backup_row["name"], "BACKUP")
+        self.assertTrue(archive["catalogued"])
+        self.assertFalse(archive["offline"])
+        self.assertEqual(archive["id"], archive["catalogVolumeId"])
+        self.assertEqual(archive["catalogState"], "complete")
+        self.assertGreater(archive["catalogEntries"], 0)
+        self.assertGreater(archive["indexedEpoch"], 0)
+        self.assertEqual(archive["device"], "/dev/sdb1")
+        # Both are called ARCHIVE, so both say which one they are.
+        self.assertEqual(archive["name"], "ARCHIVE · Pocket Drive · "
+                         + quickfile.human_size(63 * 1024**3))
+        self.assertEqual(orphan["name"], "ARCHIVE · Old Stick · " + quickfile.human_size(8 * 1024**3))
+        self.assertEqual(orphan, dict(orphan, **{
+            "id": "uuid:OLD-1", "catalogVolumeId": "uuid:OLD-1", "offline": True,
+            "catalogued": True, "locked": False, "device": "", "deviceName": "",
+            "mountPath": "", "mountToken": "", "mounted": False, "canMount": False,
+            "canUnmount": False, "identityStrength": "strong", "catalogState": "complete",
+            "uuid": "OLD-1", "model": "Old Stick", "fstype": "exfat", "transport": "USB",
+        }))
+        self.assertEqual(set(orphan) - set(archive), set())
+
+        with self.lsblk():
+            unplugged = quickfile.volumes_command(argparse.Namespace())
+        self.assertEqual([row["id"] for row in unplugged["volumes"]],
+                         ["uuid:DRIVE-1", "uuid:OLD-1"])
+        self.assertEqual(unplugged["volumes"][0]["catalogVolumeId"], "uuid:DRIVE-1")
+        self.assertTrue(all(row["offline"] for row in unplugged["volumes"]))
+
+    def test_locked_luks_drive_is_one_row_matched_to_its_catalog(self) -> None:
+        drive = self.drive()
+        mapper = {
+            "name": "luks-4f2a", "kname": "dm-0", "path": "/dev/mapper/luks-4f2a",
+            "type": "crypt", "fstype": "ext4", "label": "VAULT", "uuid": "FS-1",
+            "size": 63 * 1024**3 - 16 * 1024**2, "mountpoints": [str(drive)],
+            "rm": False, "hotplug": False, "tran": None,
+        }
+        unlocked = self.disk(self.partition(
+            "sdc1", uuid="LUKS-1", fstype="crypto_luks", label=None, children=[mapper],
+        ), name="sdc")
+        result = self.index_drive(drive, disks=(unlocked,), device="/dev/mapper/luks-4f2a")
+        self.assertEqual(result["volume"]["volumeId"], "uuid:FS-1")
+        connection = sqlite3.connect(self.catalog_file("uuid:FS-1"))
+        try:
+            meta = dict(connection.execute("SELECT key, value FROM meta"))
+        finally:
+            connection.close()
+        self.assertEqual(meta["containerUuid"], "LUKS-1")
+
+        with self.lsblk(unlocked, mounts={str(drive)}):
+            open_rows = quickfile.volumes_command(argparse.Namespace())
+        self.assertEqual([row["id"] for row in open_rows["volumes"]], ["uuid:FS-1"])
+        self.assertFalse(open_rows["volumes"][0]["locked"])
+        self.assertEqual(open_rows["volumes"][0]["containerUuid"], "LUKS-1")
+
+        locked = self.disk(self.partition(
+            "sdc1", uuid="LUKS-1", fstype="crypto_luks", label=None,
+        ), name="sdc")
+        with self.lsblk(locked):
+            result = quickfile.volumes_command(argparse.Namespace())
+        self.assertEqual((result["count"], result["offlineCount"]), (1, 0))
+        [row] = result["volumes"]
+        self.assertTrue(row["locked"])
+        self.assertTrue(row["catalogued"])
+        self.assertFalse(row["offline"])
+        self.assertEqual(row["id"], "uuid:FS-1")
+        self.assertEqual(row["catalogVolumeId"], "uuid:FS-1")
+        self.assertEqual(row["device"], "/dev/sdc1")
+        self.assertEqual(row["name"], "VAULT")
+
+    def test_decode_path_rejects_tokens_outside_the_alphabet(self) -> None:
+        for token in ("catalog:x:Y", "a b", "abc=", "a/b", "a+b"):
+            with self.subTest(token=token), self.assertRaises(quickfile.QuickfileError) as raised:
+                quickfile.decode_path(token)
+            self.assertEqual(raised.exception.code, "invalid-path-token")
+        for raw in (b"", b"/", b"/tmp/x", "/home/Привет.md".encode(), b"/mnt/caf\xe9\xff\xfe",
+                    bytes(range(1, 256))):
+            with self.subTest(raw=raw):
+                token = quickfile.encode_path(raw)
+                self.assertEqual(os.fsencode(quickfile.decode_path(token)), raw)
+
+    def run_main(self, argv: list[str]) -> tuple[int, list[dict]]:
+        output = io.StringIO()
+        handlers = (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGINT))
+        try:
+            with contextlib.redirect_stdout(output):
+                code = quickfile.main(argv)
+        finally:
+            signal.signal(signal.SIGTERM, handlers[0])
+            signal.signal(signal.SIGINT, handlers[1])
+            quickfile._operation_cancelled = False
+        return code, [json.loads(line) for line in output.getvalue().splitlines()]
+
+    def test_catalog_index_through_main_stops_on_sigterm(self) -> None:
+        drive = self.drive()
+        real_scandir = os.scandir
+
+        def terminated_scandir(path):
+            # The panel's Cancel: the walk is already under way when it lands.
+            signal.raise_signal(signal.SIGTERM)
+            return real_scandir(path)
+
+        with self.lsblk(self.disk(self.partition(mount=drive)), mounts={str(drive)}), \
+                mock.patch.object(quickfile.os, "scandir", terminated_scandir):
+            code, lines = self.run_main(["catalog-index", "--device", "/dev/sdb1"])
+        self.assertEqual(code, 130)
+        self.assertEqual(lines[-1], {
+            "ok": False, "error": "Operation cancelled", "code": "cancelled", "event": "result",
+        })
+        self.assertFalse(self.catalog_file().exists())
+        self.assertEqual(self.catalog_temporaries(), [])
+
+        with self.lsblk(self.disk(self.partition(mount=drive)), mounts={str(drive)}):
+            code, lines = self.run_main(["catalog-index", "--device", "/dev/sdb1"])
+        self.assertEqual(code, 0)
+        self.assertEqual(lines[-1]["event"], "result")
+        self.assertTrue(lines[-1]["ok"])
+        self.assertEqual(lines[-1]["volume"]["volumeId"], "uuid:DRIVE-1")
+        self.assertTrue(any(line.get("phase") == "saving" for line in lines))
+
+        with self.lsblk():
+            code, lines = self.run_main(["catalog-index", "--device", "/dev/sdb1"])
+        self.assertEqual(code, 2)
+        self.assertEqual((lines[-1]["code"], lines[-1]["event"]), ("volume-missing", "result"))
+        code, lines = self.run_main(["catalog-forget", "--volume-id", "uuid:DRIVE-1"])
+        self.assertEqual(code, 0)
+        self.assertEqual(lines[-1]["message"], "Forgot “ARCHIVE”")
 
     def test_tree_sorts_directories_and_hides_dotfiles(self) -> None:
         result = quickfile.tree_command(self.tree_args())

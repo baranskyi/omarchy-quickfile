@@ -95,6 +95,21 @@ ShellRoot {
     }
     function retryOperation(policy) { lastConflictPolicy = policy; return true }
     function openPreviewExternally(value) { externalPreviewToken = value ? value.token : ""; return !!value }
+    // Writable here so the panel can be shown a running index without one.
+    property bool catalogIndexBusy: false
+    property var indexedVolumes: []
+    property int catalogIndexCancels: 0
+    property var forgottenCatalogs: []
+    property var unmountedDevices: []
+    property var openedVolumes: []
+    function indexVolume(volume, automatic) {
+      indexedVolumes.push(String(volume.catalogVolumeId || ""))
+      return true
+    }
+    function cancelCatalogIndex() { catalogIndexCancels++; return true }
+    function forgetCatalog(volumeId) { forgottenCatalogs.push(String(volumeId)); return true }
+    function unmountVolume(volume) { unmountedDevices.push(String(volume.device || "")); return true }
+    function openVolume(volume) { openedVolumes.push(String(volume.id || "")); return true }
   }
 
   Quickfile.Panel {
@@ -1110,6 +1125,217 @@ ShellRoot {
     check(panel.noteDraft === "keep my unsaved note", "drop/conflict workflow discarded the note draft")
   }
 
+  // Every pinned module is shown, below `top`, and none overlaps the next.
+  function moduleStackChecks(top, above) {
+    var stacked = ["quickfileSessionsModule", "quickfileDevicesModule",
+      "quickfileFavoritesModule", "quickfileKnowledgeModule"]
+      .map(function(name) { return objectFinder.findChild(panel, name) })
+      .filter(function(item) { return item !== null && item.visible && item.height > 0 })
+      .sort(function(a, b) { return a.y - b.y })
+    check(stacked.length === 4, "a pinned module was not shown beside " + above)
+    for (var m = 0; m < stacked.length; m++) {
+      check(stacked[m].y >= top, stacked[m].objectName + " was drawn over " + above)
+      if (m > 0)
+        check(stacked[m - 1].y + stacked[m - 1].height <= stacked[m].y + 0.5,
+          stacked[m - 1].objectName + " overlapped " + stacked[m].objectName)
+    }
+    return stacked
+  }
+
+  function deviceRowFor(list, id) {
+    for (var i = 0; i < list.count; i++) {
+      var item = list.itemAtIndex(i)
+      if (item !== null && String(item.modelData.id) === id) return item
+    }
+    return null
+  }
+
+  function devicesChecks() {
+    var now = Date.now() / 1000
+    var drives = [
+      { id: "uuid:A1", catalogVolumeId: "uuid:A1", device: "/dev/sdb1", name: "ARCHIVE",
+        label: "ARCHIVE", sizeText: "64 GB", transport: "usb", mounted: true,
+        mountPath: "/run/media/test/ARCHIVE", mountToken: "archive-mount", canMount: false,
+        canUnmount: true, identityStrength: "strong", catalogued: true,
+        indexedEpoch: now - 3 * 86400, catalogEntries: 41300, catalogState: "complete",
+        offline: false, locked: false },
+      { id: "/dev/sdc1", catalogVolumeId: "", device: "/dev/sdc1", name: "NO NAME",
+        label: "", sizeText: "8 GB", transport: "usb", mounted: true,
+        mountPath: "/run/media/test/NONAME", mountToken: "noname-mount", canMount: false,
+        canUnmount: true, identityStrength: "none", catalogued: false, indexedEpoch: 0,
+        catalogEntries: 0, catalogState: "", offline: false, locked: false },
+      { id: "uuid:OFF", catalogVolumeId: "uuid:OFF", device: "", name: "OLD DRIVE",
+        label: "OLD DRIVE", sizeText: "2 TB", transport: "usb", mounted: false,
+        mountPath: "", mountToken: "", canMount: false, canUnmount: false,
+        identityStrength: "strong", catalogued: true, indexedEpoch: now - 2 * 3600,
+        catalogEntries: 12, catalogState: "complete", offline: true, locked: false }
+    ]
+    check(fixture.applyVolumes(JSON.stringify({ ok: true, volumes: drives, count: 2,
+      offlineCount: 1 })), "the drive snapshot was rejected")
+    check(fixture.indexedVolumes.length === 0,
+      "drives already mounted when the panel opened were indexed")
+    var layoutBefore = fixture.moduleLayout
+    fixture.setModuleCollapsed("devices", false)
+    var list = objectFinder.findChild(panel, "quickfileDevicesList")
+    check(list !== null && list.visible && list.count === 3,
+      "the DEVICES list did not show connected and offline drives together")
+    list.forceLayout()
+    var summary = objectFinder.findChild(panel, "quickfileDevicesSummary")
+    check(summary !== null && summary.text === "2 drives · 1 offline",
+      "the DEVICES header did not count offline drives apart: "
+        + (summary ? summary.text : "missing"))
+
+    var away = deviceRowFor(list, "uuid:OFF")
+    check(away !== null, "the offline drive row was not realised")
+    var awayIcon = objectFinder.findChild(away, "quickfileDeviceIcon")
+    var awayName = objectFinder.findChild(away, "quickfileDeviceName")
+    var awayDetail = objectFinder.findChild(away, "quickfileDeviceDetail")
+    check(awayIcon.opacity === 0.55 && awayName.opacity === 0.58 && awayDetail.opacity === 0.58
+        && !away.current, "an offline drive was not dimmed like a hidden file")
+    check(awayDetail.text === "2 TB  ·  Not connected  ·  indexed 2h ago",
+      "an offline drive did not say it is away and when it was indexed: " + awayDetail.text)
+    var forget = objectFinder.findChild(away, "quickfileVolumeActionButton")
+    check(forget.glyph === "󰆴" && forget.tooltip === "Forget this drive's catalog"
+        && forget.available, "an offline drive did not offer to forget its catalog")
+    check(!objectFinder.findChild(away, "quickfileCatalogIndexButton").visible,
+      "an offline drive offered to be indexed")
+
+    var archive = deviceRowFor(list, "uuid:A1")
+    var archiveIndex = objectFinder.findChild(archive, "quickfileCatalogIndexButton")
+    var archiveUnmount = objectFinder.findChild(archive, "quickfileVolumeActionButton")
+    var archiveDetail = objectFinder.findChild(archive, "quickfileDeviceDetail")
+    check(archiveIndex.visible && archiveIndex.glyph === "󰑐" && archiveIndex.available
+        && archiveIndex.tooltip === "Re-index · indexed 3d ago",
+      "a catalogued drive did not offer a re-index with its age: " + archiveIndex.tooltip)
+    check(archiveDetail.text.indexOf("/run/media/test/ARCHIVE  ·  indexed 3d ago") > 0,
+      "a catalogued drive did not show when it was indexed: " + archiveDetail.text)
+    check(archive.height === away.height, "drive rows changed height for their buttons")
+    archiveIndex.clicked(Qt.LeftButton)
+    check(fixture.indexedVolumes.join(",") === "uuid:A1",
+      "the index button did not index its own drive")
+
+    var anonymous = deviceRowFor(list, "/dev/sdc1")
+    var anonymousIndex = objectFinder.findChild(anonymous, "quickfileCatalogIndexButton")
+    check(anonymousIndex.visible && !anonymousIndex.available
+        && anonymousIndex.tooltip === "This drive has no stable identity",
+      "a drive without a stable identity could be indexed")
+
+    // While a walk runs it owns the header, its row and the footer's Cancel.
+    var undoBefore = fixture.undoAvailable
+    fixture.undoAvailable = true
+    fixture.catalogIndexDevice = "/dev/sdb1"
+    fixture.catalogIndexVolumeId = "uuid:A1"
+    fixture.catalogIndexName = "ARCHIVE"
+    fixture.catalogIndexFiles = 41200
+    fixture.catalogIndexBusy = true
+    check(summary.text === "INDEXING…", "the DEVICES header did not show a running index")
+    check(archiveDetail.text === "Indexing  ·  41.2k files",
+      "the drive being indexed did not report its progress: " + archiveDetail.text)
+    check(archiveIndex.glyph === "󰜺" && archiveIndex.tooltip === "Stop indexing"
+        && archiveIndex.available, "the drive being indexed did not offer to stop")
+    // Unmounting it is the service's to sequence: stop the walk, then unmount.
+    check(archiveUnmount.available && archiveUnmount.tooltip === "Stop indexing and unmount",
+      "the drive being indexed could not be unmounted: " + archiveUnmount.tooltip)
+    archiveUnmount.clicked(Qt.LeftButton)
+    check(fixture.unmountedDevices.join(",") === "/dev/sdb1",
+      "unmounting the drive being indexed did not go through the service")
+    fixture.unmountedDevices = []
+    var another = Object.assign({}, drives[1], { identityStrength: "strong",
+      catalogVolumeId: "uuid:B2" })
+    check(!panel.canIndexVolume(another), "a second drive could start indexing alongside")
+    archiveIndex.clicked(Qt.LeftButton)
+    check(fixture.catalogIndexCancels === 1, "Stop indexing did not cancel the index")
+    check(fixture.indexedVolumes.length === 1, "Stop indexing started another index")
+    var footer = objectFinder.findChild(panel, "quickfileFooterStatus")
+    var cancel = objectFinder.findChild(panel, "quickfileFooterCancel")
+    var undo = objectFinder.findChild(panel, "quickfileFooterUndo")
+    var messageBefore = fixture.actionMessage
+    var clipboardBefore = [fixture.clipboardToken, fixture.clipboardMode, fixture.clipboardName]
+    fixture.actionMessage = ""
+    fixture.clipboardToken = ""
+    check(footer.text === "Indexing “ARCHIVE” · 41.2k files",
+      "the footer did not report the running index: " + footer.text)
+    // A background walk keeps the foreground's controls and its feedback.
+    undo.parent.forceLayout()
+    check(cancel.visible && cancel.available && cancel.tooltip === "Stop indexing"
+        && undo.visible && undo.x < cancel.x,
+      "the footer did not keep Undo in its place beside the index's Cancel: "
+        + [cancel.visible, cancel.available, cancel.tooltip, undo.visible, undo.x, cancel.x])
+    fixture.actionMessage = "Connect “OLD DRIVE” to browse it"
+    check(footer.text === "Connect “OLD DRIVE” to browse it",
+      "a message set during the index was hidden behind it: " + footer.text)
+    fixture.actionMessage = ""
+    fixture.clipboardMode = "cut"
+    fixture.clipboardName = "report.pdf"
+    fixture.clipboardToken = "report-token"
+    check(footer.text === "Cut: report.pdf",
+      "a pending cut was hidden behind the index: " + footer.text)
+    fixture.clipboardToken = ""
+    check(footer.text === "Indexing “ARCHIVE” · 41.2k files",
+      "the index did not take the slot back once the footer was free: " + footer.text)
+    cancel.clicked(Qt.LeftButton)
+    check(fixture.catalogIndexCancels === 2, "the footer Cancel did not stop the index")
+    fixture.catalogIndexCancelling = true
+    check(footer.text === "Cancelling…" && !cancel.available,
+      "a cancelling index still offered to cancel")
+    fixture.catalogIndexCancelling = false
+    fixture.catalogIndexBusy = false
+    fixture.catalogIndexDevice = ""
+    fixture.catalogIndexVolumeId = ""
+    fixture.catalogIndexName = ""
+    fixture.catalogIndexFiles = 0
+    check(!cancel.visible && undo.visible && summary.text === "2 drives · 1 offline"
+        && archiveIndex.glyph === "󰑐", "the finished index left its controls behind")
+    check(panel.canIndexVolume(another), "a drive with a stable identity could not be indexed")
+    // Not while its own mount or unmount is still running.
+    fixture.volumeActionDevice = "/dev/sdc1"
+    check(!panel.canIndexVolume(another), "a drive could be indexed while it was being unmounted")
+    fixture.volumeActionDevice = "/dev/sdb1"
+    check(panel.canIndexVolume(another), "an action on another drive blocked indexing")
+    fixture.volumeActionDevice = ""
+    fixture.undoAvailable = undoBefore
+    fixture.actionMessage = messageBefore
+    fixture.clipboardMode = clipboardBefore[1]
+    fixture.clipboardName = clipboardBefore[2]
+    fixture.clipboardToken = clipboardBefore[0]
+
+    // Forgetting a catalog goes through its own confirmation.
+    forget.clicked(Qt.LeftButton)
+    check(panel.editorMode === "catalog-forget" && panel.pendingForgetVolume
+        && panel.pendingForgetVolume.id === "uuid:OFF",
+      "Forget did not ask for confirmation of the drive it was pressed on")
+    var title = objectFinder.findChild(panel, "quickfileEditorTitle")
+    var body = objectFinder.findChild(panel, "quickfileCatalogForgetText")
+    check(title.text === "Forget “OLD DRIVE”?" && body.visible
+        && body.text.indexOf("Nothing on the drive changes") >= 0,
+      "the Forget sheet did not name the drive or say what is kept")
+    panel.cancelEditor()
+    check(panel.editorMode === "" && panel.pendingForgetVolume === null
+        && fixture.forgottenCatalogs.length === 0, "cancelling Forget still forgot the drive")
+    forget.clicked(Qt.LeftButton)
+    check(panel.editorConfirmEnabled(), "Forget could not be confirmed from the keyboard")
+    panel.commitEditor()
+    check(panel.editorMode === "" && fixture.forgottenCatalogs.join(",") === "uuid:OFF",
+      "confirming Forget did not forget the catalog of that drive")
+
+    // Offline rows are ordinary rows to the module stack.
+    var smartSummary = objectFinder.findChild(panel, "quickfileSmartSummary")
+    fixture.setModulePinned("sessions", true)
+    fixture.setModulePinned("devices", true)
+    fixture.setModulePinned("favorites", true)
+    fixture.setModulePinned("knowledge", true)
+    var devicesModule = objectFinder.findChild(panel, "quickfileDevicesModule")
+    check(devicesModule.height >= list.height && list.height > 0,
+      "the DEVICES module did not make room for its drive rows")
+    var stacked = moduleStackChecks(smartSummary.y + smartSummary.height, "the search field")
+    var contextStrip = objectFinder.findChild(panel, "quickfileContextStrip")
+    var lastModule = stacked[stacked.length - 1]
+    check(contextStrip.y >= lastModule.y + lastModule.height - 0.5,
+      "the context strip was drawn over a module stack holding offline drives")
+    fixture.moduleLayout = layoutBefore
+    fixture.applyModuleCollapseFlags()
+  }
+
   function prepareViewport() {
     var rows = []
     for (var i = 0; i < 80; i++) {
@@ -1361,20 +1587,8 @@ ShellRoot {
     summarySearchField.text = "find config yesterday"
     check(smartSummary.visible && smartSummary.height > 0,
       "the Smart Search chip row did not appear for a SMART query")
-    var stacked = ["quickfileSessionsModule", "quickfileDevicesModule",
-      "quickfileFavoritesModule", "quickfileKnowledgeModule"]
-      .map(function(name) { return objectFinder.findChild(panel, name) })
-      .filter(function(item) { return item !== null && item.visible && item.height > 0 })
-      .sort(function(a, b) { return a.y - b.y })
-    check(stacked.length === 4, "a pinned module was not shown beside the chip row")
-    var chipBottom = smartSummary.y + smartSummary.height
-    for (var m = 0; m < stacked.length; m++) {
-      check(stacked[m].y >= chipBottom,
-        stacked[m].objectName + " was drawn over the Smart Search chip row")
-      if (m > 0)
-        check(stacked[m - 1].y + stacked[m - 1].height <= stacked[m].y + 0.5,
-          stacked[m - 1].objectName + " overlapped " + stacked[m].objectName)
-    }
+    var stacked = moduleStackChecks(smartSummary.y + smartSummary.height,
+      "the Smart Search chip row")
     // The chips glow while SMART is still working and settle once it is done.
     fixture.query = ""
     check(panel.smartSearchWorking(), "a pending SMART query did not mark the search as working")
@@ -1562,6 +1776,7 @@ ShellRoot {
         // inspector outline that nothing has asked for yet.
         testRoot.focusPulseChecks()
         testRoot.shortcutChecks()
+        testRoot.devicesChecks()
         if (testRoot.captureIfRequested()) return
         console.log("QUICKFILE_TESTS_PASSED panel-state " + testRoot.assertions + " assertions")
       } catch (error) {

@@ -15,6 +15,8 @@ ShellRoot {
   property int destroyedDelegates: 0
   property int createdSessionDelegates: 0
   property int destroyedSessionDelegates: 0
+  property int createdDriveDelegates: 0
+  property int destroyedDriveDelegates: 0
   property bool finished: false
   property bool expectSilent: false
   property string phase: "startup"
@@ -32,6 +34,40 @@ ShellRoot {
     rootToken: "synthetic-root"
     knowledgeRootToken: "synthetic-root"
     initialized: false
+  }
+
+  // Drive catalog bookkeeping, driven through its own request/exit cycle. The
+  // process-starting and signalling calls are recorded instead, so no backend
+  // runs.
+  Quickfile.Service {
+    id: drives
+    rootPath: suite.fixture
+    initialized: false
+    property var launches: []
+    property var sentSignals: []
+    property var forgetLaunches: []
+    property var volumeActions: []
+    property int volumeReloads: 0
+    function startCatalogIndexProcess(command) {
+      launches.push(command)
+      return true
+    }
+    function signalCatalogIndex(signalNumber) {
+      sentSignals.push(signalNumber)
+      return true
+    }
+    function startCatalogForgetProcess(command) {
+      forgetLaunches.push(command)
+      return true
+    }
+    function runVolumeAction(kind, volume) {
+      volumeActions.push(kind + ":" + String(volume.device || ""))
+      return true
+    }
+    function reloadVolumes() {
+      volumeReloads++
+      return true
+    }
   }
 
   Quickfile.Service {
@@ -74,6 +110,18 @@ ShellRoot {
         required property var rowData
         Component.onCompleted: suite.createdSessionDelegates++
         Component.onDestruction: suite.destroyedSessionDelegates++
+      }
+    }
+  }
+
+  Item {
+    Repeater {
+      id: driveRows
+      model: drives.volumesModel
+      delegate: Item {
+        required property var rowData
+        Component.onCompleted: suite.createdDriveDelegates++
+        Component.onDestruction: suite.destroyedDriveDelegates++
       }
     }
   }
@@ -398,7 +446,306 @@ ShellRoot {
       "Successful operation was mistaken for a conflict")
     check(synthetic.pendingOperation === null && synthetic.operationConflicts.length === 0,
       "Completed operation retained obsolete conflict state")
+    catalogUnitTests()
     console.log("QuickFile service model assertions passed:", assertions)
+  }
+
+  // A connected drive row as `volumes` reports it; `extra` overrides fields.
+  function drive(id, device, extra) {
+    var mounted = !!extra && extra.mounted === true
+    return Object.assign({ id: id || device, catalogVolumeId: id, device: device,
+      deviceName: device.replace("/dev/", ""), name: "Drive " + device.slice(-4),
+      label: "", uuid: "", partUuid: "", serial: "", model: "Stick", vendor: "",
+      fstype: "exfat", transport: "usb", size: 64000000000, sizeText: "64 GB",
+      mountPath: mounted ? "/run/media/test/" + device.slice(-4) : "",
+      mountToken: mounted ? "mount-" + device.slice(-4) : "",
+      mounted: false, removable: true, hotplug: true, readOnly: false,
+      canMount: true, canUnmount: mounted, identityStrength: id ? "strong" : "none",
+      catalogued: false, indexedAt: "", indexedEpoch: 0, catalogEntries: 0,
+      catalogState: "", offline: false, locked: false }, extra || ({}))
+  }
+
+  function offlineDrive(id, name, epoch) {
+    return { id: id, catalogVolumeId: id, offline: true, catalogued: true, locked: false,
+      name: name, label: name, uuid: "", partUuid: "", serial: "", model: "Stick",
+      vendor: "", fstype: "exfat", transport: "usb", size: 64000000000, sizeText: "64 GB",
+      device: "", deviceName: "", mountPath: "", mountToken: "", mounted: false,
+      removable: true, hotplug: true, readOnly: false, canMount: false, canUnmount: false,
+      identityStrength: "strong", indexedAt: "2026-10-01T10:00:00", indexedEpoch: epoch,
+      catalogEntries: 12, catalogState: "complete" }
+  }
+
+  function snapshot(rows) {
+    var offline = rows.filter(function(row) { return row.offline === true }).length
+    return JSON.stringify({ ok: true, volumes: rows, count: rows.length - offline,
+      offlineCount: offline })
+  }
+
+  function catalogUnitTests() {
+    var old = Date.now() / 1000 - 7 * 86400
+    var archive = drive("uuid:A1", "/dev/sdb1", { name: "ARCHIVE", label: "ARCHIVE",
+      mounted: true, catalogued: true, indexedEpoch: old, catalogState: "complete" })
+
+    var indexCommand = drives.buildCatalogIndexCommand(archive)
+    check(JSON.stringify(indexCommand) === JSON.stringify(["/usr/bin/env", "python3",
+      drives.cliPath, "catalog-index", "--device", "/dev/sdb1"]),
+      "Catalog index command is not the fixed argv the backend expects: " + indexCommand)
+    var forgetCommand = drives.buildCatalogForgetCommand("uuid:A1 $(rm -rf ~)")
+    check(JSON.stringify(forgetCommand) === JSON.stringify(["/usr/bin/env", "python3",
+      drives.cliPath, "catalog-forget", "--volume-id", "uuid:A1 $(rm -rf ~)"]),
+      "Catalog forget command did not pass the volume id as one argv value")
+
+    drives.handleCatalogIndexEvent(JSON.stringify({ event: "progress", phase: "indexing",
+      files: 1200, directories: 30, bytes: 4096, path: "/run/media/test/Photos" }))
+    check(drives.catalogIndexPhase === "indexing" && drives.catalogIndexFiles === 1200
+      && drives.catalogIndexDirectories === 30 && drives.catalogIndexBytes === 4096,
+      "Catalog index progress did not reach the service state")
+    drives.handleCatalogIndexEvent(JSON.stringify({ event: "progress", phase: "saving",
+      files: 1300, directories: 31, bytes: 5000 }))
+    check(drives.catalogIndexPhase === "saving" && drives.catalogIndexFiles === 1300,
+      "The saving phase was not reported")
+    drives.handleCatalogIndexEvent("not json")
+    check(drives.catalogIndexFiles === 1300, "A malformed progress line changed the state")
+    drives.handleCatalogIndexEvent(JSON.stringify({ ok: false, event: "result",
+      error: "The drive was disconnected while indexing", code: "catalog-volume-lost" }))
+    check(drives.catalogIndexError === "The drive was disconnected while indexing"
+      && drives.catalogIndexResult.code === "catalog-volume-lost",
+      "A structured index failure was not kept")
+    drives.handleCatalogIndexEvent(JSON.stringify({ ok: true, event: "result",
+      volume: { volumeId: "uuid:A1", name: "ARCHIVE", entries: 41300, files: 41200,
+        directories: 100, bytes: 9000, truncated: false, state: "complete" } }))
+    check(drives.catalogIndexResult.ok === true && drives.catalogIndexFiles === 41200
+      && drives.catalogIndexError === "", "The index result did not replace the progress")
+    drives.catalogIndexResult = null
+
+    // Drives already mounted when QuickFile starts were not just plugged in.
+    var created = createdDriveDelegates
+    check(drives.applyVolumes(snapshot([archive])), "The first drive snapshot was rejected")
+    check(drives.volumesSnapshotReady && drives.launches.length === 0,
+      "The baseline drive snapshot started an index")
+    check(drives.catalogVolumeCount === 1 && drives.offlineVolumeCount === 0,
+      "Catalogued and offline drive counts were not published")
+    check(createdDriveDelegates === created + 1, "The drive row did not get a delegate")
+    var archiveDelegate = driveRows.itemAt(0)
+    drives.applyVolumes(snapshot([archive]))
+    check(drives.launches.length === 0 && driveRows.itemAt(0) === archiveDelegate,
+      "An unchanged drive snapshot started an index or rebuilt its row")
+
+    // Unmounted, then mounted again: that transition re-indexes, once.
+    var unmounted = drive("uuid:A1", "/dev/sdb1", { name: "ARCHIVE", label: "ARCHIVE",
+      catalogued: true, indexedEpoch: old, catalogState: "complete" })
+    drives.applyVolumes(snapshot([unmounted]))
+    check(drives.launches.length === 0, "Unmounting a catalogued drive started an index")
+    drives.applyVolumes(snapshot([archive]))
+    check(drives.launches.length === 1
+      && JSON.stringify(drives.launches[0]) === JSON.stringify(indexCommand),
+      "Mounting a known drive again did not re-index it")
+    check(drives.catalogIndexVolumeId === "uuid:A1" && drives.catalogIndexAutomatic
+      && drives.catalogIndexDevice === "/dev/sdb1" && drives.catalogIndexName === "ARCHIVE",
+      "The automatic index did not record which drive it walks")
+    check(!drives.actionBusy && !drives.operationBusy,
+      "A drive index was folded into the foreground busy state")
+    check(!drives.indexVolume(archive, false), "A second index started while one was running")
+    check(!drives.forgetCatalog("uuid:A1") && drives.actionMessage === "This drive is being indexed",
+      "Forgetting the drive being indexed was not refused")
+    drives.applyVolumes(snapshot([archive]))
+    check(drives.launches.length === 1, "A repeated mounted snapshot re-indexed the drive")
+
+    drives.handleCatalogIndexEvent(JSON.stringify({ ok: true, event: "result",
+      volume: { volumeId: "uuid:A1", name: "ARCHIVE", entries: 41300, files: 41200,
+        directories: 100, bytes: 9000, truncated: false, state: "partial",
+        partialReason: "entry-limit" } }))
+    var finished = []
+    var finishHandler = function(kind, ok, message) { finished.push([kind, ok, message]) }
+    drives.actionFinished.connect(finishHandler)
+    drives.finishCatalogIndex(0)
+    check(drives.actionMessage === "Indexed “ARCHIVE” · 41.2k files · partial",
+      "The finished index did not report its size and partial state: " + drives.actionMessage)
+    check(finished.length === 1 && finished[0][0] === "catalog-index" && finished[0][1] === true,
+      "The finished index did not announce itself")
+    check(drives.catalogIndexVolumeId === "" && drives.catalogIndexDevice === ""
+      && !drives.catalogIndexAutomatic, "The finished index left its drive recorded")
+    // Indexing stamps the catalog; the next snapshot must not loop into another run.
+    var fresh = Object.assign({}, archive, { indexedEpoch: Date.now() / 1000,
+      catalogEntries: 41300, catalogState: "partial" })
+    drives.applyVolumes(snapshot([fresh]))
+    check(drives.launches.length === 1, "A finished index started another one")
+
+    // A drive indexed a moment ago is not walked again on a quick replug.
+    var recent = drive("uuid:B2", "/dev/sdc1", { catalogued: true,
+      indexedEpoch: Date.now() / 1000 - 10 })
+    drives.applyVolumes(snapshot([fresh, recent]))
+    drives.applyVolumes(snapshot([fresh, Object.assign({}, recent, { mounted: true,
+      canUnmount: true, mountPath: "/run/media/test/sdc1" })]))
+    check(drives.launches.length === 1, "A drive indexed seconds ago was re-indexed")
+
+    // Two drives at once: one runs, the other waits its turn.
+    var c3 = drive("uuid:C3", "/dev/sdd1", { catalogued: true, indexedEpoch: old })
+    var d4 = drive("uuid:D4", "/dev/sde1", { catalogued: true, indexedEpoch: old })
+    drives.applyVolumes(snapshot([fresh, c3, d4]))
+    var c3Mounted = drive("uuid:C3", "/dev/sdd1", { catalogued: true, indexedEpoch: old,
+      mounted: true })
+    var d4Mounted = drive("uuid:D4", "/dev/sde1", { catalogued: true, indexedEpoch: old,
+      mounted: true })
+    drives.applyVolumes(snapshot([fresh, c3Mounted, d4Mounted]))
+    check(drives.launches.length === 2 && drives.catalogIndexVolumeId === "uuid:C3"
+      && drives.autoIndexQueue.join(",") === "uuid:D4",
+      "Two remounted drives did not run one at a time: " + drives.autoIndexQueue)
+    drives.applyVolumes(snapshot([fresh, c3Mounted, d4Mounted]))
+    check(drives.autoIndexQueue.length === 1, "A queued drive was queued twice")
+
+    // Stopping an automatic run skips that drive for the session and moves on.
+    // SIGTERM first; a walk stuck in a pulled drive's I/O gets SIGKILL later.
+    drives.actionMessage = "Connect “OLD DRIVE” to browse it"
+    check(drives.cancelCatalogIndex() && drives.catalogIndexCancelling,
+      "Cancelling an index did not latch")
+    check(drives.sentSignals.join(",") === "15" && drives.catalogIndexKillPending,
+      "Cancelling an index did not send SIGTERM and arm the kill: " + drives.sentSignals)
+    check(!drives.cancelCatalogIndex() && drives.sentSignals.length === 1,
+      "A second cancel was not ignored")
+    check(drives.escalateCatalogIndexCancel() && drives.sentSignals.join(",") === "15,9"
+      && !drives.catalogIndexKillPending, "A walk ignoring SIGTERM was not killed")
+    drives.finishCatalogIndex(130)
+    check(drives.actionMessage === "Connect “OLD DRIVE” to browse it",
+      "A cancelled index wiped the message that arrived while it ran: " + drives.actionMessage)
+    check(drives.autoIndexSkipped["uuid:C3"] === true,
+      "Stopping an automatic index did not skip the drive for the session")
+    check(drives.launches.length === 3 && drives.catalogIndexVolumeId === "uuid:D4"
+      && drives.autoIndexQueue.length === 0, "The queued drive did not start next")
+    drives.catalogIndexResult = { ok: true, event: "result",
+      volume: { name: "Drive sde1", files: 12, state: "complete" } }
+    drives.finishCatalogIndex(0)
+    check(drives.actionMessage === "Indexed “Drive sde1” · 12 files",
+      "A small index did not report its count")
+    drives.applyVolumes(snapshot([fresh, c3, d4]))
+    drives.applyVolumes(snapshot([fresh, c3Mounted, d4]))
+    check(drives.launches.length === 3, "A skipped drive was re-indexed in the same session")
+
+    // Unmounting the drive being indexed stops the walk, then unmounts.
+    var e5 = drive("uuid:E5", "/dev/sdf1", { mounted: true })
+    drives.applyVolumes(snapshot([fresh, c3Mounted, d4, e5]))
+    check(drives.launches.length === 3, "A drive without a catalog was indexed on its own")
+    check(drives.indexVolume(e5, false) && drives.launches.length === 4
+      && !drives.catalogIndexAutomatic, "A requested index did not start")
+    check(drives.actionMessage === "",
+      "A new index left an older message over its progress: " + drives.actionMessage)
+    check(!drives.catalogIndexKillPending, "A finished index left its kill armed")
+    check(drives.unmountVolume(e5) && drives.unmountAfterIndexDevice === "/dev/sdf1"
+      && drives.catalogIndexCancelling && drives.volumeActions.length === 0,
+      "Unmounting the drive being indexed did not cancel first and park the unmount")
+    drives.finishCatalogIndex(130)
+    check(drives.volumeActions.join(",") === "unmount:/dev/sdf1"
+      && drives.unmountAfterIndexDevice === "",
+      "The parked unmount did not run once the index stopped")
+    check(drives.autoIndexSkipped["uuid:E5"] !== true,
+      "Unmounting mid-index was mistaken for skipping the drive")
+
+    // Drives that cannot carry a catalog are refused.
+    var anonymous = drive("", "/dev/sdh1", { mounted: true })
+    check(!drives.indexVolume(anonymous, false)
+      && drives.actionMessage === "This drive has no stable identity",
+      "A drive without a stable identity was indexed")
+    check(!drives.indexVolume(c3, false), "An unmounted drive was indexed")
+    var away = offlineDrive("uuid:OFF", "OLD DRIVE", old)
+    check(!drives.indexVolume(away, false), "An offline drive was indexed")
+    check(drives.launches.length === 4, "A refused index still started a process")
+
+    // An offline row keeps its catalog id as its key, so replugging the drive
+    // updates the row in place instead of rebuilding it.
+    check(drives.rowKey(away) === "uuid:OFF", "An offline row was not keyed by its catalog id")
+    drives.applyVolumes(snapshot([fresh, away]))
+    check(drives.offlineVolumeCount === 1 && drives.catalogVolumeCount === 2,
+      "The offline drive was not counted")
+    var awayIndex = -1
+    for (var i = 0; i < driveRows.count; i++)
+      if (driveRows.itemAt(i).rowData.id === "uuid:OFF") awayIndex = i
+    check(awayIndex === 1, "The offline row was not rendered")
+    var awayDelegate = driveRows.itemAt(awayIndex)
+    var createdBeforeReplug = createdDriveDelegates
+    var destroyedBeforeReplug = destroyedDriveDelegates
+    var launchesBeforeReplug = drives.launches.length
+    check(!drives.openVolume(away)
+      && drives.actionMessage === "Connect “OLD DRIVE” to browse it",
+      "Opening an offline drive did not say which drive to connect")
+    check(drives.volumeActions.length === 1 && drives.launches.length === launchesBeforeReplug,
+      "Opening an offline drive started a process")
+    var replugged = drive("uuid:OFF", "/dev/sdg1", { name: "OLD DRIVE", label: "OLD DRIVE",
+      catalogued: true, indexedEpoch: Date.now() / 1000 - 5, catalogState: "complete" })
+    drives.applyVolumes(snapshot([fresh, replugged]))
+    check(driveRows.itemAt(awayIndex) === awayDelegate
+      && createdDriveDelegates === createdBeforeReplug
+      && destroyedDriveDelegates === destroyedBeforeReplug,
+      "Replugging an offline drive rebuilt its delegate")
+    check(driveRows.itemAt(awayIndex).rowData.device === "/dev/sdg1"
+      && drives.offlineVolumeCount === 0, "The replugged drive did not update in place")
+
+    var locked = drive("uuid:LUKS", "/dev/sdi1", { name: "VAULT", catalogued: true,
+      locked: true, canMount: false })
+    check(!drives.openVolume(locked) && drives.actionMessage === "Unlock “VAULT” to browse it",
+      "Opening a locked catalogued drive did not ask to unlock it")
+    check(drives.volumeActions.length === 1, "Opening a locked drive started a process")
+
+    // Two drives of one name are told apart by model and size in the list;
+    // the hint names the drive by its label alone.
+    var orphan = Object.assign(offlineDrive("uuid:OLD", "ARCHIVE", old),
+      { name: "ARCHIVE · Old Stick · 8 GB" })
+    check(!drives.openVolume(orphan) && drives.actionMessage === "Connect “ARCHIVE” to browse it",
+      "The connect hint carried the listed model and size: " + drives.actionMessage)
+    var lockedTwin = Object.assign({}, locked, { label: "VAULT", name: "VAULT · Stick · 64 GB" })
+    check(!drives.openVolume(lockedTwin) && drives.actionMessage === "Unlock “VAULT” to browse it",
+      "The unlock hint carried the listed model and size: " + drives.actionMessage)
+
+    // Forgetting runs its own process; its exit reports and settles the queue.
+    drives.autoIndexQueue = ["uuid:OFF", "uuid:Z9"]
+    check(drives.forgetCatalog("uuid:OFF") && drives.catalogForgetVolumeId === "uuid:OFF"
+      && drives.forgetLaunches.length === 1 && JSON.stringify(drives.forgetLaunches[0])
+        === JSON.stringify(drives.buildCatalogForgetCommand("uuid:OFF")),
+      "Forgetting a catalog did not start its process")
+    drives.catalogForgetStdout = JSON.stringify({ ok: true, volumeId: "uuid:OFF",
+      removed: true, message: "Forgot “OLD DRIVE”" })
+    drives.finishCatalogForget(0)
+    var forgot = finished[finished.length - 1]
+    check(drives.actionMessage === "Forgot “OLD DRIVE”" && drives.catalogForgetVolumeId === ""
+      && forgot[0] === "catalog-forget" && forgot[1] === true,
+      "A forgotten catalog was not reported: " + drives.actionMessage)
+    check(drives.autoIndexQueue.join(",") === "uuid:Z9",
+      "A forgotten drive stayed queued for indexing: " + drives.autoIndexQueue)
+    drives.forgetCatalog("uuid:Z9")
+    drives.catalogForgetStdout = JSON.stringify({ ok: false, event: "result",
+      error: "This drive is being indexed", code: "catalog-busy" })
+    drives.finishCatalogForget(2)
+    forgot = finished[finished.length - 1]
+    check(drives.actionMessage === "This drive is being indexed" && forgot[1] === false
+      && drives.autoIndexQueue.join(",") === "uuid:Z9",
+      "A refused forget was not reported as the backend said it: " + drives.actionMessage)
+    drives.forgetCatalog("uuid:Z9")
+    drives.catalogForgetStderr = "Traceback: catalog dir is gone\n"
+    drives.finishCatalogForget(1)
+    check(drives.actionMessage === "Traceback: catalog dir is gone",
+      "A forget without a result did not fall back to its stderr: " + drives.actionMessage)
+    drives.autoIndexQueue = []
+
+    // Never while the drive's own mount or unmount runs: a remounted drive in
+    // that state waits in the queue for the snapshot after the action.
+    var f6 = drive("uuid:F6", "/dev/sdj1", { catalogued: true, indexedEpoch: old })
+    var f6Mounted = drive("uuid:F6", "/dev/sdj1", { catalogued: true, indexedEpoch: old,
+      mounted: true })
+    drives.applyVolumes(snapshot([fresh, f6]))
+    var launchesBeforeAction = drives.launches.length
+    drives.volumeActionDevice = "/dev/sdj1"
+    check(!drives.indexVolume(f6Mounted, false) && drives.launches.length === launchesBeforeAction,
+      "A drive was indexed while its own mount or unmount was running")
+    drives.applyVolumes(snapshot([fresh, f6Mounted]))
+    check(drives.launches.length === launchesBeforeAction
+      && drives.autoIndexQueue.join(",") === "uuid:F6",
+      "A remounted drive with an action in flight was not held back: " + drives.autoIndexQueue)
+    drives.volumeActionDevice = ""
+    drives.applyVolumes(snapshot([fresh, f6Mounted]))
+    check(drives.launches.length === launchesBeforeAction + 1
+      && drives.catalogIndexVolumeId === "uuid:F6" && drives.autoIndexQueue.length === 0,
+      "The held drive did not start once its action had finished")
+    drives.finishCatalogIndex(130)
+    drives.actionFinished.disconnect(finishHandler)
   }
 
   function entryNamed(name) {

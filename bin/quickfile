@@ -28,6 +28,7 @@ import selectors
 import shlex
 import shutil
 import signal
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -99,6 +100,33 @@ MEASURE_ENTRY_LIMIT = 20000000
 MEASURE_PENDING_LIMIT = 50000
 MEASURE_IDENTITY_LIMIT = 200000
 OPERATION_DEPTH_LIMIT = 128
+# The offline drive catalog: one private SQLite file per drive, holding names,
+# relative paths, sizes and dates only. A drive is walked like a measured
+# folder — bounded, cancellable, and past a ceiling still published, marked
+# partial — and its depth and queue ceilings are the ones measuring uses.
+CATALOG_SCHEMA_VERSION = 1
+CATALOG_ENTRY_LIMIT = 1_000_000
+CATALOG_DEPTH_LIMIT = OPERATION_DEPTH_LIMIT
+CATALOG_BATCH_SIZE = 2048
+# How often, in directories, the walk confirms the drive is still the one it
+# started on. A pulled stick does not always fail the next readdir: cached
+# directories keep answering, so the walk asks the mount table as well.
+CATALOG_PRESENCE_INTERVAL = 500
+# What a readdir or stat answers once the device under a mount is gone. A
+# pulled stick stays mounted until udisks tears the mount down, and until then
+# every uncached read fails fast with one of these: counted as unreadable
+# folders, they would drain the walk into a hollow catalog published as whole.
+CATALOG_LOST_ERRNOS = frozenset({
+    errno.EIO, errno.ENODEV, errno.ENXIO, errno.ESHUTDOWN, errno.ENOTCONN,
+})
+# Litter other systems leave on a removable drive. It is nobody's files, and a
+# `.Trash-1000` holds deleted ones that would answer searches as if they were
+# still there. `.Trash-<uid>` is matched by prefix.
+CATALOG_SKIPPED_DIRECTORIES = frozenset({
+    "$RECYCLE.BIN", "System Volume Information", ".Trashes", ".Spotlight-V100",
+    ".fseventsd", ".TemporaryItems", "lost+found",
+})
+CATALOG_SKIPPED_PREFIXES = (".Trash-",)
 OPERATION_HISTORY_LIMIT = 50
 OPERATION_HISTORY_SIZE_LIMIT = 2 * 1024 * 1024
 OPERATION_JOURNAL_BUDGET = 1024 * 1024
@@ -176,7 +204,14 @@ def encode_path(path: str | bytes) -> str:
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
+PATH_TOKEN = re.compile(r"[A-Za-z0-9_-]*")
+
+
 def decode_path(token: str) -> str:
+    # The decoder silently drops characters outside its alphabet, so a token
+    # of any other shape would name some other path instead of failing.
+    if not isinstance(token, str) or not PATH_TOKEN.fullmatch(token):
+        raise QuickfileError("Invalid path token", "invalid-path-token")
     try:
         padding = "=" * (-len(token) % 4)
         raw = base64.urlsafe_b64decode((token + padding).encode("ascii"))
@@ -228,6 +263,15 @@ def quick_nav_file() -> Path:
     state_home = os.environ.get("XDG_STATE_HOME", "").strip()
     base = Path(state_home).expanduser() if state_home else Path.home() / ".local" / "state"
     return base / "omarchy" / "quickfile" / "recent-locations.json"
+
+
+def catalog_dir() -> Path:
+    override = os.environ.get("QUICKFILE_CATALOG_DIR", "").strip()
+    if override:
+        return Path(override).expanduser()
+    data_home = os.environ.get("XDG_DATA_HOME", "").strip()
+    base = Path(data_home).expanduser() if data_home else Path.home() / ".local" / "share"
+    return base / "omarchy" / "quickfile" / "catalog"
 
 
 def load_quick_nav_recents() -> list[dict[str, Any]]:
@@ -822,6 +866,48 @@ def human_size(size: int) -> str:
 
 EXTERNAL_TRANSPORTS = {"usb", "mmc", "firewire", "thunderbolt"}
 UNMOUNTABLE_FILESYSTEMS = {"", "swap", "crypto_luks", "lvm2_member"}
+# Serial numbers cheap enclosures and card readers report for every unit. Two
+# sticks sharing one would share one catalog, so such a serial is no identity.
+PLACEHOLDER_SERIALS = frozenset({
+    "none", "null", "unknown", "default", "defaultstring", "serial", "na",
+    "notspecified", "notavailable", "tobefilledbyoem", "0123456789abcdef", "1234567890",
+})
+SERIAL_SEQUENCE = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+
+def placeholder_serial(serial: str) -> bool:
+    folded = re.sub(r"[\s._:/-]+", "", serial.casefold())
+    return (
+        len(folded) < 4
+        or len(set(folded)) == 1
+        or folded in PLACEHOLDER_SERIALS
+        or folded in SERIAL_SEQUENCE
+        or folded in SERIAL_SEQUENCE[::-1]
+    )
+
+
+def volume_identity(row: dict[str, Any]) -> str | None:
+    """The key a drive's catalog is filed under, or None when it has none.
+
+    Only what the drive itself carries: a filesystem or partition UUID, else
+    the disk's serial narrowed to the partition and its size. Device paths and
+    mount points change between plugs, and a label-and-size guess would give
+    two identical sticks one catalog.
+    """
+    value = str(row.get("uuid") or "").strip()
+    if value:
+        return "uuid:" + value
+    value = str(row.get("partUuid") or "").strip()
+    if value:
+        return "part:" + value
+    serial = str(row.get("serial") or "").strip()
+    if serial and not placeholder_serial(serial):
+        try:
+            size = max(0, int(row.get("size") or 0))
+        except (TypeError, ValueError):
+            size = 0
+        return f"serial:{serial}:{row.get('partition') or ''}:{size}"
+    return None
 
 
 def volume_rows_from_lsblk(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -836,6 +922,20 @@ def volume_rows_from_lsblk(payload: dict[str, Any]) -> list[dict[str, Any]]:
             or transport in EXTERNAL_TRANSPORTS
         model = str(node.get("model") or parent.get("model") or "").strip()
         vendor = str(node.get("vendor") or parent.get("vendor") or "").strip()
+        serial = str(node.get("serial") or parent.get("serial") or "").strip()
+        # The partition's place on its disk, from the kernel names: sdb1 is
+        # "1" of sdb, nvme0n1p2 "p2" of nvme0n1. A device-mapper child such
+        # as dm-0 keeps the place of the partition it sits on.
+        kernel = str(node.get("kname") or node.get("name") or "").strip()
+        disk = str(parent.get("disk") or kernel)
+        if kernel.startswith(disk):
+            partition = kernel[len(disk):]
+        else:
+            partition = str(parent.get("partition") or "")
+        # An unlocked LUKS volume reports its filesystem's UUID; the locked
+        # container reports the LUKS header's. Children remember the header so
+        # the locked container can still be matched to its drive's catalog.
+        container = str(parent.get("container") or "")
         inherited = {
             "transport": transport,
             "removable": removable,
@@ -843,6 +943,11 @@ def volume_rows_from_lsblk(payload: dict[str, Any]) -> list[dict[str, Any]]:
             "external": external,
             "model": model,
             "vendor": vendor,
+            "serial": serial,
+            "disk": disk,
+            "partition": partition,
+            "container": str(node.get("uuid") or "")
+                if str(node.get("fstype") or "").lower() == "crypto_luks" else container,
         }
         children = node.get("children")
         child_nodes = children if isinstance(children, list) else []
@@ -871,8 +976,17 @@ def volume_rows_from_lsblk(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 size = max(0, int(node.get("size") or 0))
             except (TypeError, ValueError):
                 size = 0
+            part_uuid = str(node.get("partuuid") or "").strip()
+            identity = volume_identity({
+                "uuid": node.get("uuid"), "partUuid": part_uuid, "serial": serial,
+                "partition": partition, "size": size,
+            })
             rows.append({
-                "id": str(node.get("uuid") or device),
+                # One key for a drive across replugs, locks and unplugs, so its
+                # row and its offline catalog are the same row to the panel.
+                "id": identity or device,
+                "catalogVolumeId": identity or "",
+                "identityStrength": "strong" if identity else "none",
                 "name": display_text(name),
                 "device": device,
                 "deviceName": kernel_name,
@@ -882,6 +996,9 @@ def volume_rows_from_lsblk(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 "fstype": fstype,
                 "label": display_text(label),
                 "uuid": str(node.get("uuid") or ""),
+                "partUuid": display_text(part_uuid),
+                "serial": display_text(serial),
+                "containerUuid": container,
                 "size": size,
                 "sizeText": human_size(size),
                 "transport": transport.upper(),
@@ -919,7 +1036,8 @@ def external_volumes() -> list[dict[str, Any]]:
         "--json",
         "--bytes",
         "--output",
-        "NAME,KNAME,PATH,TYPE,FSTYPE,LABEL,UUID,SIZE,MOUNTPOINTS,RM,HOTPLUG,TRAN,MODEL,VENDOR,RO",
+        "NAME,KNAME,PATH,TYPE,FSTYPE,LABEL,UUID,PARTUUID,SERIAL,SIZE,MOUNTPOINTS,"
+        "RM,HOTPLUG,TRAN,MODEL,VENDOR,RO",
     ])
     if code != 0:
         raise QuickfileError(error.strip() or "Could not inspect storage devices", "volumes-failed")
@@ -932,9 +1050,281 @@ def external_volumes() -> list[dict[str, Any]]:
     return volume_rows_from_lsblk(payload)
 
 
+CATALOG_SUFFIX = ".sqlite"
+# A build in progress: `.tmp-<stem>-<pid>.sqlite`, beside the file it replaces.
+CATALOG_TEMPORARY = re.compile(r"\.tmp-([A-Za-z0-9_-]+)-(\d+)\.sqlite(?:-journal)?")
+
+
+def catalog_stem(volume_id: str) -> str:
+    return base64.urlsafe_b64encode(volume_id.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def catalog_volume_id(stem: str) -> str | None:
+    """The drive a catalog file is named for, or None for a file not ours."""
+    if not stem or not PATH_TOKEN.fullmatch(stem):
+        return None
+    try:
+        value = base64.urlsafe_b64decode(stem + "=" * (-len(stem) % 4)).decode("utf-8")
+    except ValueError:
+        return None
+    return value if value and catalog_stem(value) == stem else None
+
+
+def ensure_catalog_dir() -> Path:
+    directory = catalog_dir()
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(directory, 0o700)
+    return directory
+
+
+def pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (OSError, OverflowError):
+        return False
+    return True
+
+
+def catalog_temporaries(directory: Path) -> list[tuple[Path, str, int]]:
+    try:
+        names = os.listdir(directory)
+    except FileNotFoundError:
+        return []
+    found = []
+    for name in names:
+        match = CATALOG_TEMPORARY.fullmatch(name)
+        if match:
+            found.append((directory / name, match.group(1), int(match.group(2))))
+    return found
+
+
+def live_catalog_build(pid: int) -> bool:
+    # A build carrying this process's pid was left by an earlier process the
+    # pid was reused from: this one has not started its own.
+    if pid == os.getpid() or not pid_alive(pid):
+        return False
+    # A live pid alone proves nothing: a build killed outright leaves its file
+    # behind, and once the pid goes to a browser or a shell the drive would
+    # read as being indexed for as long as that process runs.
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as stream:
+            arguments = stream.read(64 * 1024).split(b"\0")
+    except OSError:
+        return False
+    return b"catalog-index" in arguments
+
+
+def sweep_catalog_temporaries(directory: Path) -> None:
+    # By owner, never by age: indexing a full disk over USB 2.0 can outlast
+    # any age a sweep would pick, and its build must not vanish under it.
+    for path, _stem, pid in catalog_temporaries(directory):
+        if not live_catalog_build(pid):
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+
+
+def catalog_busy(directory: Path, stem: str) -> bool:
+    return any(
+        found == stem and live_catalog_build(pid)
+        for _path, found, pid in catalog_temporaries(directory)
+    )
+
+
+def open_catalog_ro(path: Path) -> sqlite3.Connection:
+    # Immutable: a published catalog only ever changes by os.replace, so the
+    # reader takes no lock and leaves no journal on a file it merely reads.
+    # Always an empty authority: a path starting with exactly two slashes,
+    # which POSIX allows, would otherwise read as `file://host/...`.
+    uri = ("file://" + urllib.parse.quote(os.fsencode(os.path.abspath(path)))
+           + "?mode=ro&immutable=1")
+    connection = sqlite3.connect(uri, uri=True)
+    try:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        if version != CATALOG_SCHEMA_VERSION:
+            raise sqlite3.DatabaseError(f"Unsupported catalog schema {version}")
+    except BaseException:
+        connection.close()
+        raise
+    return connection
+
+
+def read_catalog_meta(path: Path) -> dict[str, str]:
+    connection = open_catalog_ro(path)
+    try:
+        rows = connection.execute("SELECT key, value FROM meta LIMIT 256").fetchall()
+    finally:
+        connection.close()
+    return {str(key): str(value) for key, value in rows}
+
+
+def meta_number(meta: dict[str, str], key: str) -> int:
+    try:
+        return max(0, int(float(meta.get(key) or 0)))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def catalog_volumes() -> list[dict[str, Any]]:
+    """Every catalog on file, read from its meta table alone.
+
+    A catalog that cannot be read — damaged, foreign, or from a newer schema —
+    is still listed, as unreadable, so its drive stays there to be forgotten.
+    """
+    directory = catalog_dir()
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return []
+    catalogs: list[dict[str, Any]] = []
+    for name in names:
+        if name.startswith(".") or not name.endswith(CATALOG_SUFFIX):
+            continue
+        volume_id = catalog_volume_id(name[:-len(CATALOG_SUFFIX)])
+        if volume_id is None:
+            continue
+        try:
+            meta = read_catalog_meta(directory / name)
+            if meta.get("volumeId") != volume_id:
+                raise sqlite3.DatabaseError("Catalog belongs to another drive")
+            state = meta.get("state") if meta.get("state") in {"complete", "partial"} \
+                else "unreadable"
+        except (sqlite3.Error, OSError):
+            meta, state = {}, "unreadable"
+        size = meta_number(meta, "size")
+        catalogs.append({
+            "volumeId": volume_id,
+            "state": state,
+            "name": meta.get("name") or meta.get("label") or volume_id,
+            "label": meta.get("label", ""),
+            "uuid": meta.get("uuid", ""),
+            "partUuid": meta.get("partUuid", ""),
+            "serial": meta.get("serial", ""),
+            "containerUuid": meta.get("containerUuid", ""),
+            "model": meta.get("model", ""),
+            "vendor": meta.get("vendor", ""),
+            "fstype": meta.get("fstype", ""),
+            "transport": meta.get("transport", ""),
+            "size": size,
+            "sizeText": human_size(size),
+            "indexedAt": meta.get("indexedAt", ""),
+            "indexedEpoch": meta_number(meta, "indexedEpoch"),
+            "entries": meta_number(meta, "entries"),
+        })
+    return catalogs
+
+
+def offline_volume(catalog: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": catalog["volumeId"],
+        "catalogVolumeId": catalog["volumeId"],
+        "offline": True,
+        "catalogued": True,
+        "locked": False,
+        "name": catalog["name"],
+        "label": catalog["label"],
+        "uuid": catalog["uuid"],
+        "partUuid": catalog["partUuid"],
+        "serial": catalog["serial"],
+        "containerUuid": catalog["containerUuid"],
+        "model": catalog["model"],
+        "vendor": catalog["vendor"],
+        "fstype": catalog["fstype"],
+        "transport": catalog["transport"],
+        "size": catalog["size"],
+        "sizeText": catalog["sizeText"],
+        "device": "",
+        "deviceName": "",
+        "mountPath": "",
+        "mountToken": "",
+        "mounted": False,
+        "removable": True,
+        "hotplug": True,
+        "readOnly": False,
+        "canMount": False,
+        "canUnmount": False,
+        "identityStrength": "strong",
+        "indexedAt": catalog["indexedAt"],
+        "indexedEpoch": catalog["indexedEpoch"],
+        "catalogEntries": catalog["entries"],
+        "catalogState": catalog["state"],
+    }
+
+
 def volumes_command(_args: argparse.Namespace) -> dict[str, Any]:
     rows = external_volumes()
-    return {"ok": True, "volumes": rows, "count": len(rows)}
+    # With nothing catalogued this is one listdir: the panel asks on every
+    # refresh, and a drive nobody indexed must cost nothing.
+    catalogs = {catalog["volumeId"]: catalog for catalog in catalog_volumes()}
+    # A locked LUKS container reports the header's UUID, not the one of the
+    # filesystem its catalog is filed under; the newest catalog made inside
+    # that container stands for it.
+    containers: dict[str, dict[str, Any]] = {}
+    for catalog in sorted(catalogs.values(), key=lambda value: value["indexedEpoch"]):
+        if catalog["containerUuid"]:
+            containers[catalog["containerUuid"]] = catalog
+    claimed: set[str] = set()
+    keys: set[str] = set()
+    volumes: list[dict[str, Any]] = []
+    for row in rows:
+        volume = dict(row)
+        catalog = catalogs.get(row["catalogVolumeId"]) if row["catalogVolumeId"] else None
+        locked = False
+        if catalog is None and str(row["fstype"]).lower() == "crypto_luks" and row["uuid"]:
+            candidate = containers.get(row["uuid"])
+            if candidate is not None and candidate["volumeId"] not in claimed:
+                catalog, locked = candidate, True
+                volume["catalogVolumeId"] = candidate["volumeId"]
+                volume["id"] = candidate["volumeId"]
+                if not volume["label"]:
+                    volume["name"] = candidate["name"]
+        # Two plugged clones of one drive share an identity; the panel still
+        # needs a key per row, and the device path is one.
+        if volume["id"] in keys:
+            volume["id"] = row["device"]
+        keys.add(volume["id"])
+        if catalog is not None:
+            claimed.add(catalog["volumeId"])
+        volume.update({
+            "catalogued": catalog is not None,
+            "indexedAt": catalog["indexedAt"] if catalog else "",
+            "indexedEpoch": catalog["indexedEpoch"] if catalog else 0,
+            "catalogEntries": catalog["entries"] if catalog else 0,
+            "catalogState": catalog["state"] if catalog else "",
+            "offline": False,
+            "locked": locked,
+        })
+        volumes.append(volume)
+    offline = [
+        offline_volume(catalog) for volume_id, catalog in catalogs.items()
+        if volume_id not in claimed
+    ]
+    merged = volumes + offline
+    merged.sort(key=lambda row: (
+        0 if row["mounted"] else 2 if row["offline"] else 1,
+        str(row["name"]).casefold(),
+        str(row["device"]),
+    ))
+    # Two sticks both called ARCHIVE, or an orphaned catalog beside the
+    # reformatted drive, must not read as one row.
+    named: dict[str, list[dict[str, Any]]] = {}
+    for row in merged:
+        named.setdefault(str(row["name"]).casefold(), []).append(row)
+    for group in named.values():
+        if len(group) > 1:
+            for row in group:
+                detail = [part for part in (row["model"], row["sizeText"]) if part]
+                row["name"] = " · ".join([str(row["name"]), *detail])
+    return {
+        "ok": True, "volumes": merged, "count": len(volumes), "offlineCount": len(offline),
+    }
 
 
 def volume_action_command(args: argparse.Namespace) -> dict[str, Any]:
@@ -4316,6 +4706,367 @@ def directory_size_command(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+CATALOG_SCHEMA = (
+    "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+    """CREATE TABLE entries (
+        id INTEGER PRIMARY KEY,
+        name BLOB NOT NULL,
+        rel BLOB NOT NULL,
+        name_fold TEXT NOT NULL,
+        rel_fold TEXT NOT NULL,
+        is_dir INTEGER NOT NULL,
+        is_link INTEGER NOT NULL,
+        hidden INTEGER NOT NULL,
+        depth INTEGER NOT NULL,
+        size INTEGER NOT NULL,
+        mtime REAL NOT NULL,
+        smart_kind TEXT NOT NULL
+    )""",
+)
+# Built after the rows are in: one sort at the end is cheaper than keeping
+# both indexes ordered through a million inserts.
+CATALOG_INDEXES = (
+    "CREATE INDEX entries_mtime ON entries(mtime)",
+    "CREATE INDEX entries_kind ON entries(smart_kind)",
+)
+
+
+def catalog_text(value: str) -> str:
+    # Folded from the surrogate-escaped name, exactly as the live walk folds
+    # it, then made storable: an undecodable byte becomes U+FFFD, which no
+    # typed query contains. The exact bytes are kept in `name` and `rel`.
+    return os.fsencode(value).decode("utf-8", "replace")
+
+
+def fsync_directory(directory: Path) -> None:
+    try:
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
+
+
+def catalog_index_command(args: argparse.Namespace, callback: Any = json_print) -> dict[str, Any]:
+    """Walk a mounted drive into its offline catalog, streaming progress.
+
+    The catalog is built beside the published one and swapped in whole, so a
+    cancelled run, a failed write or a drive pulled halfway leaves the previous
+    catalog exactly as it was. A walk stopped by a ceiling is still published,
+    marked partial: it is what fits, not something broken.
+    """
+    global _operation_cancelled
+    _operation_cancelled = False
+    device = str(args.device or "")
+    volume = next((row for row in external_volumes() if row["device"] == device), None)
+    if volume is None:
+        raise QuickfileError("This external device is no longer available", "volume-missing")
+    if not volume["mounted"] or not volume["mountToken"]:
+        raise QuickfileError("Mount this drive to index it", "catalog-not-mounted")
+    volume_id = str(volume.get("catalogVolumeId") or "")
+    if not volume_id:
+        raise QuickfileError("This drive has no stable identity", "catalog-no-identity")
+    # The displayed mount path is lossy for a non-UTF-8 name; the token is not.
+    root = decode_path(volume["mountToken"])
+
+    def lost() -> QuickfileError:
+        return QuickfileError("The drive was disconnected while indexing", "catalog-volume-lost")
+
+    try:
+        root_device = os.stat(root).st_dev
+    except OSError as exc:
+        raise lost() from exc
+    # The /dev node goes the moment the device does, well before udisks gets
+    # round to the mount. A path that is no block node to begin with leaves
+    # the walk to the mount checks alone.
+    try:
+        node = os.stat(device)
+        device_node = node.st_rdev if stat.S_ISBLK(node.st_mode) else None
+    except OSError:
+        device_node = None
+
+    def ensure_present() -> None:
+        # Unplugged, the mount point is an empty directory of the parent
+        # filesystem again: still there, but no longer a mount, nor this device.
+        try:
+            present = os.path.ismount(root) and os.stat(root).st_dev == root_device
+            if present and device_node is not None:
+                present = os.stat(device).st_rdev == device_node
+        except OSError:
+            present = False
+        if not present:
+            raise lost()
+
+    try:
+        directory = ensure_catalog_dir()
+        sweep_catalog_temporaries(directory)
+    except OSError as exc:
+        raise QuickfileError(
+            f"Could not prepare the drive catalog: {exc}", "catalog-write-failed"
+        ) from exc
+    stem = catalog_stem(volume_id)
+    if catalog_busy(directory, stem):
+        raise QuickfileError("This drive is being indexed", "catalog-busy")
+    target = directory / (stem + CATALOG_SUFFIX)
+    temporary = directory / f".tmp-{stem}-{os.getpid()}{CATALOG_SUFFIX}"
+    reporter = OperationReporter(callback)
+    started = time.monotonic()
+    connection: sqlite3.Connection | None = None
+    entries = files = directories = total = skipped = unreadable = 0
+    truncated = False
+    partial_reason = ""
+
+    def stop(reason: str) -> None:
+        nonlocal truncated, partial_reason
+        truncated = True
+        partial_reason = partial_reason or reason
+
+    try:
+        try:
+            # Created private before SQLite opens it, which would make it 0644.
+            descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            try:
+                os.fchmod(descriptor, 0o600)
+            finally:
+                os.close(descriptor)
+            connection = sqlite3.connect(str(temporary), isolation_level=None)
+            # A build nobody reads until it is complete needs no journal; the
+            # published file gets the default one back before it is swapped in.
+            connection.execute("PRAGMA journal_mode=OFF")
+            connection.execute("PRAGMA synchronous=OFF")
+            for statement in CATALOG_SCHEMA:
+                connection.execute(statement)
+            connection.execute("BEGIN")
+        except (OSError, sqlite3.Error) as exc:
+            raise QuickfileError(
+                f"Could not create the drive catalog: {exc}", "catalog-write-failed"
+            ) from exc
+
+        batch: list[tuple[Any, ...]] = []
+
+        def flush() -> None:
+            check_operation_cancelled()
+            if batch:
+                assert connection is not None
+                try:
+                    connection.executemany(
+                        "INSERT INTO entries (name, rel, name_fold, rel_fold, is_dir, is_link,"
+                        " hidden, depth, size, mtime, smart_kind)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        batch,
+                    )
+                except sqlite3.Error as exc:
+                    raise QuickfileError(
+                        f"Could not save the drive catalog: {exc}", "catalog-write-failed"
+                    ) from exc
+                batch.clear()
+
+        pending: list[tuple[str, bytes, int, bool]] = [(root, b"", 0, False)]
+        visited = 0
+        while pending:
+            check_operation_cancelled()
+            current, relative, depth, hidden = pending.pop()
+            visited += 1
+            if visited % CATALOG_PRESENCE_INTERVAL == 0:
+                ensure_present()
+            try:
+                with os.scandir(current) as iterator:
+                    # Streamed, never listed, as measuring does.
+                    for child in iterator:
+                        check_operation_cancelled()
+                        if entries >= CATALOG_ENTRY_LIMIT:
+                            stop("entry-limit")
+                            pending = []
+                            break
+                        name = child.name
+                        try:
+                            details = child.stat(follow_symlinks=False)
+                        except OSError as exc:
+                            if exc.errno in CATALOG_LOST_ERRNOS:
+                                raise lost() from exc
+                            unreadable += 1
+                            continue
+                        is_dir = stat.S_ISDIR(details.st_mode)
+                        is_link = stat.S_ISLNK(details.st_mode)
+                        if name == ".git" or (is_dir and (
+                                name in CATALOG_SKIPPED_DIRECTORIES
+                                or name.startswith(CATALOG_SKIPPED_PREFIXES))):
+                            skipped += 1
+                            continue
+                        raw = os.fsencode(name)
+                        relative_child = relative + b"/" + raw if relative else raw
+                        below_dot = hidden or name.startswith(".")
+                        batch.append((
+                            raw, relative_child,
+                            catalog_text(fold_text(name)),
+                            catalog_text(fold_text(os.fsdecode(relative_child))),
+                            int(is_dir), int(is_link), int(below_dot), depth,
+                            details.st_size, details.st_mtime,
+                            smart_file_kind(name, is_dir),
+                        ))
+                        entries += 1
+                        if len(batch) >= CATALOG_BATCH_SIZE:
+                            flush()
+                        if not is_dir:
+                            files += 1
+                            if stat.S_ISREG(details.st_mode):
+                                total += details.st_size
+                            continue
+                        directories += 1
+                        path = os.path.join(current, name)
+                        # Listed but not entered, as a SMART walk treats them,
+                        # so offline answers are the ones a live search gives.
+                        if name in SMART_PRUNED_DIRECTORIES or os.path.lexists(
+                                os.path.join(path, SMART_CACHE_MARKER)):
+                            skipped += 1
+                        elif depth + 1 > CATALOG_DEPTH_LIMIT:
+                            stop("depth-limit")
+                        elif len(pending) >= MEASURE_PENDING_LIMIT:
+                            stop("pending-limit")
+                        else:
+                            pending.append((path, relative_child, depth + 1, below_dot))
+            except OSError as exc:
+                # A pulled drive fails here first; anything else is one
+                # unreadable folder, counted like measuring counts it.
+                if exc.errno in CATALOG_LOST_ERRNOS:
+                    raise lost() from exc
+                ensure_present()
+                if not relative:
+                    # Nothing of the drive was read. Published, the empty
+                    # build would replace a good catalog and call itself whole.
+                    raise QuickfileError(
+                        "Could not read this drive", "catalog-unreadable"
+                    ) from exc
+                unreadable += 1
+                continue
+            reporter.emit("indexing", files=files, directories=directories,
+                          bytes=total, path=display_text(current))
+
+        ensure_present()
+        flush()
+        # Stamped as the walk ends, not as it starts: an hour-long walk is
+        # an hour old the moment it is published otherwise, and a quick
+        # replug would walk the drive straight again.
+        indexed_epoch = int(time.time())
+        reporter.emit("saving", force=True, files=files, directories=directories, bytes=total)
+        duration = int((time.monotonic() - started) * 1000)
+        state = "partial" if truncated else "complete"
+        meta = {
+            "schemaVersion": str(CATALOG_SCHEMA_VERSION),
+            "volumeId": volume_id,
+            "uuid": str(volume.get("uuid") or ""),
+            "partUuid": str(volume.get("partUuid") or ""),
+            "serial": str(volume.get("serial") or ""),
+            "containerUuid": str(volume.get("containerUuid") or ""),
+            "label": str(volume.get("label") or ""),
+            "name": str(volume.get("name") or ""),
+            "model": str(volume.get("model") or ""),
+            "vendor": str(volume.get("vendor") or ""),
+            "fstype": str(volume.get("fstype") or ""),
+            "transport": str(volume.get("transport") or ""),
+            "size": str(volume.get("size") or 0),
+            "mountPathAtIndex": str(volume.get("mountPath") or ""),
+            "indexedAt": iso_time(indexed_epoch),
+            "indexedEpoch": str(indexed_epoch),
+            "durationMs": str(duration),
+            "entries": str(entries),
+            "files": str(files),
+            "directories": str(directories),
+            "bytes": str(total),
+            "skipped": str(skipped),
+            "unreadable": str(unreadable),
+            "state": state,
+            "partialReason": partial_reason,
+        }
+        try:
+            for statement in CATALOG_INDEXES:
+                connection.execute(statement)
+            check_operation_cancelled()
+            # Meta last: a file without it is a build that never finished.
+            connection.executemany("INSERT INTO meta (key, value) VALUES (?, ?)", meta.items())
+            connection.execute(f"PRAGMA user_version = {CATALOG_SCHEMA_VERSION}")
+            connection.execute("COMMIT")
+            connection.execute("PRAGMA journal_mode=DELETE")
+            connection.close()
+            connection = None
+            descriptor = os.open(temporary, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            # The last moment a cancel can still keep the previous catalog;
+            # after the swap it is no longer there to keep.
+            check_operation_cancelled()
+            replaced = os.path.lexists(target)
+            os.replace(temporary, target)
+        except (OSError, sqlite3.Error) as exc:
+            raise QuickfileError(
+                f"Could not save the drive catalog: {exc}", "catalog-write-failed"
+            ) from exc
+        fsync_directory(directory)
+    finally:
+        if connection is not None:
+            connection.close()
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+
+    return {
+        "ok": True,
+        "volume": {
+            "volumeId": volume_id,
+            "name": str(volume.get("name") or ""),
+            "entries": entries,
+            "files": files,
+            "directories": directories,
+            "bytes": total,
+            "truncated": truncated,
+            "state": state,
+            "partialReason": partial_reason,
+            "indexedAt": meta["indexedAt"],
+            "indexedEpoch": indexed_epoch,
+            "durationMs": duration,
+            "replaced": replaced,
+        },
+    }
+
+
+def catalog_forget_command(args: argparse.Namespace) -> dict[str, Any]:
+    volume_id = str(args.volume_id or "")
+    directory = catalog_dir()
+    stem = catalog_stem(volume_id) if volume_id else ""
+    # A live build would swap the file straight back in when it finished.
+    if stem and catalog_busy(directory, stem):
+        raise QuickfileError("This drive is being indexed", "catalog-busy")
+    target = directory / (stem + CATALOG_SUFFIX)
+    if not stem or not os.path.lexists(target):
+        raise QuickfileError("No catalog for this drive", "catalog-missing")
+    try:
+        name = read_catalog_meta(target).get("name") or volume_id
+    except (sqlite3.Error, OSError):
+        name = volume_id
+    try:
+        os.unlink(target)
+    except FileNotFoundError as exc:
+        raise QuickfileError("No catalog for this drive", "catalog-missing") from exc
+    except OSError as exc:
+        raise QuickfileError(
+            f"Could not forget the drive catalog: {exc}", "catalog-forget-failed"
+        ) from exc
+    try:
+        sweep_catalog_temporaries(directory)
+    except OSError:
+        pass
+    return {
+        "ok": True, "volumeId": volume_id, "removed": True, "message": f"Forgot “{name}”",
+    }
+
+
 def request_operation_cancel(_signum: int, _frame: Any) -> None:
     global _operation_cancelled
     _operation_cancelled = True
@@ -5558,6 +6309,16 @@ def parser() -> argparse.ArgumentParser:
     )
     add_path_arguments(directory_size)
 
+    catalog_index = subcommands.add_parser(
+        "catalog-index", help="Index a mounted external drive for offline search"
+    )
+    catalog_index.add_argument("--device", required=True)
+
+    catalog_forget = subcommands.add_parser(
+        "catalog-forget", help="Delete one drive's offline catalog"
+    )
+    catalog_forget.add_argument("--volume-id", required=True)
+
     subcommands.add_parser("trash-list", help="List bounded Trash entries")
     subcommands.add_parser("history", help="Return the latest undoable operation")
     return root
@@ -5565,7 +6326,7 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv: Iterable[str] | None = None) -> int:
     args = parser().parse_args(list(argv) if argv is not None else None)
-    if args.command in {"operation", "directory-size"}:
+    if args.command in {"operation", "directory-size", "catalog-index"}:
         signal.signal(signal.SIGTERM, request_operation_cancel)
         signal.signal(signal.SIGINT, request_operation_cancel)
     try:
@@ -5598,6 +6359,11 @@ def main(argv: Iterable[str] | None = None) -> int:
         elif args.command == "directory-size":
             result = directory_size_command(args)
             result["event"] = "result"
+        elif args.command == "catalog-index":
+            result = catalog_index_command(args)
+            result["event"] = "result"
+        elif args.command == "catalog-forget":
+            result = catalog_forget_command(args)
         elif args.command == "trash-list":
             result = trash_list_command(args)
         elif args.command == "history":
@@ -5611,7 +6377,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         if isinstance(exc, OperationConflict):
             payload["conflicts"] = exc.conflicts
             payload["conflictPolicyOptions"] = list(CONFLICT_POLICIES[1:])
-        if args.command in {"operation", "directory-size"}:
+        if args.command in {"operation", "directory-size", "catalog-index"}:
             payload["event"] = "result"
         json_print(payload)
         return 130 if isinstance(exc, OperationCancelled) else 2

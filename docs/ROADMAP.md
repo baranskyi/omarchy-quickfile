@@ -80,6 +80,39 @@ identity, navigation/search, metadata, and a small set of recoverable actions.
 - Semantic embeddings, synonym retrieval, and domain fine-tuning remain future
   experiments; SMART currently reranks the bounded lexical candidate set.
 
+## 0.8 — offline drive catalog (in progress)
+
+A drive that is not plugged in can still be found: QuickFile walks an external
+drive once into a private catalog and lists it, dimmed, while it is away. The
+walk is a bounded, cancellable scan like measuring a folder.
+
+- [x] Stable drive identity from filesystem UUID, partition UUID or a real disk
+  serial; placeholder serials and label guesses are never an identity. Locked
+  LUKS containers match the catalog made inside them.
+- [x] One private `0600` SQLite catalog per drive in a `0700` directory, holding
+  names, relative paths, sizes, dates and kinds only, built aside and swapped in
+  atomically; a cancelled or interrupted walk never replaces the previous one.
+- [x] Bounded, cancellable indexer with streamed progress, entry/depth/queue
+  ceilings that publish a partial catalog, and a stop when the drive is pulled.
+- [x] Index and Forget from `DEVICES`, automatic re-index when an indexed drive
+  is mounted again, footer progress and Cancel, dimmed offline rows with their
+  index age; an unreadable catalog stays listed so it can be forgotten.
+- Offline rows in search, both the deterministic modes and SMART, after the
+  live rows and within a time budget, with an `OFFLINE` badge and the drive to
+  connect.
+- A setting to keep offline rows out of search.
+- An offline row comes alive in place, with its selection kept, when its drive
+  is connected.
+
+Deferred:
+
+- Incremental re-indexing; a full walk is simpler and correct, since folder
+  dates do not change when a file inside is edited.
+- An FTS5 trigram index, if plain substring scans miss the search budget on
+  large catalogs.
+- A typo-tolerant prefilter for offline SMART matches.
+- Browsing an offline drive's folder tree in `FILES`.
+
 ## Non-negotiable constraints
 
 Implemented filesystem monitoring: native GIO events, bounded watches and event

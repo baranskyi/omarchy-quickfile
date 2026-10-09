@@ -67,6 +67,7 @@ def run_harness(executable: str, source: Path, timeout: float) -> bool:
             "QUICKFILE_METADATA_FILE": str(directory / "metadata.json"),
             "QUICKFILE_SETTINGS_FILE": str(directory / "settings.json"),
             "QUICKFILE_SEMANTIC_HOME": str(directory / "semantic"),
+            "QUICKFILE_CATALOG_DIR": str(directory / "catalog"),
             "NO_COLOR": "1",
         })
         command = [executable, "--no-duplicate", "--no-color", "--path", str(target)]

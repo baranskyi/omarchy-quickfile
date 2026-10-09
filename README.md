@@ -77,7 +77,9 @@ concept. It does not depend on or copy unreleased FileBlade source code.
   tree, and semantic colors follow the active Omarchy palette.
 - Live `DEVICES` module for USB sticks and other external storage. It shows
   capacity, connection type, mount state and mount path; clicking mounts and
-  opens a drive through UDisks, with a separate safe-unmount control.
+  opens a drive through UDisks, with a separate safe-unmount control. A drive
+  can be indexed into a private offline catalog, and an indexed drive stays
+  listed, dimmed, while it is unplugged.
 - Collapsible `PROJECT KNOWLEDGE` index for agent instructions that apply to the
   current directory. It discovers project and user rules for Codex, Claude,
   Gemini, Cursor, GitHub Copilot, and Windsurf, merges shared symlink targets,
@@ -339,6 +341,27 @@ open it, or click an unmounted drive to mount and open it. The trailing eject
 button safely unmounts it; if the current file view is on that drive, QuickFile
 returns home after the unmount completes.
 
+Offline drives: the refresh button beside a mounted drive indexes it, walking
+the drive once in the background into a private catalog of names, relative
+paths, sizes, dates and kinds. The footer shows `Indexing “ARCHIVE” · N files`
+with a Cancel button whenever it has nothing newer to say, and the drive's row
+shows the same count; a cancelled run, a drive pulled mid-walk, or a drive whose
+top folder cannot be read keeps the previous catalog untouched. When an indexed
+drive is mounted again it is re-indexed automatically, one drive at a time;
+cancelling an automatic run leaves that drive alone for the rest of the session.
+Ejecting a drive that is being indexed stops the walk first, then unmounts.
+An indexed drive that is unplugged stays in `DEVICES` as a dimmed row,
+`Not connected · indexed 3d ago`, and its trash button forgets the catalog
+after a confirmation. A new drive is only ever indexed on request. A drive
+needs a stable identity — a filesystem or partition UUID, or a real disk
+serial — to be indexed; two sticks with the same label still get separate
+catalogs. The walk skips `.git`, does not enter dependency and cache trees
+such as `node_modules` or folders tagged with `CACHEDIR.TAG`, ignores drive
+litter such as `$RECYCLE.BIN`, `.Trashes` and `.Trash-*`, and stops at one
+million entries, marking the catalog partial.
+A `dd` clone shares its original's catalog. Searching an offline drive's
+catalog from the search field is not wired in yet.
+
 The short labels in `PROJECT KNOWLEDGE` (`CX`, `CL`, `GM`, `CU`, `CP`, `WS`) describe
 which agent configuration references a file. They are bindings, not currently
 running agent sessions. A chain glyph marks a symbolic-link binding; hovering
@@ -395,6 +418,15 @@ only the information needed for safe undo, never file contents. The footer shows
 recursive-operation progress and exposes Cancel; when idle it exposes the latest
 available Undo. `Ctrl+Shift+T` opens the Trash browser with restore and
 permanent-delete controls.
+
+Offline drive catalogs are stored privately in
+`$XDG_DATA_HOME/omarchy/quickfile/catalog/` (normally
+`~/.local/share/omarchy/quickfile/catalog/`), a `0700` directory holding one
+`0600` SQLite file per indexed drive. A catalog holds file and folder names,
+paths relative to the drive's root, sizes, modification dates and kinds, plus
+the drive's label, model, size and identifiers; it never stores file contents
+or previews. A catalog is built beside the old one and swapped in only once it
+is complete. Forget on a drive's offline row in `DEVICES` deletes its catalog.
 
 ## Requirements
 
@@ -453,9 +485,9 @@ Remove the installed plugin with:
 omarchy plugin remove m0sthatedman.quickfile
 ```
 
-Removal does not delete private metadata or operation history. This protects
-notes and recovery information from accidental loss. If they are no longer
-needed, the user-owned data lives under
+Removal does not delete private metadata, offline drive catalogs or operation
+history. This protects notes and recovery information from accidental loss. If
+they are no longer needed, the user-owned data lives under
 `$XDG_DATA_HOME/omarchy/quickfile/` and
 `$XDG_STATE_HOME/omarchy/quickfile/`.
 The optional Smart Search environment is likewise retained across plugin

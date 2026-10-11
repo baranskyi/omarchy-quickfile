@@ -72,6 +72,57 @@ ShellRoot {
     }
   }
 
+  // The bounded clipboard reader, driven through its request/exit cycle with
+  // the process start and its signals recorded instead.
+  Quickfile.Service {
+    id: clipboard
+    rootPath: suite.fixture
+    initialized: false
+    property var launches: []
+    property var sentSignals: []
+    property var answers: []
+    function startClipboardReadProcess(command) {
+      launches.push(command)
+      return true
+    }
+    function signalClipboardRead(signalNumber) {
+      sentSignals.push(signalNumber)
+      return true
+    }
+    onClipboardTextRead: function(serial, ok, text) {
+      answers.push({ serial: serial, ok: ok, text: text })
+    }
+  }
+
+  // The same reader around real processes: stand-ins for wl-paste that
+  // stream without end, stall, or answer in pieces, so the kill, the deadline
+  // and the collector are the ones that ship.
+  Quickfile.Service {
+    id: liveReader
+    rootPath: suite.fixture
+    initialized: false
+    property var standIns: []
+    property var answers: []
+    function buildClipboardReadCommand(primary, typeIndex) {
+      return standIns[Math.min(typeIndex, standIns.length - 1)]
+    }
+    onClipboardTextRead: function(serial, ok, text) {
+      answers.push({ serial: serial, ok: ok, text: text })
+    }
+  }
+
+  // And wl-paste itself, with the real argv, in an environment without a
+  // Wayland display: both types are tried and nothing is pasted.
+  Quickfile.Service {
+    id: realPaste
+    rootPath: suite.fixture
+    initialized: false
+    property var answers: []
+    onClipboardTextRead: function(serial, ok, text) {
+      answers.push({ serial: serial, ok: ok, text: text })
+    }
+  }
+
   // Search rows from drive catalogs. Everything a guard could hand a catalog
   // token to is either recorded here or a real process whose busy flag shows.
   Quickfile.Service {
@@ -1265,6 +1316,178 @@ ShellRoot {
       "A folder listing kept the last search's catalog tally")
   }
 
+  function lastAnswer(service) {
+    return service.answers.length > 0 ? service.answers[service.answers.length - 1] : null
+  }
+
+  function clipboardUnitTests() {
+    check(clipboard.clipboardByteBudget(512) === 512 * 4 + 8
+        && clipboard.clipboardByteBudget(32767) === 131072
+        && clipboard.clipboardByteBudget(0) === 0 && clipboard.clipboardByteBudget(-3) === 0,
+      "The paste byte budget is not four bytes a character under the ceiling")
+    check(JSON.stringify(clipboard.buildClipboardReadCommand(false, 0)) === JSON.stringify(
+        ["/usr/bin/env", "wl-paste", "--no-newline", "--type", "text/plain;charset=utf-8"]),
+      "The clipboard is not read through a fixed wl-paste argv")
+    check(JSON.stringify(clipboard.buildClipboardReadCommand(true, 1)) === JSON.stringify(
+        ["/usr/bin/env", "wl-paste", "--no-newline", "--primary", "--type", "text/plain"]),
+      "The primary selection's fallback argv is wrong")
+
+    check(clipboard.readClipboardText(false, 0) === 0 && clipboard.launches.length === 0,
+      "A box with no room still read the clipboard")
+    var serial = clipboard.readClipboardText(false, 512)
+    check(serial > 0 && clipboard.launches.length === 1 && clipboard.clipboardReadBusy
+        && clipboard.clipboardReadDeadlineArmed && clipboard.clipboardReadBudget === 2056,
+      "A paste did not start one bounded read under its deadline")
+    check(clipboard.readClipboardText(false, 512) === 0 && clipboard.launches.length === 1,
+      "A second paste started while the first was still reading")
+    clipboard.handleClipboardReadProgress(5)
+    clipboard.handleClipboardReadExit(0, "hello")
+    var answer = lastAnswer(clipboard)
+    check(answer && answer.serial === serial && answer.ok && answer.text === "hello"
+        && !clipboard.clipboardReadBusy && !clipboard.clipboardReadDeadlineArmed,
+      "A finished read was not answered, or left its deadline armed")
+
+    // UTF-8 text not offered: plain text, once, under the same deadline.
+    serial = clipboard.readClipboardText(true, 10)
+    clipboard.handleClipboardReadExit(1, "")
+    check(clipboard.launches.length === 3 && JSON.stringify(clipboard.launches[2])
+        === JSON.stringify(clipboard.buildClipboardReadCommand(true, 1))
+        && clipboard.clipboardReadPending === serial && clipboard.clipboardReadDeadlineArmed,
+      "A clipboard without UTF-8 text was not asked for plain text")
+    clipboard.handleClipboardReadProgress(5)
+    clipboard.handleClipboardReadExit(0, "plain")
+    answer = lastAnswer(clipboard)
+    check(answer.serial === serial && answer.ok && answer.text === "plain",
+      "The plain-text fallback was not answered")
+
+    // No text at all pastes nothing, and says nothing.
+    clipboard.actionMessage = ""
+    var answers = clipboard.answers.length
+    serial = clipboard.readClipboardText(false, 10)
+    clipboard.handleClipboardReadExit(1, "")
+    clipboard.handleClipboardReadExit(1, "")
+    answer = lastAnswer(clipboard)
+    check(clipboard.answers.length === answers + 1 && !answer.ok && answer.text === ""
+        && clipboard.launches.length === 5 && clipboard.actionMessage === "",
+      "A clipboard without text was retried more than once or announced")
+
+    // A missing wl-paste is said once, not retried.
+    serial = clipboard.readClipboardText(false, 10)
+    clipboard.handleClipboardReadExit(127, "")
+    answer = lastAnswer(clipboard)
+    check(!answer.ok && clipboard.launches.length === 6
+        && clipboard.actionMessage === "Pasting needs wl-paste from wl-clipboard",
+      "A missing wl-paste was retried or not explained: " + clipboard.actionMessage)
+
+    // Past the byte budget: SIGKILL at once, the paste dropped whole, and the
+    // exit that follows changes nothing.
+    serial = clipboard.readClipboardText(false, 1)
+    check(clipboard.clipboardReadBudget === 12, "A one-character box got a large budget")
+    clipboard.handleClipboardReadProgress(12)
+    check(clipboard.sentSignals.length === 0 && clipboard.clipboardReadPending === serial,
+      "A read within its budget was stopped")
+    clipboard.handleClipboardReadProgress(13)
+    answer = lastAnswer(clipboard)
+    check(clipboard.sentSignals.join(",") === "9" && answer.serial === serial && !answer.ok
+        && !clipboard.clipboardReadBusy && !clipboard.clipboardReadDeadlineArmed,
+      "A read past its budget was not killed and dropped: " + clipboard.sentSignals)
+    check(clipboard.actionMessage === "Clipboard text is too long to paste here",
+      "An oversized paste was not explained")
+    answers = clipboard.answers.length
+    clipboard.handleClipboardReadExit(0, "far too much")
+    check(clipboard.answers.length === answers, "A killed read was answered twice")
+
+    // A chunk that lands with the exit is held to the same budget.
+    serial = clipboard.readClipboardText(false, 1)
+    clipboard.clipboardReadBytes = 13
+    clipboard.handleClipboardReadExit(0, "far too much")
+    answer = lastAnswer(clipboard)
+    check(answer.serial === serial && !answer.ok,
+      "An oversized last chunk was pasted")
+
+    // Past the deadline: SIGKILL, dropped, explained.
+    clipboard.sentSignals = []
+    serial = clipboard.readClipboardText(false, 10)
+    clipboard.expireClipboardRead()
+    answer = lastAnswer(clipboard)
+    check(clipboard.sentSignals.join(",") === "9" && answer.serial === serial && !answer.ok
+        && !clipboard.clipboardReadBusy,
+      "A stalled read was not killed and dropped")
+    check(clipboard.actionMessage === "The clipboard did not answer in time",
+      "A stalled paste was not explained")
+    answers = clipboard.answers.length
+    clipboard.expireClipboardRead()
+    clipboard.handleClipboardReadExit(0, "late")
+    check(clipboard.answers.length === answers, "An expired read was answered twice")
+  }
+
+  // Real processes, one after another: each starts when the last has gone.
+  property string pastePhase: "stream"
+  property bool pasteDone: false
+  property double pasteStarted: 0
+  property int pasteSerial: 0
+
+  function startLivePaste(standIns, maxChars, primary) {
+    liveReader.standIns = standIns
+    pasteStarted = Date.now()
+    pasteSerial = liveReader.readClipboardText(primary === true, maxChars)
+    check(pasteSerial > 0, "A real clipboard read did not start in " + pastePhase)
+  }
+
+  function livePasteStep() {
+    if (pasteDone || liveReader.clipboardReadBusy || realPaste.clipboardReadBusy) return
+    var answer = lastAnswer(liveReader)
+    if (pastePhase === "stream" && pasteSerial === 0) {
+      startLivePaste([["/usr/bin/python3", "-c",
+        "import sys\nwhile True:\n  sys.stdout.write('a' * 65536)\n  sys.stdout.flush()"]], 512)
+    } else if (pastePhase === "stream") {
+      check(answer && answer.serial === pasteSerial && !answer.ok
+          && liveReader.actionMessage === "Clipboard text is too long to paste here",
+        "An endless clipboard was not cut off at its budget")
+      // At most what had landed when the budget was crossed: one pipe's worth.
+      check(liveReader.clipboardReadBytes <= 2056 + 1048576,
+        "An endless clipboard was buffered past one pipe's worth: "
+          + liveReader.clipboardReadBytes)
+      pastePhase = "stall"
+      startLivePaste([["/usr/bin/python3", "-c", "import time\ntime.sleep(30)"]], 512)
+    } else if (pastePhase === "stall") {
+      var waited = Date.now() - pasteStarted
+      check(answer && answer.serial === pasteSerial && !answer.ok && waited >= 900
+          && liveReader.actionMessage === "The clipboard did not answer in time",
+        "A stalled clipboard was not dropped at its deadline: " + waited + "ms")
+      pastePhase = "pieces"
+      // No UTF-8 type, then the plain text in pieces that split characters.
+      startLivePaste([["/usr/bin/python3", "-c", "import sys\nsys.exit(1)"],
+        ["/usr/bin/python3", "-c",
+          "import sys, time\nb = ('é' * 3000).encode()\n"
+          + "for i in range(0, len(b), 999):\n"
+          + "  sys.stdout.buffer.write(b[i:i + 999])\n  sys.stdout.flush()\n  time.sleep(0.01)"]],
+        32767)
+    } else if (pastePhase === "pieces") {
+      check(answer && answer.serial === pasteSerial && answer.ok
+          && answer.text === new Array(3001).join("é"),
+        "Text read in pieces was not whole: " + (answer ? answer.text.length : "no answer"))
+      pastePhase = "wl-paste"
+      realPaste.actionMessage = ""
+      check(realPaste.readClipboardText(false, 10) > 0, "wl-paste itself did not start")
+    } else if (pastePhase === "wl-paste") {
+      var real = lastAnswer(realPaste)
+      check(real && !real.ok && (realPaste.clipboardReadType === 1
+          || realPaste.actionMessage === "Pasting needs wl-paste from wl-clipboard"),
+        "wl-paste without a display pasted something or skipped plain text")
+      pasteDone = true
+    }
+  }
+
+  Timer {
+    interval: 50
+    repeat: true
+    running: !suite.finished && !suite.pasteDone
+    onTriggered: {
+      try { suite.livePasteStep() } catch (error) { suite.fail(error.message) }
+    }
+  }
+
   function entryNamed(name) {
     for (var i = 0; i < live.entries.length; i++)
       if (live.entries[i].name === name) return live.entries[i]
@@ -1367,13 +1590,15 @@ ShellRoot {
             String(suite.previousWatcherPid)]
           mutation.running = true
           suite.transition("watcher-crashed")
-        } else if (suite.phase === "watcher-crashed" && now - suite.phaseStarted >= 1500) {
+        } else if (suite.phase === "watcher-crashed" && now - suite.phaseStarted >= 1500
+            && suite.pasteDone) {
           suite.check(live.watcherFailed && !live.watcherReady && !live.watcherPid,
             "Unexpected watcher exit did not remain in fallback without restarting")
           suite.finished = true
           live.setPanelVisible(false)
           console.log("QUICKFILE_TESTS_PASSED service:", suite.assertions,
-            "assertions; native events, idle, hide/reopen, rapid reopen, crash fallback verified")
+            "assertions; native events, idle, hide/reopen, rapid reopen, crash fallback,"
+              + " bounded clipboard reads verified")
           Qt.quit()
         }
       } catch (error) { suite.fail(error.message) }
@@ -1383,6 +1608,7 @@ ShellRoot {
   Component.onCompleted: Qt.callLater(function() {
     try {
       suite.runUnitTests()
+      suite.clipboardUnitTests()
       suite.phaseStarted = Date.now()
       live.setPanelVisible(true)
     } catch (error) { suite.fail(error.message) }

@@ -127,6 +127,26 @@ Item {
   property string clipboardToken: ""
   property var clipboardTokens: []
   property string clipboardName: ""
+  // Text pasted into the panel's boxes comes from another client's clipboard.
+  // Qt's own reader buffers that client's whole offer before a box's length
+  // limit applies, with no byte cap or deadline, and the shell is one process
+  // for the whole desktop; so no box pastes through Qt (components/TextBox.qml)
+  // and the text is read here instead: wl-paste with a fixed argv, killed the
+  // moment it passes the box's byte budget or its second, the paste dropped
+  // whole. clipboardReadPending is the read still owed an answer; the process
+  // may outlive it by the moment a kill takes.
+  readonly property int clipboardReadCeiling: 131072
+  readonly property int clipboardReadTimeout: 1000
+  readonly property var clipboardReadTypes: ["text/plain;charset=utf-8", "text/plain"]
+  property int clipboardReadSerial: 0
+  property int clipboardReadPending: 0
+  property bool clipboardReadPrimary: false
+  property int clipboardReadBudget: 0
+  property int clipboardReadType: 0
+  property double clipboardReadBytes: 0
+  readonly property bool clipboardReadBusy: clipboardReadPending !== 0
+    || clipboardReadProcess.running
+  readonly property bool clipboardReadDeadlineArmed: clipboardReadDeadline.running
   property var expandedTokens: []
   property bool showHidden: false
   // Listing order, persisted with the other panel preferences. Search results
@@ -354,6 +374,8 @@ Item {
   signal conflictRequested(var conflicts)
   // The offline row the user asked for has come alive under this token.
   signal revealRequested(string token)
+  // The answer to readClipboardText: the text when ok, nothing otherwise.
+  signal clipboardTextRead(int serial, bool ok, string text)
 
   onActionMessageChanged: actionNoticeFresh = false
   onClipboardTokenChanged: actionNoticeFresh = false
@@ -2799,6 +2821,113 @@ Item {
     clipboardName = ""
   }
 
+  // Four bytes hold any character in UTF-8, plus a little slack; never past
+  // the ceiling, whatever the box allows.
+  function clipboardByteBudget(maxChars) {
+    var chars = Math.floor(Number(maxChars) || 0)
+    if (chars <= 0) return 0
+    return Math.min(clipboardReadCeiling, chars * 4 + 8)
+  }
+
+  function buildClipboardReadCommand(primary, typeIndex) {
+    var command = ["/usr/bin/env", "wl-paste", "--no-newline"]
+    if (primary === true) command.push("--primary")
+    var type = clipboardReadTypes[typeIndex]
+    command.push("--type", String(type !== undefined ? type : clipboardReadTypes[0]))
+    return command
+  }
+
+  // Asks for the clipboard's text, or the primary selection's, for a box that
+  // holds at most maxChars. Returns the serial clipboardTextRead will answer,
+  // or 0 when a read is still in flight or nothing would fit.
+  function readClipboardText(primary, maxChars) {
+    var budget = clipboardByteBudget(maxChars)
+    if (budget <= 0 || clipboardReadBusy) return 0
+    clipboardReadSerial++
+    clipboardReadPending = clipboardReadSerial
+    clipboardReadPrimary = primary === true
+    clipboardReadBudget = budget
+    clipboardReadType = 0
+    clipboardReadBytes = 0
+    clipboardReadDeadline.restart()
+    var serial = clipboardReadPending
+    if (startClipboardReadProcess(buildClipboardReadCommand(clipboardReadPrimary, 0)))
+      return serial
+    finishClipboardRead(false, "")
+    return 0
+  }
+
+  // The one place a clipboard read starts, so the harness can drive the whole
+  // request/exit cycle without wl-paste.
+  function startClipboardReadProcess(command) {
+    clipboardReadProcess.command = command
+    clipboardReadProcess.running = true
+    return true
+  }
+
+  // The one place it is signalled, beside the one place it starts.
+  function signalClipboardRead(signalNumber) {
+    if (!clipboardReadProcess.running) return false
+    clipboardReadProcess.signal(signalNumber)
+    return true
+  }
+
+  // Called as each chunk lands with the bytes read so far. Past the budget
+  // the reader dies there and then, so nothing after that chunk is buffered.
+  function handleClipboardReadProgress(byteCount) {
+    if (clipboardReadPending === 0) return
+    clipboardReadBytes = Math.max(clipboardReadBytes, Number(byteCount) || 0)
+    if (clipboardReadBytes > clipboardReadBudget)
+      abortClipboardRead("Clipboard text is too long to paste here")
+  }
+
+  function expireClipboardRead() {
+    if (clipboardReadPending !== 0)
+      abortClipboardRead("The clipboard did not answer in time")
+  }
+
+  function abortClipboardRead(message) {
+    signalClipboardRead(9)
+    announce(message)
+    finishClipboardRead(false, "")
+  }
+
+  function finishClipboardRead(ok, text) {
+    var serial = clipboardReadPending
+    clipboardReadPending = 0
+    clipboardReadDeadline.stop()
+    if (serial !== 0) clipboardTextRead(serial, ok === true, ok === true ? String(text) : "")
+  }
+
+  function handleClipboardReadExit(exitCode, text) {
+    if (clipboardReadPending === 0) return
+    // The last chunk can arrive with the exit itself.
+    if (clipboardReadBytes > clipboardReadBudget) {
+      abortClipboardRead("Clipboard text is too long to paste here")
+      return
+    }
+    if (exitCode === 0) {
+      finishClipboardRead(true, text)
+      return
+    }
+    // env's answer for a program that is not installed.
+    if (exitCode === 127) {
+      announce("Pasting needs wl-paste from wl-clipboard")
+      finishClipboardRead(false, "")
+      return
+    }
+    // The clipboard does not offer the first type: ask for the next one, under
+    // the same deadline. Anything else — nothing copied, no text — pastes
+    // nothing, as a native paste would.
+    if (clipboardReadBytes === 0 && clipboardReadType + 1 < clipboardReadTypes.length) {
+      clipboardReadType++
+      if (startClipboardReadProcess(
+          buildClipboardReadCommand(clipboardReadPrimary, clipboardReadType)))
+        return
+    }
+    finishClipboardRead(false, "")
+  }
+
   function createFile(name) { return runAction("touch", rootToken, name) }
   function createFolder(name) { return runAction("mkdir", rootToken, name) }
   function renameSelected(name) {
@@ -3571,6 +3700,32 @@ Item {
     id: catalogIndexKillTimer
     interval: 5000
     onTriggered: root.escalateCatalogIndexCancel()
+  }
+
+  // stderr is left unparsed: it carries only wl-paste's own messages, never
+  // the other client's data.
+  Process {
+    id: clipboardReadProcess
+    stdout: StdioCollector {
+      id: clipboardReadCollector
+      // Reported chunk by chunk, so the budget is checked as the bytes land
+      // rather than once everything has been collected.
+      waitForEnd: false
+      onDataChanged: root.handleClipboardReadProgress(data.byteLength)
+    }
+    // The collector keeps the previous run's bytes until new ones arrive, so a
+    // run that printed nothing has no text of its own.
+    onExited: function(exitCode) {
+      root.handleClipboardReadExit(exitCode,
+        root.clipboardReadBytes > 0 ? clipboardReadCollector.text : "")
+    }
+  }
+
+  // One second for the whole paste, fallback type included.
+  Timer {
+    id: clipboardReadDeadline
+    interval: root.clipboardReadTimeout
+    onTriggered: root.expireClipboardRead()
   }
 
   Process {

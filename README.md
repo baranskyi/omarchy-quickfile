@@ -456,7 +456,8 @@ provides its core runtime dependencies:
 - Python 3, PyGObject/GIO and the `gio` command for filesystem monitoring,
   opening files and Trash integration.
 - `lsblk` and `udisksctl` for the removable-device module.
-- `wl-copy` for copying a selected path to the Wayland clipboard.
+- `wl-copy` and `wl-paste` (wl-clipboard) for copying a selected path to the
+  Wayland clipboard and for pasting into QuickFile's text boxes.
 
 Git, `rg`, zoxide, GNOME Sushi, `getfacl`, and `lsattr` are optional. They add
 Git context, faster content search, frequent locations, external QuickView,
@@ -519,6 +520,22 @@ backend messages and tooltips — renders literally: each `Text` is pinned to
 `Text.PlainText`, and tooltip values are escaped before they reach Qt Quick
 Controls' shared tooltip, which renders with `Text.AutoText`. A file called
 `<img src="…">` is shown as that text and loads nothing.
+
+The clipboard is another client's data too. Qt reads it by buffering that
+client's whole offer before a field's length limit applies, with no byte cap or
+deadline, and Qt Quick's `TextField` does so on every paste and again each time
+the clipboard changes. The shell is one process for the whole desktop, so no
+QuickFile text box pastes through Qt: the search field, the name and Quick Nav
+fields and the note editor are TextEdit-based boxes
+(`components/TextBox.qml`) that route the paste keys, a middle click and their
+context menu's Paste to one reader in `Service.qml`. It runs `wl-paste` with a
+fixed argument array, counts the bytes as they arrive, and kills it the moment
+it passes the box's budget — four bytes for each character the box can hold,
+at most 128 KiB — or one second; the paste is then dropped whole with a short
+note in the footer. The text goes in at the cursor, only into the box that
+asked and still has the keyboard, without NUL characters and, on one line,
+with line breaks and tabs as spaces. The read-only path field and preview
+never paste.
 
 QuickFile runs inside the unsandboxed Omarchy shell with the permissions of the
 signed-in user. It collects no telemetry. Its only network-capable path is the

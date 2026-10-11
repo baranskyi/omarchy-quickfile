@@ -1565,6 +1565,36 @@ Item {
     else applyPendingCursor()
   }
 
+  // The box a paste is filling, the read it waits for, and the box's focus
+  // epoch when it asked. An answer that lands after the keyboard has moved
+  // on, or after the box is gone, is dropped rather than typed somewhere the
+  // user is no longer looking.
+  property Item pasteTarget: null
+  property int pasteSerial: 0
+  property int pasteEpoch: 0
+
+  // Every text box pastes through here (components/TextBox.qml), never
+  // through Qt's clipboard reader.
+  function requestPaste(box, primary) {
+    if (!service || !box || box.readOnly) return false
+    var serial = service.readClipboardText(primary === true, box.maximumLength)
+    if (serial <= 0) return false
+    pasteTarget = box
+    pasteSerial = serial
+    pasteEpoch = box.focusEpoch
+    return true
+  }
+
+  function finishPaste(serial, ok, text) {
+    if (serial === 0 || serial !== pasteSerial) return false
+    var box = pasteTarget
+    var epoch = pasteEpoch
+    pasteTarget = null
+    pasteSerial = 0
+    if (!ok || !box || !box.activeFocus || box.focusEpoch !== epoch) return false
+    return box.insertPaste(text)
+  }
+
   function applyPendingCursor() {
     if (!pendingCursorRequested || !service) return
     pendingCursorRequested = false
@@ -1823,6 +1853,9 @@ Item {
     function onKnowledgeLinksFinished(ok, applied, message) {
       if (!ok) root.editorError = message
       else root.editorError = ""
+    }
+    function onClipboardTextRead(serial, ok, text) {
+      root.finishPaste(serial, ok, text)
     }
   }
 
@@ -3015,7 +3048,7 @@ Item {
             onClicked: searchField.forceActiveFocus()
           }
 
-          TextField {
+          Components.TextBox {
             id: searchField
             objectName: "quickfileSearchField"
             anchors.left: parent.left
@@ -3034,6 +3067,7 @@ Item {
             font.pixelSize: root.primaryFontSize
             background: Item {}
             onTextEdited: searchDebounce.restart()
+            onPasteRequested: function(primary) { root.requestPaste(searchField, primary) }
           }
 
           Row {
@@ -3123,6 +3157,7 @@ Item {
 
           Timer {
             id: searchDebounce
+            objectName: "quickfileSearchDebounce"
             interval: root.service && root.service.searchMode === "smart" ? 700 : 180
             onTriggered: if (root.service)
               root.service.setSearch(searchField.text, root.service.searchMode)
@@ -4530,6 +4565,8 @@ Item {
                   ? String(root.service.selectedProperties.path || "")
                   : root.service.selectedEntry
                     ? String(root.service.selectedEntry.path || "") : ""
+              // Read-only is what keeps this TextField off Qt's clipboard
+              // reader; an editable box has to be a TextBox.
               readOnly: true
               selectByMouse: true
               color: root.foreground
@@ -4687,7 +4724,7 @@ Item {
               font.pixelSize: root.secondaryFontSize
               renderType: Text.NativeRendering
             }
-            TextArea {
+            Components.TextBox {
               id: noteEditor
               objectName: "quickfileNoteEditor"
               anchors.left: noteLabel.right
@@ -4697,13 +4734,15 @@ Item {
               anchors.bottom: parent.bottom
               anchors.topMargin: Style.space(4)
               anchors.bottomMargin: Style.space(5)
+              multiline: true
+              // The backend refuses a longer note (NOTE_LENGTH_LIMIT).
+              maximumLength: 16384
               text: root.noteDraft
               placeholderText: "Add a note…"
               color: root.foreground
               placeholderTextColor: Qt.alpha(root.muted, 0.75)
               selectionColor: Style.selectionFill
               selectedTextColor: root.foreground
-              wrapMode: TextEdit.Wrap
               selectByMouse: true
               font.family: Style.font.family
               font.pixelSize: Style.font.bodySmall
@@ -4718,6 +4757,7 @@ Item {
               }
               onTextChanged: if (!root.syncingMetadata && root.noteDraft !== text)
                 root.noteDraft = text
+              onPasteRequested: function(primary) { root.requestPaste(noteEditor, primary) }
               Keys.onPressed: function(event) {
                 if (event.key === Qt.Key_Return
                     && (event.modifiers & Qt.ControlModifier) !== 0) {
@@ -5046,6 +5086,8 @@ Item {
                 height: Math.max(previewScroll.height, contentHeight)
                 text: root.previewTextContent()
                 textFormat: TextEdit.PlainText
+                // Read-only, so no paste key or middle click reaches Qt's
+                // clipboard reader from here.
                 readOnly: true
                 selectByMouse: true
                 wrapMode: TextEdit.Wrap
@@ -5535,7 +5577,7 @@ Item {
                 renderType: Text.NativeRendering
               }
 
-              TextField {
+              Components.TextBox {
                 id: quickNavField
                 objectName: "quickfileQuickNavSearch"
                 visible: root.editorMode === "quick-nav"
@@ -5558,6 +5600,7 @@ Item {
                   root.quickNavQuery = text
                   root.quickNavIndex = 0
                 }
+                onPasteRequested: function(primary) { root.requestPaste(quickNavField, primary) }
                 Keys.onPressed: function(event) {
                   if (event.key === Qt.Key_Down || event.key === Qt.Key_Up) {
                     root.quickNavIndex = Math.max(0, Math.min(root.quickNavResults.length - 1,
@@ -6285,8 +6328,9 @@ Item {
                 renderType: Text.NativeRendering
               }
 
-              TextField {
+              Components.TextBox {
                 id: editorField
+                objectName: "quickfileEditorField"
                 visible: root.editorMode === "new-file"
                   || root.editorMode === "new-folder"
                   || root.editorMode === "rename"
@@ -6304,6 +6348,7 @@ Item {
                   border.color: Style.focusBorderColor
                 }
                 onTextEdited: root.editorValue = text
+                onPasteRequested: function(primary) { root.requestPaste(editorField, primary) }
                 Keys.onEscapePressed: function(event) {
                   root.editorMode = ""
                   root.focusList()

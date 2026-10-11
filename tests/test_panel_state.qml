@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Templates as T
 import QtTest
 import Quickshell
 import qs.Commons
@@ -122,6 +123,28 @@ ShellRoot {
       return true
     }
     function persistSettings() { settingsSaves++; return true }
+    // The bounded clipboard reader: what it would run and how it is stopped
+    // are recorded; the test answers for wl-paste.
+    property var clipboardLaunches: []
+    property var clipboardSignals: []
+    function startClipboardReadProcess(command) {
+      clipboardLaunches.push(command)
+      return true
+    }
+    function signalClipboardRead(signalNumber) {
+      clipboardSignals.push(signalNumber)
+      return true
+    }
+  }
+
+  // Keys and clicks go through the real window, so a paste Qt handled itself
+  // would show up in the box.
+  TestEvent { id: input }
+
+  // Seeds the in-process clipboard of the offscreen platform with text a
+  // native paste would insert.
+  Item {
+    TextEdit { id: clipboardSeed; text: "NATIVE" }
   }
 
   Quickfile.Panel {
@@ -420,6 +443,283 @@ ShellRoot {
         && fixture.selectedToken === fixture.entries[0].token,
       "Escape from a search started without a selection did not land on the "
         + "first row")
+  }
+
+  function lastLaunch() {
+    var launches = fixture.clipboardLaunches
+    return launches.length > 0 ? JSON.stringify(launches[launches.length - 1]) : ""
+  }
+
+  function walkItems(item, visit) {
+    if (!item) return
+    visit(item)
+    var children = item.children || []
+    for (var i = 0; i < children.length; i++) walkItems(children[i], visit)
+  }
+
+  // Qt's clipboard reader buffers another client's whole offer, with no byte
+  // cap or deadline, inside the one process that runs the desktop shell. No
+  // text box may reach it: not by the paste keys, a middle click or its menu,
+  // and not by merely existing, which a TextField does by re-reading the
+  // clipboard on every change. Pastes go through the bounded reader instead.
+  function pasteChecks() {
+    var clipboardText = JSON.stringify(["/usr/bin/env", "wl-paste", "--no-newline",
+      "--type", "text/plain;charset=utf-8"])
+    var primaryText = JSON.stringify(["/usr/bin/env", "wl-paste", "--no-newline",
+      "--primary", "--type", "text/plain;charset=utf-8"])
+    var search = objectFinder.findChild(panel, "quickfileSearchField")
+    var debounce = objectFinder.findChild(panel, "quickfileSearchDebounce")
+    var footer = objectFinder.findChild(panel, "quickfileFooterStatus")
+    check(search !== null && debounce !== null && footer !== null,
+      "could not find the search box, its debounce or the footer")
+
+    // An editable TextInput reads the whole clipboard text whenever the
+    // clipboard changes, and an editable TextEdit pastes through Qt; only
+    // read-only ones may remain beside the TextBoxes.
+    var window = objectFinder.findChild(panel, "quickfilePanelWindow")
+    var boxes = 0
+    var readOnlyTexts = 0
+    walkItems(window.contentItem, function(item) {
+      var isBox = typeof item.insertPaste === "function" && item.pasteRequested !== undefined
+      if (isBox) boxes++
+      else if (item.echoMode !== undefined || item.textDocument !== undefined) {
+        check(item.readOnly === true, "an editable Qt text item remains in the panel: " + item)
+        readOnlyTexts++
+      }
+    })
+    check(boxes === 4 && readOnlyTexts === 2,
+      "the panel's text items are not the four TextBoxes and two read-only views: "
+        + boxes + " / " + readOnlyTexts)
+
+    clipboardSeed.selectAll()
+    clipboardSeed.copy()
+    // The control: a plain Qt text item would paste the seed.
+    var nativeProbe = Qt.createQmlObject("import QtQuick; TextInput {}", window.contentItem)
+    nativeProbe.paste()
+    check(nativeProbe.text === "NATIVE", "the offscreen clipboard was not seeded")
+    nativeProbe.destroy()
+    panel.beginSearch()
+    check(search.activeFocus, "the slash path did not focus the search box")
+    search.text = "ab"
+    search.cursorPosition = 1
+    var launches = fixture.clipboardLaunches.length
+
+    input.keyClick(Qt.Key_V, Qt.ControlModifier, -1)
+    check(search.text === "ab", "Ctrl+V pasted through Qt: " + search.text)
+    check(fixture.clipboardLaunches.length === launches + 1 && lastLaunch() === clipboardText,
+      "Ctrl+V did not ask the bounded reader: " + lastLaunch())
+    check(panel.pasteTarget === search && panel.pasteSerial > 0
+        && fixture.clipboardReadBudget === Math.min(131072, search.maximumLength * 4 + 8),
+      "the paste was not bound to the search box and its budget: "
+        + fixture.clipboardReadBudget)
+    fixture.handleClipboardReadProgress(3)
+    fixture.handleClipboardReadExit(0, "x\ty")
+    check(search.text === "ax yb" && search.cursorPosition === 4,
+      "the read was not inserted at the cursor on one line: " + JSON.stringify(search.text))
+    check(debounce.running, "a paste did not count as an edit for the search")
+    check(panel.pasteTarget === null && panel.pasteSerial === 0
+        && !fixture.clipboardReadBusy && !fixture.clipboardReadDeadlineArmed,
+      "a finished paste left the reader or its deadline armed")
+
+    search.select(0, 2)
+    input.keyClick(Qt.Key_Insert, Qt.ShiftModifier, -1)
+    check(search.text === "ax yb" && lastLaunch() === clipboardText
+        && fixture.clipboardLaunches.length === launches + 2,
+      "Shift+Insert pasted through Qt or did not ask the reader")
+    fixture.handleClipboardReadExit(0, "Q")
+    check(search.text === "Q yb" && search.cursorPosition === 1,
+      "a paste did not replace the selection: " + search.text)
+
+    input.keyClick(Qt.Key_Paste, Qt.NoModifier, -1)
+    check(search.text === "Q yb" && fixture.clipboardLaunches.length === launches + 3,
+      "the Paste key pasted through Qt or did not ask the reader")
+    fixture.handleClipboardReadExit(1, "")
+    check(lastLaunch().indexOf("\"text/plain\"") >= 0
+        && fixture.clipboardLaunches.length === launches + 4,
+      "a clipboard without UTF-8 text was not asked for plain text")
+    fixture.handleClipboardReadExit(1, "")
+    check(search.text === "Q yb" && !fixture.clipboardReadBusy,
+      "a clipboard without text changed the box or kept the reader busy")
+
+    // The limit holds for a paste as it does for typing, and SMART's own
+    // limit sets the budget.
+    var mode = fixture.searchMode
+    fixture.searchMode = "smart"
+    search.text = new Array(510).join("x")
+    search.cursorPosition = search.length
+    input.keyClick(Qt.Key_V, Qt.ControlModifier, -1)
+    check(search.maximumLength === 512 && fixture.clipboardReadBudget === 512 * 4 + 8,
+      "a SMART paste did not ask for SMART's budget: " + fixture.clipboardReadBudget)
+    fixture.handleClipboardReadExit(0, "12345")
+    check(search.length === 512 && search.text.substring(509) === "123",
+      "a paste overran the SMART limit: " + search.length)
+    input.keyClick(Qt.Key_Z, Qt.NoModifier, -1)
+    check(search.length === 512, "typing overran the SMART limit")
+    fixture.searchMode = mode
+
+    // An answer for a box the keyboard has left is dropped.
+    search.text = "kept"
+    input.keyClick(Qt.Key_V, Qt.ControlModifier, -1)
+    panel.focusList()
+    fixture.handleClipboardReadExit(0, "late")
+    check(search.text === "kept", "a paste landed after the focus moved: " + search.text)
+    panel.beginSearch()
+    input.keyClick(Qt.Key_V, Qt.ControlModifier, -1)
+    panel.focusList()
+    panel.beginSearch()
+    fixture.handleClipboardReadExit(0, "late")
+    check(search.text === "kept",
+      "a paste landed after the focus left and came back: " + search.text)
+
+    // Past the byte budget or the deadline the reader is killed and the paste
+    // dropped whole; a late exit changes nothing.
+    var signals = fixture.clipboardSignals.length
+    input.keyClick(Qt.Key_V, Qt.ControlModifier, -1)
+    fixture.handleClipboardReadProgress(fixture.clipboardReadBudget + 1)
+    check(fixture.clipboardSignals.length === signals + 1
+        && fixture.clipboardSignals[signals] === 9 && !fixture.clipboardReadBusy,
+      "a read past its byte budget was not killed")
+    check(footer.text === "Clipboard text is too long to paste here",
+      "an oversized paste was not explained: " + footer.text)
+    fixture.handleClipboardReadExit(0, "far too much")
+    check(search.text === "kept", "an oversized paste reached the box")
+    input.keyClick(Qt.Key_V, Qt.ControlModifier, -1)
+    fixture.expireClipboardRead()
+    check(fixture.clipboardSignals.length === signals + 2
+        && fixture.clipboardSignals[signals + 1] === 9 && !fixture.clipboardReadBusy,
+      "a read past its deadline was not killed")
+    check(footer.text === "The clipboard did not answer in time",
+      "a stalled paste was not explained: " + footer.text)
+    fixture.handleClipboardReadExit(0, "too late")
+    check(search.text === "kept", "a stalled paste reached the box")
+
+    // A middle click pastes the primary selection where it lands.
+    search.text = "abc"
+    search.cursorPosition = 0
+    launches = fixture.clipboardLaunches.length
+    input.mouseClick(search, search.width - 2, search.height / 2, Qt.MiddleButton,
+      Qt.NoModifier, -1)
+    check(fixture.clipboardLaunches.length === launches + 1 && lastLaunch() === primaryText,
+      "a middle click did not ask for the primary selection: " + lastLaunch())
+    check(search.text === "abc" && search.cursorPosition === 3,
+      "a middle click pasted through Qt or did not place the cursor")
+    fixture.handleClipboardReadExit(0, "P")
+    check(search.text === "abcP", "the primary selection was not inserted: " + search.text)
+
+    // The context menu is the box's own: its Paste is the bounded one, and no
+    // entry carries Qt's paste action or its shortcut.
+    var menu = search.contextMenu
+    check(menu !== null && search.T.ContextMenu.menu === menu,
+      "the box's context menu is not its own")
+    var pasteItem = null
+    for (var m = 0; m < menu.count; m++) {
+      var entry = menu.itemAt(m)
+      check(!entry || entry.action === undefined || entry.action === null,
+        "a menu entry runs a Qt action: " + (entry ? entry.text : ""))
+      if (entry && entry.objectName === "quickfileTextBoxPaste") pasteItem = entry
+    }
+    check(pasteItem !== null && pasteItem.text === "Paste", "the box's menu has no Paste")
+    // On Wayland the menu is an item in the panel's own window, as here; the
+    // offscreen platform would otherwise give it a window that takes the
+    // keyboard with it when it closes.
+    menu.popupType = T.Popup.Item
+    input.mouseClick(search, 10, search.height / 2, Qt.RightButton, Qt.NoModifier, -1)
+    check(menu.visible, "a right click did not open the box's menu")
+    search.text = "menu"
+    search.cursorPosition = 4
+    launches = fixture.clipboardLaunches.length
+    pasteItem.triggered()
+    menu.close()
+    check(search.text === "menu" && fixture.clipboardLaunches.length === launches + 1
+        && lastLaunch() === clipboardText,
+      "the menu's Paste pasted through Qt or did not ask the reader")
+    fixture.handleClipboardReadExit(0, "!")
+    check(search.text === "menu!", "the menu's paste was not inserted: " + search.text)
+
+    // Return on one line is never a newline.
+    input.keyClick(Qt.Key_Return, Qt.NoModifier, -1)
+    check(search.text === "menu!", "Return reached the search text")
+
+    // A long line keeps the cursor in view.
+    search.text = new Array(200).join("w")
+    search.cursorPosition = search.length
+    check(search.scrollX > 0 && search.cursorRectangle.x >= 0
+        && search.cursorRectangle.x + search.cursorRectangle.width <= search.width,
+      "a long line did not scroll to its cursor: " + search.scrollX)
+    search.cursorPosition = 0
+    check(search.scrollX === 0, "a long line did not scroll back to its start")
+
+    // The keys TextField let through still reach the panel: the arrows move
+    // the list cursor and Escape leaves search.
+    debounce.stop()
+    search.text = "row"
+    var cursorBefore = panel.keyboardIndex
+    input.keyClick(Qt.Key_Down, Qt.NoModifier, -1)
+    check(search.activeFocus && search.text === "row"
+        && panel.keyboardIndex === Math.min(cursorBefore + 1, fixture.entries.length - 1),
+      "Down in search did not move the list cursor: " + cursorBefore + " → "
+        + panel.keyboardIndex)
+    input.keyClick(Qt.Key_Escape, Qt.NoModifier, -1)
+    var listFocus = objectFinder.findChild(panel, "quickfileListFocus")
+    check(search.text === "" && listFocus.activeFocus && !debounce.running,
+      "Escape did not leave search, or the cleared box counted as an edit")
+
+    // The name box feeds the dialog's value through the same edit signal.
+    panel.editorMode = "new-file"
+    panel.editorValue = ""
+    var editorField = objectFinder.findChild(panel, "quickfileEditorField")
+    check(editorField !== null && editorField.visible, "the name box did not open")
+    editorField.forceActiveFocus()
+    input.keyClick(Qt.Key_V, Qt.ControlModifier, -1)
+    check(editorField.text === "", "Ctrl+V pasted a name through Qt")
+    fixture.handleClipboardReadExit(0, "new\r\nname")
+    check(editorField.text === "new name" && panel.editorValue === "new name",
+      "a pasted name did not reach the dialog as one line: " + JSON.stringify(panel.editorValue))
+    panel.editorMode = ""
+    panel.focusList()
+
+    // The note keeps its line breaks and the backend's limit.
+    fixture.inspectorTab = "notes"
+    panel.inspectorOpen = true
+    var noteEditor = objectFinder.findChild(panel, "quickfileNoteEditor")
+    noteEditor.forceActiveFocus()
+    noteEditor.text = "line"
+    noteEditor.cursorPosition = 4
+    input.keyClick(Qt.Key_V, Qt.ControlModifier, -1)
+    check(noteEditor.text === "line" && fixture.clipboardReadBudget === 16384 * 4 + 8,
+      "Ctrl+V in the note pasted through Qt or asked for the wrong budget")
+    fixture.handleClipboardReadExit(0, "\r\nnext\u0000")
+    check(noteEditor.text === "line\nnext" && panel.noteDraft === "line\nnext",
+      "a pasted note lost its line break or kept a NUL: " + JSON.stringify(noteEditor.text))
+    input.keyClick(Qt.Key_Return, Qt.NoModifier, -1)
+    check(noteEditor.text === "line\nnext\n", "Return in the note was not a newline")
+    check(!fixture.clipboardReadBusy, "the note's paste left the reader busy")
+    noteEditor.text = ""
+    panel.noteDraft = ""
+    panel.inspectorOpen = false
+    fixture.actionMessage = ""
+    panel.focusList()
+  }
+
+  // A box destroyed while its paste is in flight takes nothing when the
+  // answer lands. Destruction happens on the event loop, so the answer comes
+  // from the next timer.
+  function startGoneBoxPaste() {
+    var window = objectFinder.findChild(panel, "quickfilePanelWindow")
+    var component = Qt.createComponent("plugin/components/TextBox.qml")
+    check(component.status === Component.Ready,
+      "could not build a stand-alone text box: " + component.errorString())
+    var box = component.createObject(window.contentItem, { width: 120, height: 30 })
+    check(panel.requestPaste(box, false) && panel.pasteTarget === box,
+      "a paste was not bound to the stand-alone box")
+    box.destroy()
+  }
+
+  function goneBoxChecks() {
+    check(panel.pasteTarget === null, "a paste kept hold of a destroyed box")
+    fixture.handleClipboardReadExit(0, "orphan")
+    check(panel.pasteSerial === 0 && !fixture.clipboardReadBusy,
+      "the answer for a destroyed box was not dropped")
   }
 
   function sortChecks() {
@@ -2060,8 +2360,12 @@ ShellRoot {
         // inspector outline that nothing has asked for yet.
         testRoot.focusPulseChecks()
         testRoot.shortcutChecks()
+        // After the pulse checks too: real key and mouse events run the row
+        // outlines that leaving search queued.
+        testRoot.pasteChecks()
         testRoot.devicesChecks()
         testRoot.offlineSearchChecks()
+        testRoot.startGoneBoxPaste()
         // The revealed row marks itself once the view has scrolled to it.
         offlineRevealTimer.start()
         return
@@ -2077,6 +2381,7 @@ ShellRoot {
     interval: 50
     onTriggered: {
       try {
+        testRoot.goneBoxChecks()
         testRoot.offlineRevealChecks()
         if (testRoot.captureIfRequested()) return
         console.log("QUICKFILE_TESTS_PASSED panel-state " + testRoot.assertions + " assertions")

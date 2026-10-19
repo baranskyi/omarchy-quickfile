@@ -8,6 +8,7 @@ import Quickshell
 import Quickshell.Hyprland
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Commons
 import "components" as Components
 import "components/plaintext.js" as PlainText
 
@@ -75,11 +76,15 @@ Item {
   readonly property int bladeWidth: Style.space(410)
   // Only the initial size; the compositor owns the window from then on.
   readonly property int bladeHeight: Style.space(1100)
-  readonly property color background: Color.popups.background
-  readonly property color foreground: Color.popups.text
-  readonly property color borderColor: Color.popups.border
-  readonly property color muted: Color.muted
-  readonly property color accent: Color.accent
+  // Always reach the theme through the `Commons` qualifier. Qt 6.12 added its
+  // own `Color` singleton to QtQuick, and an unqualified `Color` can resolve to
+  // it instead of Omarchy's: every theme read here then fails, the window
+  // falls back to black and stops following theme switches.
+  readonly property color background: Commons.Color.popups.background
+  readonly property color foreground: Commons.Color.popups.text
+  readonly property color borderColor: Commons.Color.popups.border
+  readonly property color muted: Commons.Color.muted
+  readonly property color accent: Commons.Color.accent
   readonly property int primaryFontSize: Style.font.subtitle
   readonly property int secondaryFontSize: Style.font.body
   // Brown is no longer offered. It stays in the palette resolver and in the
@@ -157,7 +162,7 @@ Item {
   function paletteColor(key) {
     var name = String(key || "")
     if (itemPalette[name]) return String(itemPalette[name])
-    if (name === "red") return Color.urgent
+    if (name === "red") return Commons.Color.urgent
     if (name === "blue") return root.accent
     var fallback = ({
       yellow: "#d0a215", orange: "#d0772b", green: "#879a39",
@@ -932,7 +937,7 @@ Item {
   function knowledgeLinkStatusColor(status) {
     var value = String(status || "")
     if (value === "connected") return root.paletteColor("green")
-    if (value === "conflict") return Color.urgent
+    if (value === "conflict") return Commons.Color.urgent
     return root.accent
   }
 
@@ -2106,7 +2111,7 @@ Item {
     implicitWidth: actionContent.implicitWidth + Style.space(16)
     implicitHeight: Style.space(28)
     radius: Style.cornerRadius > 0 ? Style.space(5) : 0
-    color: destructive ? Qt.alpha(Color.urgent, actionMouse.containsMouse ? 0.24 : 0.12)
+    color: destructive ? Qt.alpha(Commons.Color.urgent, actionMouse.containsMouse ? 0.24 : 0.12)
       : actionMouse.containsMouse ? Style.hoverFill : Style.normalFill
     opacity: enabled ? 1 : 0.35
     Row {
@@ -2757,7 +2762,7 @@ Item {
                     : root.service.semanticState === "update-required" ? "Smart Search update required"
                     : root.service.semanticState === "failed" ? "Setup failed" : "Not installed"
                   color: root.service && (root.service.semanticState === "failed"
-                    || root.service.semanticHelperFailed) ? Color.urgent : root.foreground
+                    || root.service.semanticHelperFailed) ? Commons.Color.urgent : root.foreground
                   elide: Text.ElideRight
                   font.family: Style.font.family
                   font.pixelSize: Style.font.bodySmall
@@ -2833,7 +2838,7 @@ Item {
               visible: root.service && String(root.service.semanticError || "") !== ""
               width: parent.width
               text: root.service ? String(root.service.semanticError || "") : ""
-              color: Color.urgent
+              color: Commons.Color.urgent
               elide: Text.ElideRight
               font.family: Style.font.family
               font.pixelSize: Style.font.caption
@@ -2940,7 +2945,7 @@ Item {
               visible: root.service && String(root.service.settingsError || "") !== ""
               width: parent.width
               text: root.service ? String(root.service.settingsError || "") : ""
-              color: Color.urgent
+              color: Commons.Color.urgent
               elide: Text.ElideRight
               font.family: Style.font.family
               font.pixelSize: Style.font.caption
@@ -3415,7 +3420,7 @@ Item {
                   : root.service.sessionsError !== ""
                     ? root.service.sessionsError : "No active terminal sessions here"
               color: root.service && root.service.sessionsError !== ""
-                ? Color.urgent : root.muted
+                ? Commons.Color.urgent : root.muted
               elide: Text.ElideRight
               font.family: Style.font.family
               font.pixelSize: Style.font.bodySmall
@@ -3468,7 +3473,7 @@ Item {
               : root.service.volumesError !== "" ? "DEVICE ERROR"
               : root.devicesSummary()
             color: root.service && root.service.volumesError !== ""
-              ? Color.urgent : root.muted
+              ? Commons.Color.urgent : root.muted
             font.family: Style.font.family
             font.pixelSize: Style.font.bodySmall
             renderType: Text.NativeRendering
@@ -3758,7 +3763,7 @@ Item {
               anchors.rightMargin: Style.space(11)
               anchors.verticalCenter: parent.verticalCenter
               text: "󰅖"
-              color: unstarMouse.containsMouse ? Color.urgent : root.muted
+              color: unstarMouse.containsMouse ? Commons.Color.urgent : root.muted
               font.family: Style.font.family
               font.pixelSize: root.secondaryFontSize
               renderType: Text.NativeRendering
@@ -3859,7 +3864,7 @@ Item {
                 + (root.service.knowledgeTruncated ? "+" : "")
                 + " files  ·  ≈" + root.compactTokens(root.service.knowledgeTotalTokens))
             color: root.service && root.service.knowledgeError !== ""
-              ? Color.urgent : root.muted
+              ? Commons.Color.urgent : root.muted
             font.family: Style.font.family
             font.pixelSize: Style.font.caption
             renderType: Text.NativeRendering
@@ -5113,7 +5118,7 @@ Item {
               textFormat: Text.PlainText
               wrapMode: Text.Wrap
               horizontalAlignment: Text.AlignHCenter
-              color: root.service && root.service.previewError ? Color.urgent : root.muted
+              color: root.service && root.service.previewError ? Commons.Color.urgent : root.muted
               font.family: Style.font.family
               font.pixelSize: Style.font.bodySmall
             }
@@ -5355,7 +5360,7 @@ Item {
                 textFormat: Text.PlainText
                 anchors.verticalCenter: parent.verticalCenter
                 text: root.gitLabel(fileRow.modelData.git)
-                color: text === "D" ? Color.urgent : root.accent
+                color: text === "D" ? Commons.Color.urgent : root.accent
                 visible: text !== ""
                 font.family: Style.font.family
                 font.pixelSize: Style.font.bodySmall
@@ -5471,7 +5476,7 @@ Item {
             textFormat: Text.PlainText
             anchors.horizontalCenter: parent.horizontalCenter
             text: root.service && root.service.errorMessage ? "󰅚" : "󰉖"
-            color: root.service && root.service.errorMessage ? Color.urgent : root.muted
+            color: root.service && root.service.errorMessage ? Commons.Color.urgent : root.muted
             font.family: Style.font.family
             font.pixelSize: Style.space(28)
             renderType: Text.NativeRendering
@@ -5702,7 +5707,7 @@ Item {
                     ? "Loading locations…" : "No matching locations"
                 textFormat: Text.PlainText
                 wrapMode: Text.Wrap
-                color: root.service && root.service.quickNavError ? Color.urgent : root.muted
+                color: root.service && root.service.quickNavError ? Commons.Color.urgent : root.muted
                 font.family: Style.font.family
                 font.pixelSize: Style.font.caption
               }
@@ -5746,7 +5751,7 @@ Item {
                   ? "Existing items below will be moved to Trash, then replaced with the incoming items. Undo restores them."
                   : "Choose how to handle the existing destination items."
                 wrapMode: Text.Wrap
-                color: root.editorMode === "conflict-replace" ? Color.urgent : root.foreground
+                color: root.editorMode === "conflict-replace" ? Commons.Color.urgent : root.foreground
                 font.family: Style.font.family
                 font.pixelSize: Style.font.bodySmall
               }
@@ -6069,7 +6074,7 @@ Item {
                     + "local after setup; file names, paths, and contents are never sent to the model."
                   : "The isolated environment and model will be moved to Trash. QuickFile "
                     + "metadata, notes, and files are not affected."
-                color: root.editorMode === "semantic-remove" ? Color.urgent : root.foreground
+                color: root.editorMode === "semantic-remove" ? Commons.Color.urgent : root.foreground
                 font.family: Style.font.family
                 font.pixelSize: Style.font.bodySmall
                 renderType: Text.NativeRendering
@@ -6193,7 +6198,7 @@ Item {
                   : root.service.trashBusy ? "Loading Trash…"
                   : root.service.trashError ? root.service.trashError
                   : "Trash is empty"
-                color: root.service && root.service.trashError ? Color.urgent : root.muted
+                color: root.service && root.service.trashError ? Commons.Color.urgent : root.muted
                 font.family: Style.font.family
                 font.pixelSize: Style.font.caption
                 renderType: Text.NativeRendering
@@ -6366,7 +6371,7 @@ Item {
                 width: parent.width
                 wrapMode: Text.Wrap
                 text: root.editorError
-                color: Color.urgent
+                color: Commons.Color.urgent
                 font.family: Style.font.family
                 font.pixelSize: Style.font.caption
                 renderType: Text.NativeRendering

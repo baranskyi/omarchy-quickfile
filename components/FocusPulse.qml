@@ -1,5 +1,6 @@
 import QtQuick
 import qs.Commons
+import qs.Commons as Commons
 
 // A one-shot outline that brightens and fades where the keyboard just landed,
 // so a jump between the search field, the list and the inspector is visible
@@ -8,7 +9,7 @@ import qs.Commons
 Rectangle {
   id: root
 
-  property color pulseColor: Color.accent
+  property color pulseColor: Commons.Color.accent
   // Fast enough to read as a flash rather than a state change.
   property int riseDuration: 110
   property int holdDuration: 90

@@ -1,5 +1,5 @@
 import QtQuick
-import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 
 BarWidget {
@@ -43,7 +43,7 @@ BarWidget {
           active: button.active
           activeBackgroundColor: button.foreground
           activeForegroundColor: root.bar
-            ? root.bar.background : Color.background
+            ? root.bar.background : Commons.Color.background
         }
       }
     }

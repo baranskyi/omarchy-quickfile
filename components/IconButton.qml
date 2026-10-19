@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import qs.Commons
+import qs.Commons as Commons
 import "plaintext.js" as PlainText
 
 Rectangle {
@@ -28,7 +29,7 @@ Rectangle {
     textFormat: Text.PlainText
     anchors.centerIn: parent
     text: root.glyph
-    color: root.active ? Color.accent : Color.popups.text
+    color: root.active ? Commons.Color.accent : Commons.Color.popups.text
     font.family: Style.font.family
     font.pixelSize: Style.font.body
     renderType: Text.NativeRendering

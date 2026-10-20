@@ -1814,7 +1814,10 @@ Item {
   Connections {
     target: root.service
     function onConflictRequested(conflicts) {
-      root.conflictRows = Array.isArray(conflicts) ? conflicts.slice() : []
+      // Qt 6.12 hands a var signal argument over as a list, which is not a
+      // JS array: Array.isArray() is false and it has no slice().
+      root.conflictRows = conflicts && typeof conflicts === "object"
+        && typeof conflicts.length === "number" ? Array.prototype.slice.call(conflicts) : []
       root.editorError = ""
       root.editorMode = "conflict"
     }

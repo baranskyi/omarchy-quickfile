@@ -29,6 +29,9 @@ Item {
   property var pendingTrashEntry: null
   property var pendingForgetVolume: null
   property var pendingDrop: null
+  // QuickFile's own drag while it runs: the row it started from and the tokens
+  // it carries. A drop takes its tokens from here, never from the drag's data.
+  property var internalDrag: null
   property var conflictRows: []
   // Quick Nav is switched off pending a reason to keep it: the location bar,
   // Favorites and the tree already cover getting somewhere. The implementation
@@ -510,74 +513,58 @@ Item {
     return names[String(entry.kind || entry.source || "")] || "Folder"
   }
 
+  // What a row offers other apps when it is dragged out of the panel. QuickFile
+  // never reads it back: its own drops take their tokens from internalDrag.
   function dragMimeData(entry) {
     if (!service || !entry || service.isOfflineEntry(entry)) return ({})
     return ({
-      "application/x-quickfile-tokens": JSON.stringify(
-        service.effectiveSelectionTokens(String(entry.token || ""))),
       "text/uri-list": service.dragUriList(entry),
       "text/plain": service.dragText(entry)
     })
   }
 
-  function directoryDropPayload(event) {
-    if (!event) return null
-    var canReadMime = typeof event.getDataAsString === "function"
-    var formats = event.formats || []
-    if (formats.indexOf("application/x-quickfile-tokens") >= 0) {
-      if (!canReadMime) return null
-      var raw = event.getDataAsString("application/x-quickfile-tokens")
-      if (raw.length > 1048576) return null
-      var tokens = null
-      try { tokens = JSON.parse(raw) } catch (error) { return null }
-      if (!Array.isArray(tokens) || tokens.length === 0 || tokens.length > 500) return null
-      for (var i = 0; i < tokens.length; i++) {
-        if (typeof tokens[i] !== "string" || tokens[i] === "" || tokens[i].length > 32768)
-          return null
-      }
-      return ({ tokens: tokens.slice(), uris: [] })
-    }
-    if (formats.indexOf("text/uri-list") < 0 && !(event.urls && event.urls.length > 0)) return null
-    var uris = []
-    var uriText = canReadMime ? event.getDataAsString("text/uri-list") : ""
-    if (uriText.length > 4194304) return null
-    var lines = uriText.split(/\r?\n/)
-    // Only URI-list is interpreted. text/plain may contain arbitrary prose or
-    // shell quoting and is deliberately never treated as filesystem paths.
-    for (var j = 0; j < lines.length; j++) {
-      var uri = String(lines[j]).trim()
-      if (uri === "" || uri.charAt(0) === "#") continue
-      if (uri.indexOf("file://") !== 0 || uri.length > 32768 || uris.length >= 500) return null
-      uris.push(uri)
-    }
-    if (uris.length === 0 && event.urls) {
-      for (var k = 0; k < event.urls.length; k++) {
-        var value = String(event.urls[k])
-        if (value.indexOf("file://") !== 0 || value.length > 32768 || uris.length >= 500)
-          return null
-        uris.push(value)
-      }
-    }
-    return uris.length > 0 ? ({ tokens: [], uris: uris }) : null
+  // A row's drag registers itself as it starts and clears itself as it ends;
+  // the drop it lands as, if any, comes in between.
+  function beginInternalDrag(source, entry) {
+    internalDrag = null
+    if (!service || !source || !entry || service.isOfflineEntry(entry)) return false
+    var tokens = service.effectiveSelectionTokens(String(entry.token || ""))
+    if (tokens.length === 0) return false
+    internalDrag = ({ source: source, tokens: tokens.slice() })
+    return true
   }
 
+  function endInternalDrag(source) {
+    if (internalDrag && internalDrag.source === source) internalDrag = null
+  }
+
+  // What a drop into a folder carries: the tokens of QuickFile's own running
+  // drag, or null for any other drag. Nothing here, or anywhere a drag is
+  // handled, reads the drag's data. For a drag from another client Qt reads
+  // that data off the Wayland offer to the end on the shell's GUI thread, with
+  // no byte cap and no deadline (QWaylandMimeData::readData), and the shell is
+  // one process for the whole desktop: getDataAsString, urls, text and html
+  // all take that path. source and supportedActions read nothing. Qt reports
+  // the row a drag started from as its source only while that drag runs in
+  // this process; another client's drag has none.
+  function directoryDropPayload(event) {
+    var running = internalDrag
+    if (!event || !running || !event.source || event.source !== running.source) return null
+    return ({ tokens: running.tokens.slice(), uris: [] })
+  }
+
+  // Hover and drop ask the same question, so a folder never lights up for a
+  // drop it would then refuse, itself among them.
   function canEnterDirectoryDrop(event, destination) {
     if (!event || !service || service.actionBusy || editorMode !== "" || !destination
         || destination.isDir !== true || !destination.token
         || (event.supportedActions & Qt.CopyAction) === 0) return false
-    var formats = event.formats || []
-    return formats.indexOf("application/x-quickfile-tokens") >= 0
-      || formats.indexOf("text/uri-list") >= 0 || !!(event.urls && event.urls.length > 0)
-  }
-
-  function canAcceptDirectoryDrop(event, destination) {
-    if (!canEnterDirectoryDrop(event, destination)) return false
     var payload = directoryDropPayload(event)
     return payload !== null && payload.tokens.indexOf(String(destination.token)) < 0
   }
 
   function beginDirectoryDrop(event, destination) {
-    if (!canAcceptDirectoryDrop(event, destination)) return false
+    if (!canEnterDirectoryDrop(event, destination)) return false
     var payload = directoryDropPayload(event)
     pendingDrop = ({ destinationToken: String(destination.token),
       destinationPath: String(destination.path || destination.name || "Folder"),
@@ -1875,19 +1862,17 @@ Item {
     z: 6
     enabled: root.service && !root.service.actionBusy && root.editorMode === ""
       && !!destinationEntry && destinationEntry.isDir === true
-    // DropArea.keys filters Drag.keys, not MIME formats. Leave it empty so
-    // native file-manager drags can enter; canEnterDirectoryDrop() and
-    // directoryDropPayload() validate the advertised and delivered MIME data.
+    // DropArea.keys filters Drag.keys, not MIME formats, and an automatic
+    // drag has only its formats for keys. Leave it empty: the drag's source,
+    // not its data, decides (directoryDropPayload()).
     keys: []
     onEntered: function(drag) {
-      // Wayland sources may supply their actual data only after the drop.
-      // Hover inspects advertised types; payload validation happens on drop.
       drag.accepted = root.canEnterDirectoryDrop(drag, destinationEntry)
     }
     onDropped: function(drop) {
       if (root.beginDirectoryDrop(drop, destinationEntry)) {
-        // The backend owns both copy and move. Do not ask an external drag
-        // source to delete anything while our choice/transfer is still pending.
+        // The backend owns both copy and move. The drag itself ends as a copy,
+        // so nothing removes the source while the choice is still pending.
         drop.accept(Qt.CopyAction)
       } else drop.accepted = false
     }
@@ -3816,6 +3801,8 @@ Item {
             Drag.dragType: Drag.Automatic
             Drag.supportedActions: Qt.CopyAction | Qt.MoveAction
             Drag.mimeData: root.dragMimeData(favoriteRow.modelData)
+            Drag.onDragStarted: root.beginInternalDrag(favoriteRow, favoriteRow.modelData)
+            Drag.onDragFinished: root.endInternalDrag(favoriteRow)
           }
 
           ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
@@ -4053,6 +4040,8 @@ Item {
             Drag.dragType: Drag.Automatic
             Drag.supportedActions: Qt.CopyAction | Qt.MoveAction
             Drag.mimeData: root.dragMimeData(knowledgeRow.modelData)
+            Drag.onDragStarted: root.beginInternalDrag(knowledgeRow, knowledgeRow.modelData)
+            Drag.onDragFinished: root.endInternalDrag(knowledgeRow)
           }
 
           ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
@@ -5448,6 +5437,8 @@ Item {
             Drag.dragType: Drag.Automatic
             Drag.supportedActions: Qt.CopyAction | Qt.MoveAction
             Drag.mimeData: root.dragMimeData(fileRow.modelData)
+            Drag.onDragStarted: root.beginInternalDrag(fileRow, fileRow.modelData)
+            Drag.onDragFinished: root.endInternalDrag(fileRow)
 
             MouseArea {
               anchors.left: parent.left

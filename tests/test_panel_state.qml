@@ -312,9 +312,26 @@ ShellRoot {
         + "that shows no confirm button")
   }
 
-  function dropEvent(formats, values) {
-    return { formats: formats, supportedActions: Qt.CopyAction | Qt.MoveAction,
-      getDataAsString: function(format) { return values[format] || "" } }
+  // A drag event as a DropArea hands it over, from the given source. Each
+  // accessor that would read the drag's data logs the read and throws: for
+  // another client's drag Qt reads that data off the Wayland offer to the end,
+  // with no byte cap and no deadline.
+  property var dragReads: []
+  function dragEvent(source, formats) {
+    function read(name) {
+      dragReads.push(name)
+      throw new Error("the drop read the drag's " + name)
+    }
+    return {
+      source: source, formats: formats || [],
+      supportedActions: Qt.CopyAction | Qt.MoveAction,
+      get urls() { return read("urls") },
+      get text() { return read("text") },
+      get html() { return read("html") },
+      get colorData() { return read("colorData") },
+      getDataAsString: function(format) { return read(format) },
+      getDataAsArrayBuffer: function(format) { return read(format) }
+    }
   }
 
   // A filename is untrusted input. Rendered as rich text, a name like
@@ -1362,45 +1379,54 @@ ShellRoot {
     check(nativeDropTarget && nativeDropTarget.keys.length === 0,
       "drop target filtered MIME drags through unrelated Drag.keys: "
         + (nativeDropTarget ? String(nativeDropTarget.keys) : "missing"))
-    check(panel.canEnterDirectoryDrop({ formats: ["text/uri-list"], supportedActions: Qt.CopyAction,
-      getDataAsString: function() { throw new Error("payload read before native drop") } }, destination),
-      "drag hover tried to read native data before drop")
-    var internal = dropEvent(["application/x-quickfile-tokens"], {
-      "application/x-quickfile-tokens": JSON.stringify(["one-token", "two-token"])
-    })
+    var dragRow = Qt.createQmlObject("import QtQuick; QtObject {}", testRoot, "dragRow")
+    var otherRow = Qt.createQmlObject("import QtQuick; QtObject {}", testRoot, "otherRow")
+    var advertised = ["application/x-quickfile-tokens", "text/uri-list", "text/plain"]
+    dragReads = []
+    // Another client's drag has no source in this process. Whatever it
+    // advertises, no folder lights up for it and none takes it.
+    var foreign = dragEvent(null, advertised)
+    check(!panel.canEnterDirectoryDrop(foreign, destination)
+        && !panel.beginDirectoryDrop(foreign, destination)
+        && panel.editorMode === "" && fixture.lastDrop === null,
+      "a drag from another app was taken into a folder")
+    // QuickFile's own drag, registered as a row's drag registers it on start.
+    fixture.selectedTokens = ["one-token", "two-token"]
+    check(panel.beginInternalDrag(dragRow, { token: "one-token" })
+        && panel.internalDrag.tokens.length === 2,
+      "a row's drag did not register itself with the whole selection")
+    check(!panel.beginDirectoryDrop(foreign, destination),
+      "while QuickFile's own drag ran, another app's drag was taken for it")
+    check(!panel.beginDirectoryDrop(dragEvent(otherRow, advertised), destination),
+      "a drag from a row QuickFile did not start was taken for its own")
+    var internal = dragEvent(dragRow, [])
+    check(panel.canEnterDirectoryDrop(internal, destination),
+      "a folder did not light up for QuickFile's own drag")
     check(panel.beginDirectoryDrop(internal, destination) && panel.editorMode === "drop-choice",
       "internal drop did not request an explicit copy/move choice")
     check(fixture.lastDrop === null, "drop started a transfer before the user's choice")
     check(panel.commitDirectoryDrop(true) && fixture.lastDrop.move
-        && fixture.lastDrop.destination === "destination" && fixture.lastDrop.tokens.length === 2,
-      "internal drop did not pass binary tokens and selected move action")
-    var external = dropEvent(["text/uri-list", "text/plain"], {
-      "text/uri-list": "# Comment\r\nfile:///tmp/a%20b.txt\r\nfile:///tmp/c%23d.txt\r\n",
-      "text/plain": "$(must-not-run)"
-    })
-    check(panel.beginDirectoryDrop(external, destination), "external URI-list drop was rejected")
-    check(panel.commitDirectoryDrop(false) && !fixture.lastDrop.move
-        && fixture.lastDrop.uris[0] === "file:///tmp/a%20b.txt",
-      "external drop did not preserve encoded URI data for the backend")
-    check(!panel.canAcceptDirectoryDrop(dropEvent(["text/plain"], {
-      "text/plain": "/tmp/not-a-uri"
-    }), destination), "plain text was accepted as a filesystem drop")
-    check(!panel.canAcceptDirectoryDrop(dropEvent(["text/uri-list"], {
-      "text/uri-list": "https://example.com/file"
-    }), destination), "remote URL was accepted as a local filesystem drop")
-    check(!panel.canAcceptDirectoryDrop(internal, { isDir: false, token: "destination" }),
+        && fixture.lastDrop.destination === "destination"
+        && fixture.lastDrop.tokens.join() === "one-token,two-token",
+      "internal drop did not pass the dragged tokens and the move action")
+    check(!panel.canEnterDirectoryDrop(internal, { isDir: false, token: "destination" }),
       "a file was accepted as a directory drop target")
-    check(!panel.canAcceptDirectoryDrop(internal, { isDir: true, token: "one-token" }),
+    check(!panel.canEnterDirectoryDrop(internal, { isDir: true, token: "one-token" }),
       "a source was allowed to drop onto itself")
-    check(!panel.directoryDropPayload(dropEvent(["application/x-quickfile-tokens"], {
-      "application/x-quickfile-tokens": "{invalid}"
-    })), "malformed internal tokens were accepted")
-    check(panel.directoryDropPayload({ formats: [], urls: ["file:///tmp/from-urls.txt"] }).uris[0]
-        === "file:///tmp/from-urls.txt", "native drag.urls fallback was ignored")
+    panel.endInternalDrag(otherRow)
+    check(panel.internalDrag !== null, "another row's drag ending cleared this one")
+    panel.endInternalDrag(dragRow)
+    check(panel.internalDrag === null && !panel.beginDirectoryDrop(internal, destination),
+      "a finished drag could still be dropped")
+    check(dragReads.length === 0, "a drop read the drag's data: " + dragReads.join(", "))
+    // Dragged out to other apps a row offers its URIs and paths, and no longer
+    // QuickFile's own tokens, which nothing reads back.
     fixture.selectedTokens = ["selected-one", "selected-two"]
-    check(JSON.parse(panel.dragMimeData({ token: "selected-one" })[
-      "application/x-quickfile-tokens"]).length === 2,
-      "internal drag payload lost the multi-selection")
+    check(Object.keys(panel.dragMimeData({ token: "selected-one" })).sort().join()
+        === "text/plain,text/uri-list",
+      "a dragged row offered other apps more than its URIs and paths")
+    dragRow.destroy()
+    otherRow.destroy()
 
     var fileConflict = { name: "report.txt", sourcePath: "/source/report.txt", sourceKind: "file",
       targetPath: "/target/report.txt", targetKind: "file", canMerge: false }
@@ -1751,6 +1777,8 @@ ShellRoot {
       "an offline row accepted drops")
     check(Object.keys(panel.dragMimeData(away)).length === 0,
       "an offline row could be dragged out")
+    check(!panel.beginInternalDrag(awayItem, away) && panel.internalDrag === null,
+      "an offline row's drag registered something to drop")
     check(child(hereItem, "quickfileRowDetail").text === "󰋊  ARCHIVE · 64 GB · connected"
         && child(hereItem, "quickfileMatchBadgeText").text === "NAME"
         && child(hereItem, "quickfileFileIcon").opacity === 0.9,
@@ -1935,6 +1963,82 @@ ShellRoot {
       fixture.entriesModel.append({ rowData: rows[index], scope: "" })
     select(rows[40])
     panel.open("{}")
+  }
+
+  // Real drag events through the panel's window. An internal Drag delivers
+  // the QDragEnterEvent and QDropEvent a drag over the panel gets, to the
+  // folder row's own DropArea; its source is what the test sets, null being
+  // how another client's drag arrives.
+  function realDropChecks() {
+    var blade = objectFinder.findChild(panel, "quickfileBlade")
+    var dragger = Qt.createQmlObject("import QtQuick\n"
+      + "Item {\n"
+      + "  property var dragSource: null\n"
+      + "  property bool dragging: false\n"
+      + "  width: 1; height: 1\n"
+      + "  Drag.dragType: Drag.Internal\n"
+      + "  Drag.supportedActions: Qt.CopyAction | Qt.MoveAction\n"
+      + "  Drag.source: dragSource\n"
+      + "  Drag.active: dragging\n"
+      + "  function dropHere() { return Drag.drop() }\n"
+      + "}", blade, "quickfileTestDragger")
+    fileView.forceLayout()
+    var folderIndex = fileView.indexAt(1, fileView.contentY + fileView.height / 2)
+    var sourceIndex = folderIndex + 1
+    check(folderIndex >= 0 && fileView.itemAtIndex(sourceIndex) !== null,
+      "test could not find two rows on screen to drag between")
+    var saved = fixture.entries.slice()
+    var rows = saved.slice()
+    rows[folderIndex] = Object.assign({}, saved[folderIndex],
+      { token: "drop-folder", name: "drop-folder", isDir: true })
+    fixture.entries = rows
+    fixture.entriesModel.set(folderIndex, { rowData: rows[folderIndex], scope: "" })
+    fileView.forceLayout()
+    var folderItem = fileView.itemAtIndex(folderIndex)
+    var sourceItem = fileView.itemAtIndex(sourceIndex)
+    var target = objectFinder.findChild(folderItem, "quickfileDirectoryDropTarget")
+    check(target !== null && target.enabled, "the folder row did not offer a drop target")
+    var point = target.mapToItem(blade, target.width / 2, target.height / 2)
+    dragger.x = point.x
+    dragger.y = point.y
+
+    function drag(source) {
+      dragger.dragSource = source
+      dragger.dragging = true
+      var lit = target.containsDrag
+      var action = dragger.dropHere()
+      dragger.dragging = false
+      return { lit: lit, action: action }
+    }
+
+    var foreign = drag(null)
+    check(!foreign.lit && foreign.action === Qt.IgnoreAction && panel.editorMode === ""
+        && panel.pendingDrop === null,
+      "a folder row took a drag from another app")
+
+    var sourceToken = String(sourceItem.modelData.token)
+    fixture.selectedToken = sourceToken
+    fixture.selectedTokens = [sourceToken]
+    check(panel.beginInternalDrag(sourceItem, sourceItem.modelData),
+      "the dragged row did not register its drag")
+    var stranger = drag(dragger)
+    check(!stranger.lit && stranger.action === Qt.IgnoreAction && panel.editorMode === "",
+      "a folder row took a drag QuickFile did not start for its own")
+    var own = drag(sourceItem)
+    check(own.lit && own.action === Qt.CopyAction && panel.editorMode === "drop-choice"
+        && panel.pendingDrop.destinationToken === "drop-folder"
+        && panel.pendingDrop.tokens.join() === sourceToken,
+      "QuickFile's own drag did not land in the folder row as a copy/move choice")
+    panel.dismissEditor()
+    panel.endInternalDrag(sourceItem)
+    var finished = drag(sourceItem)
+    check(!finished.lit && finished.action === Qt.IgnoreAction && panel.editorMode === "",
+      "a folder row took a drag that had already finished")
+
+    dragger.destroy()
+    fixture.entries = saved
+    fixture.entriesModel.set(folderIndex, { rowData: saved[folderIndex], scope: "" })
+    fixture.modelChanged()
   }
 
   function viewportChecks() {
@@ -2346,6 +2450,7 @@ ShellRoot {
     onTriggered: {
       try {
         testRoot.viewportChecks()
+        testRoot.realDropChecks()
         testRoot.elidedNameTooltipChecks()
         testRoot.sizeBadgeChecks()
         testRoot.searchFocusChecks()

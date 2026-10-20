@@ -70,8 +70,9 @@ concept. It does not depend on or copy unreleased FileBlade source code.
   batch copy, cut, paste, duplicate, and Trash actions.
 - Native Wayland drag sources with `text/uri-list` and shell-quoted plain text,
   so one or several files can be dragged into terminals and other applications.
-- Folder rows, the current-folder header, favorites and mounted devices accept
-  internal or local `file://` drops, then ask whether to Copy or Move.
+- Folder rows, the current-folder header, favorites and mounted devices take
+  rows dragged within QuickFile, then ask whether to Copy or Move. Files
+  dragged in from other apps are refused; see the security model.
 - Per-file and per-folder theme-aware colors, private notes, and starred
   favorites. The collapsible favorites module stays above the regular `FILES`
   tree, and semantic colors follow the active Omarchy palette.
@@ -536,6 +537,16 @@ note in the footer. The text goes in at the cursor, only into the box that
 asked and still has the keyboard, without NUL characters and, on one line,
 with line breaks and tabs as spaces. The read-only path field and preview
 never paste.
+
+A drag from another app is that app's data as well, and Qt reads it the same
+way: asked for a drag's URIs or text, it reads the whole offer on the shell's
+GUI thread with no byte cap or deadline, and nothing outside Qt can read that
+offer for the shell. So a QuickFile folder takes only QuickFile's own drags.
+While one runs, Qt names the row it started from as its source, and the drop
+takes that drag's items from the panel's own state; it never asks the drag for
+its data. A drag from another app has no source in the shell and is refused,
+whatever it offers. Rows dragged out of QuickFile still offer `text/uri-list`
+and shell-quoted paths to other apps.
 
 QuickFile runs inside the unsandboxed Omarchy shell with the permissions of the
 signed-in user. It collects no telemetry. Its only network-capable path is the

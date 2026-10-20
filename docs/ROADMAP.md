@@ -35,8 +35,10 @@ identity, navigation/search, metadata, and a small set of recoverable actions.
   results, suppresses accidental double-entry clicks, and restores the saved
   viewport and originating folder on Back, Forward and Parent navigation.
 - [x] Standards-based `text/uri-list` drag source for external applications.
-- [x] Internal-token and local-URI drop targets for copying or moving items to
-  folders, the current location, favorites and mounted devices.
+- [x] Drop targets for copying or moving QuickFile's own rows to folders, the
+  current location, favorites and mounted devices. Drops from other apps were
+  taken too until 0.17.3, which refuses them: Qt reads their data without a
+  byte cap or deadline.
 
 ## 0.4 — agent context (complete)
 

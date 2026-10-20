@@ -147,6 +147,15 @@ Item {
   readonly property bool clipboardReadBusy: clipboardReadPending !== 0
     || clipboardReadProcess.running
   readonly property bool clipboardReadDeadlineArmed: clipboardReadDeadline.running
+  // Files copied in another app come in the same way, as that app's
+  // text/uri-list, under the same second but a budget of their own: the most
+  // a drop can hand the backend (dropExternalUrisOnDirectory: 500 URIs of at
+  // most 16384 characters, 1 MiB in all) and a kilobyte for the list's line
+  // breaks. Only that type is asked for; text/plain is never read as paths.
+  // clipboardReadKind is what the read in flight is for: "text" or "files".
+  readonly property int clipboardFileListBudget: 1049600
+  readonly property var clipboardFileListTypes: ["text/uri-list"]
+  property string clipboardReadKind: ""
   property var expandedTokens: []
   property bool showHidden: false
   // Listing order, persisted with the other panel preferences. Search results
@@ -376,6 +385,9 @@ Item {
   signal revealRequested(string token)
   // The answer to readClipboardText: the text when ok, nothing otherwise.
   signal clipboardTextRead(int serial, bool ok, string text)
+  // The answer to readClipboardFiles: the clipboard's local file URIs when
+  // ok, none otherwise, with the footer saying why.
+  signal clipboardFilesRead(int serial, bool ok, var uris)
 
   onActionMessageChanged: actionNoticeFresh = false
   onClipboardTokenChanged: actionNoticeFresh = false
@@ -2829,11 +2841,16 @@ Item {
     return Math.min(clipboardReadCeiling, chars * 4 + 8)
   }
 
-  function buildClipboardReadCommand(primary, typeIndex) {
+  function clipboardTypesFor(kind) {
+    return kind === "files" ? clipboardFileListTypes : clipboardReadTypes
+  }
+
+  function buildClipboardReadCommand(primary, typeIndex, kind) {
+    var types = clipboardTypesFor(kind)
     var command = ["/usr/bin/env", "wl-paste", "--no-newline"]
     if (primary === true) command.push("--primary")
-    var type = clipboardReadTypes[typeIndex]
-    command.push("--type", String(type !== undefined ? type : clipboardReadTypes[0]))
+    var type = types[typeIndex]
+    command.push("--type", String(type !== undefined ? type : types[0]))
     return command
   }
 
@@ -2841,20 +2858,54 @@ Item {
   // holds at most maxChars. Returns the serial clipboardTextRead will answer,
   // or 0 when a read is still in flight or nothing would fit.
   function readClipboardText(primary, maxChars) {
-    var budget = clipboardByteBudget(maxChars)
+    return beginClipboardRead("text", primary === true, clipboardByteBudget(maxChars))
+  }
+
+  // Asks for the files another app copied to the clipboard. Returns the serial
+  // clipboardFilesRead will answer, or 0 when a read is still in flight.
+  function readClipboardFiles() {
+    return beginClipboardRead("files", false, clipboardFileListBudget)
+  }
+
+  function beginClipboardRead(kind, primary, budget) {
     if (budget <= 0 || clipboardReadBusy) return 0
     clipboardReadSerial++
     clipboardReadPending = clipboardReadSerial
-    clipboardReadPrimary = primary === true
+    clipboardReadKind = kind
+    clipboardReadPrimary = primary
     clipboardReadBudget = budget
     clipboardReadType = 0
     clipboardReadBytes = 0
     clipboardReadDeadline.restart()
     var serial = clipboardReadPending
-    if (startClipboardReadProcess(buildClipboardReadCommand(clipboardReadPrimary, 0)))
+    if (startClipboardReadProcess(buildClipboardReadCommand(clipboardReadPrimary, 0, kind)))
       return serial
     finishClipboardRead(false, "")
     return 0
+  }
+
+  // A text/uri-list (RFC 2483) as a file paste takes it: one URI a line, blank
+  // lines and # comments skipped, every other line a local file:// URI with no
+  // host but localhost and no query or fragment, as the backend requires, and
+  // the list within what dropExternalUrisOnDirectory carries. A single line
+  // that is anything else refuses the whole list, never part of it. Returns
+  // { uris, error }, the error "" for a list that can be pasted.
+  function parseFileUriList(text) {
+    var lines = String(text === undefined || text === null ? "" : text).split(/\r?\n/)
+    // Built from a string, as the NUL in it would not survive a regex literal.
+    var localFile = new RegExp("^file://(localhost)?/[^?#\\u0000]*$")
+    var uris = []
+    for (var i = 0; i < lines.length; i++) {
+      var uri = String(lines[i]).trim()
+      if (uri === "" || uri.charAt(0) === "#") continue
+      if (!localFile.test(uri)) return ({ uris: [], error: "Only local files can be pasted" })
+      if (uris.length >= 500) return ({ uris: [], error: "Paste at most 500 files at once" })
+      uris.push(uri)
+    }
+    if (uris.length === 0) return ({ uris: [], error: "The clipboard holds no files to paste" })
+    if (boundedArgumentValues(uris, 16384) === null)
+      return ({ uris: [], error: "The clipboard's file list is too long to paste" })
+    return ({ uris: uris, error: "" })
   }
 
   // The one place a clipboard read starts, so the harness can drive the whole
@@ -2877,8 +2928,12 @@ Item {
   function handleClipboardReadProgress(byteCount) {
     if (clipboardReadPending === 0) return
     clipboardReadBytes = Math.max(clipboardReadBytes, Number(byteCount) || 0)
-    if (clipboardReadBytes > clipboardReadBudget)
-      abortClipboardRead("Clipboard text is too long to paste here")
+    if (clipboardReadBytes > clipboardReadBudget) abortClipboardRead(clipboardTooLongMessage())
+  }
+
+  function clipboardTooLongMessage() {
+    return clipboardReadKind === "files" ? "The clipboard's file list is too long to paste"
+      : "Clipboard text is too long to paste here"
   }
 
   function expireClipboardRead() {
@@ -2892,18 +2947,30 @@ Item {
     finishClipboardRead(false, "")
   }
 
+  // A file list is checked here, before anyone sees it: what the answer
+  // carries is either URIs the backend will take or nothing.
   function finishClipboardRead(ok, text) {
     var serial = clipboardReadPending
+    var kind = clipboardReadKind
     clipboardReadPending = 0
+    clipboardReadKind = ""
     clipboardReadDeadline.stop()
-    if (serial !== 0) clipboardTextRead(serial, ok === true, ok === true ? String(text) : "")
+    if (serial === 0) return
+    if (kind !== "files") {
+      clipboardTextRead(serial, ok === true, ok === true ? String(text) : "")
+      return
+    }
+    var list = ok === true ? parseFileUriList(text) : null
+    if (list && list.error !== "") announce(list.error)
+    var good = list !== null && list.error === ""
+    clipboardFilesRead(serial, good, good ? list.uris : [])
   }
 
   function handleClipboardReadExit(exitCode, text) {
     if (clipboardReadPending === 0) return
     // The last chunk can arrive with the exit itself.
     if (clipboardReadBytes > clipboardReadBudget) {
-      abortClipboardRead("Clipboard text is too long to paste here")
+      abortClipboardRead(clipboardTooLongMessage())
       return
     }
     if (exitCode === 0) {
@@ -2918,13 +2985,16 @@ Item {
     }
     // The clipboard does not offer the first type: ask for the next one, under
     // the same deadline. Anything else — nothing copied, no text — pastes
-    // nothing, as a native paste would.
-    if (clipboardReadBytes === 0 && clipboardReadType + 1 < clipboardReadTypes.length) {
+    // nothing, as a native paste would. Files were asked for by name, so their
+    // absence is said.
+    if (clipboardReadBytes === 0
+        && clipboardReadType + 1 < clipboardTypesFor(clipboardReadKind).length) {
       clipboardReadType++
-      if (startClipboardReadProcess(
-          buildClipboardReadCommand(clipboardReadPrimary, clipboardReadType)))
+      if (startClipboardReadProcess(buildClipboardReadCommand(
+          clipboardReadPrimary, clipboardReadType, clipboardReadKind)))
         return
     }
+    if (clipboardReadKind === "files") announce("The clipboard holds no files to paste")
     finishClipboardRead(false, "")
   }
 

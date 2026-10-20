@@ -135,6 +135,12 @@ ShellRoot {
       clipboardSignals.push(signalNumber)
       return true
     }
+    // QuickFile's own paste, which would start a backend transfer.
+    property int internalPastes: 0
+    function pasteHere() {
+      internalPastes++
+      return true
+    }
   }
 
   // Keys and clicks go through the real window, so a paste Qt handled itself
@@ -714,6 +720,204 @@ ShellRoot {
     noteEditor.text = ""
     panel.noteDraft = ""
     panel.inspectorOpen = false
+    fixture.actionMessage = ""
+    panel.focusList()
+  }
+
+  // Files copied in another app come in by the clipboard, never by a drop:
+  // its text/uri-list through the bounded reader, then the Copy/Move choice a
+  // drop opened, for the folder that was on screen.
+  function filePasteChecks() {
+    var uriList = JSON.stringify(["/usr/bin/env", "wl-paste", "--no-newline",
+      "--type", "text/uri-list"])
+    var footer = objectFinder.findChild(panel, "quickfileFooterStatus")
+    var dialogTitle = objectFinder.findChild(panel, "quickfileEditorTitle")
+    check(footer !== null && dialogTitle !== null, "could not find the footer or the dialog title")
+    panel.dismissEditor()
+    panel.focusList()
+    fixture.lastDrop = null
+    fixture.actionMessage = ""
+
+    // Ctrl+Shift+V from the list: one bounded text/uri-list read, and not
+    // QuickFile's own Ctrl+V, which the chord also matches.
+    var launches = fixture.clipboardLaunches.length
+    var pastes = fixture.internalPastes
+    input.keyClick(Qt.Key_V, Qt.ControlModifier | Qt.ShiftModifier, -1)
+    check(fixture.clipboardLaunches.length === launches + 1 && lastLaunch() === uriList,
+      "Ctrl+Shift+V did not ask the bounded reader for text/uri-list: " + lastLaunch())
+    check(fixture.internalPastes === pastes, "Ctrl+Shift+V also ran QuickFile's own paste")
+    check(panel.filePasteSerial > 0 && fixture.clipboardReadKind === "files"
+        && fixture.clipboardReadBudget === fixture.clipboardFileListBudget
+        && fixture.clipboardReadDeadlineArmed && panel.editorMode === "",
+      "the file paste was not bound to a bounded read, or opened a dialog before its answer")
+    fixture.handleClipboardReadProgress(80)
+    fixture.handleClipboardReadExit(0,
+      "# copied\r\nfile:///elsewhere/report.pdf\r\nfile:///elsewhere/two%20words\r\n")
+    check(panel.editorMode === "drop-choice" && dialogTitle.text === "Copy or move here?"
+        && panel.pendingDrop.destinationToken === fixture.rootToken
+        && panel.pendingDrop.destinationPath === fixture.rootPath
+        && panel.pendingDrop.tokens.length === 0 && panel.pendingDrop.count === 2
+        && JSON.stringify(panel.pendingDrop.uris) === JSON.stringify(
+          ["file:///elsewhere/report.pdf", "file:///elsewhere/two%20words"]),
+      "the pasted files did not open the Copy/Move choice for the current folder: "
+        + JSON.stringify(panel.pendingDrop))
+    check(fixture.lastDrop === null && panel.filePasteSerial === 0,
+      "a file paste started a transfer before the choice")
+    check(panel.commitDirectoryDrop(false) && !fixture.lastDrop.move
+        && fixture.lastDrop.destination === fixture.rootToken
+        && fixture.lastDrop.tokens.length === 0 && JSON.stringify(fixture.lastDrop.uris)
+          === JSON.stringify(["file:///elsewhere/report.pdf", "file:///elsewhere/two%20words"]),
+      "Copy here did not hand the pasted URIs to the backend: " + JSON.stringify(fixture.lastDrop))
+    check(panel.editorMode === "", "the choice stayed open after its transfer started")
+
+    // Anything but local files: no choice, and the footer says why.
+    fixture.lastDrop = null
+    panel.focusList()
+    input.keyClick(Qt.Key_V, Qt.ControlModifier | Qt.ShiftModifier, -1)
+    fixture.handleClipboardReadProgress(60)
+    fixture.handleClipboardReadExit(0, "file:///elsewhere/ok.txt\nhttps://example.invalid/a.txt")
+    check(panel.editorMode === "" && panel.pendingDrop === null && fixture.lastDrop === null
+        && footer.text === "Only local files can be pasted",
+      "a list with a web address opened the choice or said nothing: " + footer.text)
+
+    // No file list: no second type is asked for, text/plain least of all.
+    launches = fixture.clipboardLaunches.length
+    input.keyClick(Qt.Key_V, Qt.ControlModifier | Qt.ShiftModifier, -1)
+    fixture.handleClipboardReadExit(1, "")
+    check(fixture.clipboardLaunches.length === launches + 1 && panel.editorMode === ""
+        && footer.text === "The clipboard holds no files to paste" && !fixture.clipboardReadBusy,
+      "a clipboard without files was read as another type or not explained: " + footer.text)
+
+    // Past the byte budget or the deadline: killed, nothing opens.
+    var signals = fixture.clipboardSignals.length
+    input.keyClick(Qt.Key_V, Qt.ControlModifier | Qt.ShiftModifier, -1)
+    fixture.handleClipboardReadProgress(fixture.clipboardFileListBudget + 1)
+    check(fixture.clipboardSignals.length === signals + 1
+        && fixture.clipboardSignals[signals] === 9 && !fixture.clipboardReadBusy
+        && footer.text === "The clipboard's file list is too long to paste",
+      "a file list past its budget was not killed and explained: " + footer.text)
+    fixture.handleClipboardReadExit(0, "file:///elsewhere/late.txt")
+    check(panel.editorMode === "" && panel.filePasteSerial === 0,
+      "a file list killed at its budget still opened the choice")
+    input.keyClick(Qt.Key_V, Qt.ControlModifier | Qt.ShiftModifier, -1)
+    fixture.expireClipboardRead()
+    check(fixture.clipboardSignals.length === signals + 2
+        && fixture.clipboardSignals[signals + 1] === 9
+        && footer.text === "The clipboard did not answer in time",
+      "a stalled file paste was not killed and explained: " + footer.text)
+    fixture.handleClipboardReadExit(0, "file:///elsewhere/late.txt")
+    check(panel.editorMode === "", "a stalled file paste still opened the choice")
+
+    // The folder's own menu: a right click on its path offers the paste, and
+    // QuickFile's own copy beside it when there is one.
+    var menu = objectFinder.findChild(panel, "quickfileChoiceMenu")
+    var location = objectFinder.findChild(panel, "quickfileLocationMenuArea")
+    check(menu !== null && location !== null && location.width > 0 && location.height > 0,
+      "could not find the folder's path or the menu it opens")
+    input.mouseClick(location, location.width / 2, location.height / 2, Qt.RightButton,
+      Qt.NoModifier, -1)
+    check(menu.visible && panel.choiceKind === "folder" && panel.choiceOptions.length === 1
+        && panel.choiceOptions[0].value === "paste-files" && panel.choiceActiveValue() === "",
+      "a right click on the folder's path did not offer the file paste alone: "
+        + JSON.stringify(panel.choiceOptions))
+    launches = fixture.clipboardLaunches.length
+    panel.applyChoice("paste-files")
+    menu.close()
+    check(fixture.clipboardLaunches.length === launches + 1 && lastLaunch() === uriList,
+      "the menu's file paste did not ask the bounded reader")
+    fixture.handleClipboardReadProgress(30)
+    fixture.handleClipboardReadExit(0, "file://localhost/elsewhere/menu.txt")
+    check(panel.editorMode === "drop-choice"
+        && panel.pendingDrop.destinationToken === fixture.rootToken
+        && panel.pendingDrop.uris.join() === "file://localhost/elsewhere/menu.txt",
+      "the menu's file paste did not open the choice for the current folder")
+    panel.dismissEditor()
+    fixture.clipboardName = "copied.txt"
+    fixture.clipboardToken = "copied-token"
+    panel.openChoiceMenu("folder", location, 4, 4)
+    check(panel.choiceOptions.length === 2 && panel.choiceOptions[0].value === "paste"
+        && panel.choiceOptions[0].label.indexOf("copied.txt") >= 0,
+      "the folder's menu did not offer QuickFile's own copy")
+    pastes = fixture.internalPastes
+    launches = fixture.clipboardLaunches.length
+    panel.applyChoice("paste")
+    menu.close()
+    check(fixture.internalPastes === pastes + 1 && fixture.clipboardLaunches.length === launches,
+      "the menu's Paste did not run QuickFile's own paste, or read the clipboard")
+    fixture.clipboardName = new Array(80).join("n") + ".txt"
+    panel.openChoiceMenu("folder", location, 4, 4)
+    var capped = panel.choiceOptions[0].label
+    check(capped === "Paste “" + new Array(40).join("n") + "…”  Ctrl+V",
+      "a long copied name was not cut short in the folder's menu: " + capped)
+    menu.close()
+    fixture.clipboardToken = ""
+    fixture.clipboardName = ""
+
+    // In the search box the chord is the box's: Qt pastes nothing there and
+    // no file paste starts.
+    var search = objectFinder.findChild(panel, "quickfileSearchField")
+    clipboardSeed.selectAll()
+    clipboardSeed.copy()
+    panel.beginSearch()
+    search.text = "kept"
+    launches = fixture.clipboardLaunches.length
+    input.keyClick(Qt.Key_V, Qt.ControlModifier | Qt.ShiftModifier, -1)
+    check(search.text === "kept" && panel.filePasteSerial === 0
+        && fixture.clipboardLaunches.length === launches,
+      "Ctrl+Shift+V in the search box pasted or read the clipboard: "
+        + JSON.stringify(search.text) + " " + lastLaunch())
+    input.keyClick(Qt.Key_Escape, Qt.NoModifier, -1)
+    fixture.actionMessage = ""
+
+    // An answer that finds a dialog open, or the panel closed since, is
+    // dropped rather than stacked on top or kept for the next opening.
+    panel.focusList()
+    input.keyClick(Qt.Key_V, Qt.ControlModifier | Qt.ShiftModifier, -1)
+    panel.beginEditor("new-file")
+    fixture.handleClipboardReadExit(0, "file:///elsewhere/a.txt")
+    check(panel.editorMode === "new-file" && panel.pendingDrop === null,
+      "a file paste took over a dialog opened while it read")
+    panel.dismissEditor()
+    panel.focusList()
+    check(panel.requestFilePasteHere(), "a file paste did not start from the list")
+    panel.close()
+    panel.open("{}")
+    fixture.handleClipboardReadExit(0, "file:///elsewhere/a.txt")
+    check(panel.editorMode === "" && panel.pendingDrop === null,
+      "a file paste asked for before the panel closed opened in the next one")
+    panel.focusList()
+
+    // Nothing is read for a folder that cannot take it: an offline drive's,
+    // or any while an operation runs; nor when an operation starts during
+    // the read.
+    launches = fixture.clipboardLaunches.length
+    check(!panel.requestFilePaste({ isDir: true, token: "catalog:drive:/x", path: "/x" })
+        && !panel.requestFilePaste({ isDir: false, token: "a-file", path: "/a-file" })
+        && fixture.clipboardLaunches.length === launches,
+      "a file paste read the clipboard for an offline folder or a file")
+    check(panel.requestFilePasteHere(), "a file paste did not start for the current folder")
+    fixture.operationBusy = true
+    fixture.handleClipboardReadExit(0, "file:///elsewhere/a.txt")
+    check(panel.editorMode === "" && panel.pendingDrop === null,
+      "a file paste opened the choice while an operation ran")
+    launches = fixture.clipboardLaunches.length
+    input.keyClick(Qt.Key_V, Qt.ControlModifier | Qt.ShiftModifier, -1)
+    check(fixture.clipboardLaunches.length === launches,
+      "Ctrl+Shift+V read the clipboard while an operation ran")
+    fixture.operationBusy = false
+
+    // Ctrl+V is still QuickFile's own paste, and reads no clipboard.
+    pastes = fixture.internalPastes
+    input.keyClick(Qt.Key_V, Qt.ControlModifier, -1)
+    check(fixture.internalPastes === pastes + 1 && fixture.clipboardLaunches.length === launches,
+      "Ctrl+V stopped being QuickFile's own paste")
+
+    var groups = panel.shortcutGroups()
+    var listed = false
+    for (var g = 0; g < groups.length; g++)
+      for (var r = 0; r < groups[g].rows.length; r++)
+        if (groups[g].rows[r][0] === "Ctrl+Shift+V") listed = true
+    check(listed, "the shortcut sheet does not mention Ctrl+Shift+V")
     fixture.actionMessage = ""
     panel.focusList()
   }
@@ -2468,6 +2672,7 @@ ShellRoot {
         // After the pulse checks too: real key and mouse events run the row
         // outlines that leaving search queued.
         testRoot.pasteChecks()
+        testRoot.filePasteChecks()
         testRoot.devicesChecks()
         testRoot.offlineSearchChecks()
         testRoot.startGoneBoxPaste()

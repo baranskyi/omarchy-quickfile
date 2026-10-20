@@ -73,6 +73,9 @@ concept. It does not depend on or copy unreleased FileBlade source code.
 - Folder rows, the current-folder header, favorites and mounted devices take
   rows dragged within QuickFile, then ask whether to Copy or Move. Files
   dragged in from other apps are refused; see the security model.
+- Files copied in another app, such as a file manager, paste into the folder on
+  screen with `Ctrl+Shift+V` or from the menu a right click on the folder's
+  path opens. They get the same Copy or Move choice a drop gets.
 - Per-file and per-folder theme-aware colors, private notes, and starred
   favorites. The collapsible favorites module stays above the regular `FILES`
   tree, and semantic colors follow the active Omarchy palette.
@@ -143,6 +146,7 @@ concept. It does not depend on or copy unreleased FileBlade source code.
 | `Ctrl+R` | Refresh (listings also refresh themselves on filesystem events) |
 | `Ctrl+Shift+T` | Open the Trash browser to restore or permanently delete |
 | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy / cut / paste selected items |
+| `Ctrl+Shift+V` | Paste files copied in another app into the current folder |
 | `Ctrl+D` | Duplicate selected items |
 | `Ctrl+Z` | Undo the latest reversible QuickFile operation |
 | `Space` | Preview the hovered item, otherwise the selected item, in the window |
@@ -152,6 +156,7 @@ concept. It does not depend on or copy unreleased FileBlade source code.
 | Drag | Export selected files to a terminal or another application |
 | Double click | Enter directory/open file |
 | Right click | Select and reveal color, note, path, and properties |
+| Right click on the folder's path | Paste QuickFile's own copy or files from another app |
 
 The `FILES` strip carries three controls, all sharing one idiom: a left click
 rotates through the options, a right click opens the full list at the pointer.
@@ -458,7 +463,8 @@ provides its core runtime dependencies:
   opening files and Trash integration.
 - `lsblk` and `udisksctl` for the removable-device module.
 - `wl-copy` and `wl-paste` (wl-clipboard) for copying a selected path to the
-  Wayland clipboard and for pasting into QuickFile's text boxes.
+  Wayland clipboard, for pasting into QuickFile's text boxes and for pasting
+  files copied in other apps.
 
 Git, `rg`, zoxide, GNOME Sushi, `getfacl`, and `lsattr` are optional. They add
 Git context, faster content search, frequent locations, external QuickView,
@@ -547,6 +553,18 @@ takes that drag's items from the panel's own state; it never asks the drag for
 its data. A drag from another app has no source in the shell and is refused,
 whatever it offers. Rows dragged out of QuickFile still offer `text/uri-list`
 and shell-quoted paths to other apps.
+
+Files from another app come in through the clipboard instead, and the same
+reader reads them. `Ctrl+Shift+V`, or **Paste files from the clipboard** in the
+folder's menu, runs `wl-paste --no-newline --type text/uri-list` and nothing
+else: `text/plain` is never read as paths. The list has a budget of its own:
+1 MiB, the most the backend takes from a drop (500 URIs of at most 16384
+characters, 1 MiB in all), plus 1 KiB for the line breaks. Past it, or past one
+second, the reader is killed and nothing is pasted. Blank lines and
+`#` comments are skipped. Every other line has to be a local `file://` URI, with
+no host but `localhost` and no query or fragment, or the whole list is refused.
+A list that passes opens the Copy or Move choice for the folder that was on
+screen, and the backend checks each path again before anything is copied.
 
 QuickFile runs inside the unsandboxed Omarchy shell with the permissions of the
 signed-in user. It collects no telemetry. Its only network-capable path is the

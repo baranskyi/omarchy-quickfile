@@ -92,6 +92,10 @@ ShellRoot {
     onClipboardTextRead: function(serial, ok, text) {
       answers.push({ serial: serial, ok: ok, text: text })
     }
+    property var fileAnswers: []
+    onClipboardFilesRead: function(serial, ok, uris) {
+      fileAnswers.push({ serial: serial, ok: ok, uris: suite.plainList(uris) })
+    }
   }
 
   // The same reader around real processes: stand-ins for wl-paste that
@@ -109,6 +113,10 @@ ShellRoot {
     onClipboardTextRead: function(serial, ok, text) {
       answers.push({ serial: serial, ok: ok, text: text })
     }
+    property var fileAnswers: []
+    onClipboardFilesRead: function(serial, ok, uris) {
+      fileAnswers.push({ serial: serial, ok: ok, uris: suite.plainList(uris) })
+    }
   }
 
   // And wl-paste itself, with the real argv, in an environment without a
@@ -120,6 +128,10 @@ ShellRoot {
     property var answers: []
     onClipboardTextRead: function(serial, ok, text) {
       answers.push({ serial: serial, ok: ok, text: text })
+    }
+    property var fileAnswers: []
+    onClipboardFilesRead: function(serial, ok, uris) {
+      fileAnswers.push({ serial: serial, ok: ok, uris: suite.plainList(uris) })
     }
   }
 
@@ -1421,6 +1433,171 @@ ShellRoot {
     check(clipboard.answers.length === answers, "An expired read was answered twice")
   }
 
+  // Qt 6.12 hands a var signal argument over as a list, not a JS array.
+  function plainList(value) {
+    return value && typeof value === "object" && typeof value.length === "number"
+      ? Array.prototype.slice.call(value) : null
+  }
+
+  function lastFileAnswer(service) {
+    var answers = service.fileAnswers
+    return answers.length > 0 ? answers[answers.length - 1] : null
+  }
+
+  function repeated(text, count) {
+    var out = []
+    for (var i = 0; i < count; i++) out.push(text)
+    return out
+  }
+
+  // Files from another app: the clipboard's text/uri-list through the same
+  // reader, under a budget of its own, and only local file:// URIs out of it.
+  function clipboardFileUnitTests() {
+    var uriListArgv = JSON.stringify(
+      ["/usr/bin/env", "wl-paste", "--no-newline", "--type", "text/uri-list"])
+    check(JSON.stringify(clipboard.buildClipboardReadCommand(false, 0, "files")) === uriListArgv,
+      "Files are not read through a fixed wl-paste argv for text/uri-list")
+    check(JSON.stringify(clipboard.clipboardFileListTypes) === JSON.stringify(["text/uri-list"])
+        && clipboard.clipboardFileListBudget === 1048576 + 1024,
+      "A file paste asks for more than text/uri-list, or its budget moved")
+
+    // The parser keeps the drop's rules: one URI a line, blank lines and
+    // comments skipped, local file:// only, the whole list or nothing.
+    var good = clipboard.parseFileUriList(
+      "# copied\r\nfile:///quickfile-test/a.txt\r\n\r\n  file://localhost/quickfile-test/b%20c  \r\n")
+    check(good.error === "" && JSON.stringify(good.uris) === JSON.stringify(
+        ["file:///quickfile-test/a.txt", "file://localhost/quickfile-test/b%20c"]),
+      "A good file list was not read whole: " + JSON.stringify(good))
+    var foreign = ["https://example.invalid/a.txt", "file://otherhost/a.txt", "file:a.txt",
+      "file:///a.txt?x=1", "file:///a.txt#top", "FILE:///a.txt", "trash:///a.txt",
+      "smb://server/share/a.txt", "/quickfile-test/a.txt", "a.txt", "file:///a\u0000b"]
+    for (var f = 0; f < foreign.length; f++) {
+      var mixed = clipboard.parseFileUriList("file:///quickfile-test/ok.txt\n" + foreign[f])
+      check(mixed.uris.length === 0 && mixed.error === "Only local files can be pasted",
+        "A list holding " + JSON.stringify(foreign[f]) + " was not refused whole")
+    }
+    var empty = ["", "\r\n\r\n", "# only a comment\n#another"]
+    for (var e = 0; e < empty.length; e++) {
+      var none = clipboard.parseFileUriList(empty[e])
+      check(none.uris.length === 0 && none.error === "The clipboard holds no files to paste",
+        "An empty file list was not explained: " + JSON.stringify(empty[e]))
+    }
+    var many = repeated("file:///quickfile-test/f", 500)
+    check(clipboard.parseFileUriList(many.join("\n")).uris.length === 500,
+      "500 files, the most a drop takes, were refused")
+    many.push("file:///quickfile-test/f")
+    check(clipboard.parseFileUriList(many.join("\n")).error === "Paste at most 500 files at once",
+      "A 501st file was not refused")
+    var longest = "file:///" + new Array(16384 - 8 + 1).join("x")
+    check(longest.length === 16384 && clipboard.parseFileUriList(longest).error === "",
+      "A URI as long as the backend takes was refused")
+    check(clipboard.parseFileUriList(longest + "x").error
+        === "The clipboard's file list is too long to paste",
+      "A URI longer than the backend takes was not refused")
+    var heavy = repeated(longest, 64)
+    check(clipboard.parseFileUriList(heavy.join("\n")).error === "",
+      "1 MiB of URIs in all, the most a drop takes, was refused")
+    heavy.push("file:///x")
+    check(clipboard.parseFileUriList(heavy.join("\n")).error
+        === "The clipboard's file list is too long to paste",
+      "More than 1 MiB of URIs in all was not refused")
+
+    // A whole read: one fixed argv, the file budget, an answer on the files
+    // signal only.
+    var launches = clipboard.launches.length
+    var textAnswers = clipboard.answers.length
+    clipboard.actionMessage = ""
+    var serial = clipboard.readClipboardFiles()
+    check(serial > 0 && clipboard.launches.length === launches + 1
+        && JSON.stringify(clipboard.launches[launches]) === uriListArgv
+        && clipboard.clipboardReadKind === "files"
+        && clipboard.clipboardReadBudget === clipboard.clipboardFileListBudget
+        && clipboard.clipboardReadBusy && clipboard.clipboardReadDeadlineArmed,
+      "A file paste did not start one bounded text/uri-list read under its deadline")
+    check(clipboard.readClipboardFiles() === 0 && clipboard.readClipboardText(false, 10) === 0
+        && clipboard.launches.length === launches + 1,
+      "A second read started while a file paste was reading")
+    clipboard.handleClipboardReadProgress(40)
+    clipboard.handleClipboardReadExit(0, "file:///quickfile-test/a.txt\r\nfile:///quickfile-test/b")
+    var answer = lastFileAnswer(clipboard)
+    check(answer && answer.serial === serial && answer.ok && JSON.stringify(answer.uris)
+        === JSON.stringify(["file:///quickfile-test/a.txt", "file:///quickfile-test/b"])
+        && clipboard.answers.length === textAnswers && !clipboard.clipboardReadBusy
+        && !clipboard.clipboardReadDeadlineArmed && clipboard.clipboardReadKind === "",
+      "A file paste was not answered with its URIs, or crossed into the text answer")
+
+    // Text paste is untouched by a file paste before it.
+    serial = clipboard.readClipboardText(false, 10)
+    check(JSON.stringify(clipboard.launches[clipboard.launches.length - 1])
+        === JSON.stringify(clipboard.buildClipboardReadCommand(false, 0))
+        && clipboard.clipboardReadBudget === 48,
+      "A text paste after a file paste read the wrong type or budget")
+    var fileAnswers = clipboard.fileAnswers.length
+    clipboard.handleClipboardReadExit(0, "file:///quickfile-test/a.txt")
+    check(lastAnswer(clipboard).text === "file:///quickfile-test/a.txt"
+        && clipboard.fileAnswers.length === fileAnswers,
+      "A text paste answered on the files signal")
+
+    // Not a file list: refused whole, explained, nothing handed on.
+    serial = clipboard.readClipboardFiles()
+    clipboard.handleClipboardReadProgress(50)
+    clipboard.handleClipboardReadExit(0, "file:///quickfile-test/a.txt\nhttps://example.invalid/b")
+    answer = lastFileAnswer(clipboard)
+    check(answer.serial === serial && !answer.ok && answer.uris.length === 0
+        && clipboard.actionMessage === "Only local files can be pasted",
+      "A list with a non-file URI was handed on or not explained: " + clipboard.actionMessage)
+
+    // No file list on the clipboard: no other type is tried (text/plain is
+    // never read as paths), and the paste says so.
+    launches = clipboard.launches.length
+    clipboard.actionMessage = ""
+    serial = clipboard.readClipboardFiles()
+    clipboard.handleClipboardReadExit(1, "")
+    answer = lastFileAnswer(clipboard)
+    check(clipboard.launches.length === launches + 1 && answer.serial === serial && !answer.ok
+        && clipboard.actionMessage === "The clipboard holds no files to paste",
+      "A clipboard without files was asked for another type or not explained")
+    serial = clipboard.readClipboardFiles()
+    clipboard.handleClipboardReadExit(127, "")
+    check(!lastFileAnswer(clipboard).ok
+        && clipboard.actionMessage === "Pasting needs wl-paste from wl-clipboard",
+      "A missing wl-paste was not explained for a file paste")
+
+    // Past the file budget: SIGKILL, dropped, explained; a late exit is not
+    // answered twice.
+    clipboard.sentSignals = []
+    serial = clipboard.readClipboardFiles()
+    clipboard.handleClipboardReadProgress(clipboard.clipboardFileListBudget)
+    check(clipboard.sentSignals.length === 0 && clipboard.clipboardReadPending === serial,
+      "A file list within its budget was stopped")
+    clipboard.handleClipboardReadProgress(clipboard.clipboardFileListBudget + 1)
+    answer = lastFileAnswer(clipboard)
+    check(clipboard.sentSignals.join(",") === "9" && answer.serial === serial && !answer.ok
+        && !clipboard.clipboardReadBusy && !clipboard.clipboardReadDeadlineArmed
+        && clipboard.actionMessage === "The clipboard's file list is too long to paste",
+      "A file list past its budget was not killed, dropped and explained")
+    fileAnswers = clipboard.fileAnswers.length
+    clipboard.handleClipboardReadExit(0, "file:///quickfile-test/late")
+    check(clipboard.fileAnswers.length === fileAnswers, "A killed file paste was answered twice")
+    serial = clipboard.readClipboardFiles()
+    clipboard.clipboardReadBytes = clipboard.clipboardFileListBudget + 1
+    clipboard.handleClipboardReadExit(0, "file:///quickfile-test/a.txt")
+    check(lastFileAnswer(clipboard).serial === serial && !lastFileAnswer(clipboard).ok,
+      "An oversized last chunk of a file list was pasted")
+
+    // Past the deadline: SIGKILL, dropped, explained.
+    clipboard.sentSignals = []
+    serial = clipboard.readClipboardFiles()
+    clipboard.expireClipboardRead()
+    answer = lastFileAnswer(clipboard)
+    check(clipboard.sentSignals.join(",") === "9" && answer.serial === serial && !answer.ok
+        && clipboard.actionMessage === "The clipboard did not answer in time",
+      "A stalled file paste was not killed, dropped and explained")
+    fileAnswers = clipboard.fileAnswers.length
+    clipboard.handleClipboardReadExit(0, "file:///quickfile-test/late")
+    check(clipboard.fileAnswers.length === fileAnswers, "An expired file paste was answered twice")
+  }
+
   // Real processes, one after another: each starts when the last has gone.
   property string pastePhase: "stream"
   property bool pasteDone: false
@@ -1434,9 +1611,24 @@ ShellRoot {
     check(pasteSerial > 0, "A real clipboard read did not start in " + pastePhase)
   }
 
+  function startLiveFilePaste(standIns) {
+    liveReader.standIns = standIns
+    pasteStarted = Date.now()
+    pasteSerial = liveReader.readClipboardFiles()
+    check(pasteSerial > 0, "A real file paste did not start in " + pastePhase)
+  }
+
+  // A file manager's list as it would copy it, with a comment line and CRLF.
+  function piecedFileList() {
+    var uris = []
+    for (var i = 0; i < 300; i++) uris.push("file:///quickfile-test/piece-" + i + "-%C3%A9.txt")
+    return uris
+  }
+
   function livePasteStep() {
     if (pasteDone || liveReader.clipboardReadBusy || realPaste.clipboardReadBusy) return
     var answer = lastAnswer(liveReader)
+    var files = lastFileAnswer(liveReader)
     if (pastePhase === "stream" && pasteSerial === 0) {
       startLivePaste([["/usr/bin/python3", "-c",
         "import sys\nwhile True:\n  sys.stdout.write('a' * 65536)\n  sys.stdout.flush()"]], 512)
@@ -1475,6 +1667,50 @@ ShellRoot {
       check(real && !real.ok && (realPaste.clipboardReadType === 1
           || realPaste.actionMessage === "Pasting needs wl-paste from wl-clipboard"),
         "wl-paste without a display pasted something or skipped plain text")
+      // The same reader for files: a list that never ends is cut off at its
+      // own budget, which is far past the text one.
+      pastePhase = "files-stream"
+      liveReader.actionMessage = ""
+      startLiveFilePaste([["/usr/bin/python3", "-c",
+        "import sys\nline = b'file:///quickfile-test/streamed\\r\\n' * 2048\n"
+          + "while True:\n  sys.stdout.buffer.write(line)\n  sys.stdout.flush()"]])
+    } else if (pastePhase === "files-stream") {
+      check(files && files.serial === pasteSerial && !files.ok && files.uris.length === 0
+          && liveReader.actionMessage === "The clipboard's file list is too long to paste",
+        "An endless file list was not cut off at its budget: " + liveReader.actionMessage)
+      check(liveReader.clipboardReadBytes > liveReader.clipboardFileListBudget
+          && liveReader.clipboardReadBytes <= liveReader.clipboardFileListBudget + 1048576,
+        "An endless file list was not read to its budget, or past one pipe's worth more: "
+          + liveReader.clipboardReadBytes)
+      pastePhase = "files-stall"
+      startLiveFilePaste([["/usr/bin/python3", "-c", "import time\ntime.sleep(30)"]])
+    } else if (pastePhase === "files-stall") {
+      var stalled = Date.now() - pasteStarted
+      check(files && files.serial === pasteSerial && !files.ok && stalled >= 900
+          && liveReader.actionMessage === "The clipboard did not answer in time",
+        "A stalled file list was not dropped at its deadline: " + stalled + "ms")
+      pastePhase = "files-pieces"
+      var listed = piecedFileList()
+      startLiveFilePaste([["/usr/bin/python3", "-c",
+        "import sys, time\nb = sys.argv[1].encode()\n"
+          + "for i in range(0, len(b), 999):\n"
+          + "  sys.stdout.buffer.write(b[i:i + 999])\n  sys.stdout.flush()\n  time.sleep(0.01)",
+        "# copied files\r\n" + listed.join("\r\n") + "\r\n"]])
+    } else if (pastePhase === "files-pieces") {
+      check(files && files.serial === pasteSerial && files.ok
+          && JSON.stringify(files.uris) === JSON.stringify(piecedFileList()),
+        "A file list read in pieces was not whole: "
+          + (files ? files.uris.length + " / " + liveReader.actionMessage : "no answer"))
+      pastePhase = "files-wl-paste"
+      realPaste.actionMessage = ""
+      check(realPaste.readClipboardFiles() > 0, "wl-paste itself did not start for files")
+    } else if (pastePhase === "files-wl-paste") {
+      var realFiles = lastFileAnswer(realPaste)
+      check(realFiles && !realFiles.ok && realPaste.clipboardReadType === 0
+          && (realPaste.actionMessage === "The clipboard holds no files to paste"
+            || realPaste.actionMessage === "Pasting needs wl-paste from wl-clipboard"),
+        "wl-paste without a display pasted files, tried another type or said nothing: "
+          + realPaste.actionMessage)
       pasteDone = true
     }
   }
@@ -1598,7 +1834,7 @@ ShellRoot {
           live.setPanelVisible(false)
           console.log("QUICKFILE_TESTS_PASSED service:", suite.assertions,
             "assertions; native events, idle, hide/reopen, rapid reopen, crash fallback,"
-              + " bounded clipboard reads verified")
+              + " bounded clipboard text and file reads verified")
           Qt.quit()
         }
       } catch (error) { suite.fail(error.message) }
@@ -1609,6 +1845,7 @@ ShellRoot {
     try {
       suite.runUnitTests()
       suite.clipboardUnitTests()
+      suite.clipboardFileUnitTests()
       suite.phaseStarted = Date.now()
       live.setPanelVisible(true)
     } catch (error) { suite.fail(error.message) }

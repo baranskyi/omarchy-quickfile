@@ -39,6 +39,9 @@ identity, navigation/search, metadata, and a small set of recoverable actions.
   current location, favorites and mounted devices. Drops from other apps were
   taken too until 0.17.3, which refuses them: Qt reads their data without a
   byte cap or deadline.
+- [x] Pasting files copied in other apps (0.18): `Ctrl+Shift+V` or the current
+  folder's menu reads the clipboard's `text/uri-list` through the bounded
+  reader and offers the Copy or Move choice a drop did.
 
 ## 0.4 — agent context (complete)
 

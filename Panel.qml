@@ -279,6 +279,9 @@ Item {
 
   function close() {
     dismissEditor()
+    // A file paste still reading lands in no panel, nor in the next one.
+    filePasteSerial = 0
+    filePasteDestination = null
     hoveredToken = ""
     opened = false
     if (service) service.setPanelVisible(false)
@@ -1248,6 +1251,7 @@ Item {
         ["R", "Rename"],
         ["C · Ctrl+C", "Copy"],
         ["Ctrl+X · Ctrl+V", "Cut and paste"],
+        ["Ctrl+Shift+V", "Paste files copied in another app"],
         ["Ctrl+D", "Duplicate"],
         ["Del · Backspace", "Move to Trash"]
       ] },
@@ -1355,8 +1359,9 @@ Item {
     pulseInspector()
   }
 
-  // Both cycling controls share one picker: left click rotates, right click
-  // opens this list at the pointer so a mode can be chosen outright.
+  // The cycling controls share one picker: left click rotates, right click
+  // opens this list at the pointer so a mode can be chosen outright. A right
+  // click on the current folder's path opens it too, as that folder's menu.
   property string choiceKind: ""
   property var choiceOptions: []
 
@@ -1444,6 +1449,21 @@ Item {
       { value: "type", label: "Type  folders first" }]
   }
 
+  // What can land in the folder on screen: QuickFile's own copy or cut, when
+  // there is one, and files another app copied.
+  function folderMenuOptions() {
+    var options = []
+    if (service && service.clipboardToken !== "") {
+      // The menu is as wide as its longest label; a long name must not make
+      // it wider than the panel.
+      var name = Array.from(String(service.clipboardName || ""))
+      var shown = name.length > 40 ? name.slice(0, 39).join("") + "…" : name.join("")
+      options.push({ value: "paste", label: "Paste “" + shown + "”  Ctrl+V" })
+    }
+    options.push({ value: "paste-files", label: "Paste files from the clipboard  Ctrl+Shift+V" })
+    return options
+  }
+
   function dateFormatOptions() {
     return [{ value: "full", label: "Full  2026-09-08 10:50" },
       { value: "adaptive", label: "Adaptive  Sep  8 10:50" },
@@ -1486,8 +1506,9 @@ Item {
     return true
   }
 
+  // A folder's menu is actions, not modes: nothing in it is marked current.
   function choiceActiveValue() {
-    if (!service) return ""
+    if (!service || choiceKind === "folder") return ""
     return choiceKind === "sort" ? String(service.sortOrder)
       : choiceKind === "date-format" ? String(service.dateFormat)
       : String(service.searchMode)
@@ -1498,6 +1519,9 @@ Item {
       if (service) service.setSortOrder(String(value))
     } else if (choiceKind === "date-format") {
       if (service) service.setDateFormat(String(value))
+    } else if (choiceKind === "folder") {
+      if (value === "paste" && service) service.pasteHere()
+      else if (value === "paste-files") requestFilePasteHere()
     } else applySearchMode(value)
   }
 
@@ -1505,7 +1529,8 @@ Item {
     if (!service || !source) return
     choiceKind = String(kind)
     choiceOptions = choiceKind === "sort" ? sortOptions()
-      : choiceKind === "date-format" ? dateFormatOptions() : searchModeOptions()
+      : choiceKind === "date-format" ? dateFormatOptions()
+      : choiceKind === "folder" ? folderMenuOptions() : searchModeOptions()
     var point = source.mapToItem(keyScope, pointX, pointY)
     choiceMenu.requestedX = point.x
     choiceMenu.requestedY = point.y
@@ -1585,6 +1610,55 @@ Item {
     pasteSerial = 0
     if (!ok || !box || !box.activeFocus || box.focusEpoch !== epoch) return false
     return box.insertPaste(text)
+  }
+
+  // Files copied in another app, pasted into a folder. They used to arrive by
+  // drag and drop, which Qt reads with no bound (directoryDropPayload()); the
+  // clipboard goes through the service's bounded reader instead, and the
+  // answer opens the Copy/Move choice a drop opened. filePasteSerial is the
+  // read it waits for, filePasteDestination the folder it was asked for.
+  property int filePasteSerial: 0
+  property var filePasteDestination: null
+
+  function canPasteFilesInto(destination) {
+    return !!service && !service.actionBusy && editorMode === "" && !!destination
+      && destination.isDir === true && !!destination.token
+      && !service.isCatalogToken(String(destination.token))
+  }
+
+  function requestFilePaste(destination) {
+    if (!canPasteFilesInto(destination)) return false
+    var serial = service.readClipboardFiles()
+    if (serial <= 0) return false
+    filePasteSerial = serial
+    filePasteDestination = ({ token: String(destination.token),
+      path: String(destination.path || destination.name || "Folder") })
+    return true
+  }
+
+  function requestFilePasteHere() {
+    return !!service && requestFilePaste(({ isDir: true, token: service.rootToken,
+      path: service.rootPath }))
+  }
+
+  // The answer opens the choice only into a panel that is still open with
+  // nothing else asked of it; one that lands after a dialog or an operation
+  // has started is dropped rather than stacked on top.
+  function finishFilePaste(serial, ok, uris) {
+    if (serial === 0 || serial !== filePasteSerial) return false
+    var destination = filePasteDestination
+    filePasteSerial = 0
+    filePasteDestination = null
+    // Qt 6.12 hands a var signal argument over as a list, not a JS array.
+    var list = ok && uris && typeof uris === "object" && typeof uris.length === "number"
+      ? Array.prototype.slice.call(uris) : []
+    if (list.length === 0 || !opened || !destination
+        || !canPasteFilesInto(({ isDir: true, token: destination.token }))) return false
+    pendingDrop = ({ destinationToken: destination.token, destinationPath: destination.path,
+      tokens: [], uris: list, count: list.length })
+    editorError = ""
+    editorMode = "drop-choice"
+    return true
   }
 
   function applyPendingCursor() {
@@ -1851,6 +1925,9 @@ Item {
     }
     function onClipboardTextRead(serial, ok, text) {
       root.finishPaste(serial, ok, text)
+    }
+    function onClipboardFilesRead(serial, ok, uris) {
+      root.finishFilePaste(serial, ok, uris)
     }
   }
 
@@ -2285,6 +2362,12 @@ Item {
             root.service.cutSelected()
             event.accepted = true
           } else if (event.key === Qt.Key_V
+              && (event.modifiers & Qt.ControlModifier) !== 0
+              && (event.modifiers & Qt.ShiftModifier) !== 0) {
+            // Before plain Ctrl+V, which would otherwise take this chord too.
+            root.requestFilePasteHere()
+            event.accepted = true
+          } else if (event.key === Qt.Key_V
               && (event.modifiers & Qt.ControlModifier) !== 0) {
             root.service.pasteHere()
             event.accepted = true
@@ -2449,7 +2532,8 @@ Item {
 
         // Opens at the pointer, sized by its longest label, and closes on the
         // first press outside. Nothing here is a mode of its own: it shows the
-        // same list the left click rotates through.
+        // same list the left click rotates through, or the folder's actions
+        // that have keys of their own.
         Popup {
           id: choiceMenu
           objectName: "quickfileChoiceMenu"
@@ -2998,6 +3082,7 @@ Item {
           }
 
           Text {
+            id: locationPath
             textFormat: Text.PlainText
             anchors.left: navButtons.right
             anchors.leftMargin: Style.space(8)
@@ -3011,6 +3096,20 @@ Item {
             font.family: Style.font.family
             font.pixelSize: root.primaryFontSize
             renderType: Text.NativeRendering
+          }
+          // The folder on screen has a menu of its own: what can be pasted
+          // into it. Only the right button is taken, so a drag still lands.
+          MouseArea {
+            id: locationMouse
+            objectName: "quickfileLocationMenuArea"
+            anchors.left: locationPath.left
+            anchors.right: locationPath.right
+            anchors.top: parent.top
+            anchors.bottom: parent.bottom
+            acceptedButtons: Qt.RightButton
+            onClicked: function(event) {
+              root.openChoiceMenu("folder", locationMouse, event.x, event.y)
+            }
           }
           DirectoryDropTarget {
             objectName: "quickfileCurrentFolderDrop"
